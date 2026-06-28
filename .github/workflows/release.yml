@@ -1,0 +1,125 @@
+name: public-ci
+
+on:
+  push:
+    branches:
+      - main
+      - release-candidate/*
+
+permissions:
+  contents: read
+  id-token: none
+
+jobs:
+  compile_test:
+    name: compile-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Compile
+        run: python3 -m py_compile hooks/token-usage.py scripts/*.py
+      - name: Test
+        run: python3 -m unittest discover -s tests -v
+
+  asset_static_sanity:
+    name: asset-static-sanity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify dashboard assets
+        run: |
+          test -f assets/dashboard.html
+          test -f assets/dashboard.css
+          test -f assets/dashboard.js
+          test -d assets/dashboard
+          test -d assets/fonts
+
+  public_sensitive_guard:
+    name: public-sensitive-guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify never-public paths are absent
+        run: |
+          test ! -e analytics
+          test ! -e bad
+          test ! -e normalized
+          test ! -e raw
+          test ! -e reports
+          test ! -e state
+          test ! -e tmp
+          test ! -e release
+          test ! -e handoffs
+          test ! -e reviews
+          test ! -e AGENTS.md
+
+  candidate_snapshot_guard:
+    name: candidate-snapshot-guard
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/heads/release-candidate/')
+    needs:
+      - compile_test
+      - asset_static_sanity
+      - public_sensitive_guard
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify candidate snapshot guard boundary
+        run: echo "::notice title=placeholder::candidate snapshot guard policy runs here"
+
+  product_snapshot_guard:
+    name: product-snapshot-guard
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    needs:
+      - compile_test
+      - asset_static_sanity
+      - public_sensitive_guard
+    outputs:
+      release_kind: ${{ steps.classify.outputs.release_kind }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Classify public main push
+        id: classify
+        shell: bash
+        run: |
+          subject="$(git log -1 --pretty=%s)"
+          if [[ "$subject" == chore\(public-ops\):* ]]; then
+            echo "release_kind=public_ops" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "release_kind=product_snapshot" >> "$GITHUB_OUTPUT"
+          echo "::notice title=placeholder::product snapshot actor, subject, and codeql polling run here"
+
+  semantic_release:
+    name: semantic-release
+    runs-on: ubuntu-latest
+    needs:
+      - compile_test
+      - asset_static_sanity
+      - public_sensitive_guard
+      - product_snapshot_guard
+    if: github.ref == 'refs/heads/main' && needs.product_snapshot_guard.outputs.release_kind == 'product_snapshot'
+    permissions:
+      contents: read
+      id-token: none
+    environment: public-release-publish
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+      - name: Install release dependencies
+        run: npm ci
+      - name: Mint release-tag GitHub App token placeholder
+        run: echo "::notice title=placeholder::release-tag App token mint is not implemented in this bootstrap artifact"
+      - name: Run semantic-release placeholder
+        run: echo "::notice title=placeholder::semantic-release runs here with release-tag App GH_TOKEN"

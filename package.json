@@ -1,0 +1,13 @@
+{
+  "name": "codex-token-bola-public-release",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Public release automation dependencies for Codex Token Bola snapshot publishing",
+  "devDependencies": {
+    "@semantic-release/commit-analyzer": "^13.0.1",
+    "@semantic-release/github": "^12.0.2",
+    "@semantic-release/release-notes-generator": "^14.1.0",
+    "conventional-changelog-conventionalcommits": "^9.1.0",
+    "semantic-release": "^25.0.2"
+  }
+}
