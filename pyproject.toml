@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Codex Token Bola local token usage capture, analytics, and dashboard tooling"
 requires-python = ">=3.10"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
 
 [project.optional-dependencies]
 dev = [

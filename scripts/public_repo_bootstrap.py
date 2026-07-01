@@ -118,6 +118,8 @@ def validate_release_workflow(root: pathlib.Path) -> list[str]:
         errors.append("public release workflow must mint release-tag GitHub App token")
     if "GH_TOKEN: ${{ steps.release-tag-token.outputs.token }}" not in text:
         errors.append("public release workflow must pass release-tag token as semantic-release GH_TOKEN")
+    if 'git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"' not in text:
+        errors.append("public release workflow must configure git remote with release-tag token")
     if "npx semantic-release" not in text:
         errors.append("public release workflow must run npx semantic-release")
     for variable in ("vars.PROMOTION_APP_ACTOR", "vars.SNAPSHOT_AUTHOR_EMAIL", "vars.PUBLIC_OPS_ACTOR"):
