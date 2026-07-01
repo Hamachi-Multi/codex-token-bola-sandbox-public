@@ -55,7 +55,7 @@ REQUIRED_PUBLIC_REPO_VARIABLES = ["PROMOTION_APP_ACTOR", "SNAPSHOT_AUTHOR_EMAIL"
 NEXT_INPUTS = [
     "replace example sandbox_public_repo with the live sandbox repo before live run",
     "install snapshot, promotion, and release-tag GitHub Apps on the sandbox public repo",
-    "configure protected environment approvals for release export, main promotion, and release publish",
+    "configure environment secrets for release export, main promotion, and release publish",
     "capture live public main base SHA before pushing the sandbox candidate branch",
 ]
 

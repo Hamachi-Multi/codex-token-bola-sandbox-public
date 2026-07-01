@@ -96,10 +96,30 @@ def validate_release_workflow(root: pathlib.Path) -> list[str]:
         errors.append("public release workflow must call public main release guard")
     if "product snapshot actor, subject, and codeql polling run here" in text:
         errors.append("public release workflow must not keep product snapshot guard placeholder")
+    if (
+        "release-tag App token mint is not implemented" in text
+        or "semantic-release runs here with release-tag App GH_TOKEN" in text
+    ):
+        errors.append("public release workflow must not keep semantic-release publish placeholder")
     if "semantic_release: ${{ steps.guard.outputs.semantic_release }}" not in text:
         errors.append("public release workflow must expose semantic_release guard output")
     if "needs.product_snapshot_guard.outputs.semantic_release == 'true'" not in text:
         errors.append("semantic-release must be gated by semantic_release guard output")
+    release_token_fragments = (
+        "id: release-tag-token",
+        "uses: actions/create-github-app-token@v3",
+        "app-id: ${{ secrets.RELEASE_TAG_APP_ID }}",
+        "private-key: ${{ secrets.RELEASE_TAG_PRIVATE_KEY }}",
+        "owner: ${{ github.repository_owner }}",
+        "repositories: ${{ github.event.repository.name }}",
+        "permission-contents: write",
+    )
+    if not all(fragment in text for fragment in release_token_fragments):
+        errors.append("public release workflow must mint release-tag GitHub App token")
+    if "GH_TOKEN: ${{ steps.release-tag-token.outputs.token }}" not in text:
+        errors.append("public release workflow must pass release-tag token as semantic-release GH_TOKEN")
+    if "npx semantic-release" not in text:
+        errors.append("public release workflow must run npx semantic-release")
     for variable in ("vars.PROMOTION_APP_ACTOR", "vars.SNAPSHOT_AUTHOR_EMAIL", "vars.PUBLIC_OPS_ACTOR"):
         if variable not in text:
             errors.append(f"public release workflow missing guard variable: {variable}")
