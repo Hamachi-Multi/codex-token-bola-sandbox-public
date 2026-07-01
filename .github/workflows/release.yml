@@ -73,27 +73,67 @@ jobs:
     name: product-snapshot-guard
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      checks: read
+      id-token: none
     needs:
       - compile_test
       - asset_static_sanity
       - public_sensitive_guard
     outputs:
-      release_kind: ${{ steps.classify.outputs.release_kind }}
+      release_kind: ${{ steps.guard.outputs.release_kind }}
+      semantic_release: ${{ steps.guard.outputs.semantic_release }}
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Classify public main push
-        id: classify
+      - name: Read public main commit metadata
+        id: commit
         shell: bash
         run: |
+          git log -1 --pretty=%B > "$RUNNER_TEMP/commit-message.txt"
+          author_email="$(git log -1 --pretty=%ae)"
+          echo "message_file=$RUNNER_TEMP/commit-message.txt" >> "$GITHUB_OUTPUT"
+          echo "author_email=$author_email" >> "$GITHUB_OUTPUT"
+      - name: Resolve CodeQL conclusion for product snapshots
+        id: codeql
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          conclusion="not_required"
           subject="$(git log -1 --pretty=%s)"
           if [[ "$subject" == chore\(public-ops\):* ]]; then
-            echo "release_kind=public_ops" >> "$GITHUB_OUTPUT"
+            echo "conclusion=$conclusion" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "release_kind=product_snapshot" >> "$GITHUB_OUTPUT"
-          echo "::notice title=placeholder::product snapshot actor, subject, and codeql polling run here"
+          conclusion=""
+          for attempt in {1..60}; do
+            conclusion="$(
+              gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/check-runs" \
+                --jq '.check_runs[] | select(.name == "codeql") | .conclusion' \
+                | head -n 1
+            )"
+            if [[ -n "$conclusion" && "$conclusion" != "null" ]]; then
+              break
+            fi
+            sleep 30
+          done
+          echo "conclusion=${conclusion:-missing}" >> "$GITHUB_OUTPUT"
+      - name: Guard public main release path
+        id: guard
+        run: |
+          python3 scripts/public_main_release_guard.py \
+            --ref "${{ github.ref }}" \
+            --message-file "${{ steps.commit.outputs.message_file }}" \
+            --actor "${{ github.actor }}" \
+            --expected-promotion-actor "${{ vars.PROMOTION_APP_ACTOR }}" \
+            --author-email "${{ steps.commit.outputs.author_email }}" \
+            --expected-snapshot-author-email "${{ vars.SNAPSHOT_AUTHOR_EMAIL }}" \
+            --codeql-conclusion "${{ steps.codeql.outputs.conclusion }}" \
+            --public-ops-actor "${{ vars.PUBLIC_OPS_ACTOR }}" \
+            --github-output "$GITHUB_OUTPUT"
 
   semantic_release:
     name: semantic-release
@@ -103,7 +143,7 @@ jobs:
       - asset_static_sanity
       - public_sensitive_guard
       - product_snapshot_guard
-    if: github.ref == 'refs/heads/main' && needs.product_snapshot_guard.outputs.release_kind == 'product_snapshot'
+    if: github.ref == 'refs/heads/main' && needs.product_snapshot_guard.outputs.semantic_release == 'true'
     permissions:
       contents: read
       id-token: none
@@ -119,7 +159,16 @@ jobs:
           cache: npm
       - name: Install release dependencies
         run: npm ci
-      - name: Mint release-tag GitHub App token placeholder
-        run: echo "::notice title=placeholder::release-tag App token mint is not implemented in this bootstrap artifact"
-      - name: Run semantic-release placeholder
-        run: echo "::notice title=placeholder::semantic-release runs here with release-tag App GH_TOKEN"
+      - name: Mint release-tag GitHub App token
+        id: release-tag-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.RELEASE_TAG_APP_ID }}
+          private-key: ${{ secrets.RELEASE_TAG_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+      - name: Run semantic-release
+        env:
+          GH_TOKEN: ${{ steps.release-tag-token.outputs.token }}
+        run: npx semantic-release
