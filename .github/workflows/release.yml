@@ -171,4 +171,6 @@ jobs:
       - name: Run semantic-release
         env:
           GH_TOKEN: ${{ steps.release-tag-token.outputs.token }}
-        run: npx semantic-release
+        run: |
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          npx semantic-release
