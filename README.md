@@ -197,4 +197,4 @@ make compile && make test
 make ui-check
 ```
 
-For a running local dashboard, restart the server first and use `make ui-check-live`
+For a running local dashboard, restart the server first, then run `make ui-check-live` against the live instance.
