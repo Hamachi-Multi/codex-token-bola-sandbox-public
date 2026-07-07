@@ -15,7 +15,7 @@ jobs:
     name: compile-test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
@@ -28,7 +28,7 @@ jobs:
     name: asset-static-sanity
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Verify dashboard assets
         run: |
           test -f assets/dashboard.html
@@ -41,7 +41,7 @@ jobs:
     name: public-sensitive-guard
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Verify never-public paths are absent
         run: |
           test ! -e analytics
@@ -65,7 +65,7 @@ jobs:
       - asset_static_sanity
       - public_sensitive_guard
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Verify candidate snapshot guard boundary
         run: echo "::notice title=placeholder::candidate snapshot guard policy runs here"
 
@@ -85,7 +85,7 @@ jobs:
       release_kind: ${{ steps.guard.outputs.release_kind }}
       semantic_release: ${{ steps.guard.outputs.semantic_release }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Read public main commit metadata
@@ -149,7 +149,7 @@ jobs:
       id-token: none
     environment: public-release-publish
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
