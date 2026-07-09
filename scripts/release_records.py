@@ -142,6 +142,7 @@ def write_candidate_prepared(
     *,
     candidate: str,
     attempt: int,
+    release_ref: str,
     private_main_sha: str,
     private_release_sha: str,
     public_candidate_branch: str,
@@ -164,6 +165,7 @@ def write_candidate_prepared(
         "candidate": candidate,
         "attempt": attempt,
         "status": "candidate_prepared",
+        "release_ref": release_ref,
         "private_main_sha": validate_sha(private_main_sha, "private main SHA"),
         "private_release_sha": validate_sha(private_release_sha, "private release SHA"),
         "public_candidate_branch": validate_public_candidate_branch(public_candidate_branch, candidate, attempt),
@@ -331,6 +333,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepared.add_argument("--records-root", required=True, type=pathlib.Path)
     prepared.add_argument("--candidate", required=True)
     prepared.add_argument("--attempt", required=True, type=int)
+    prepared.add_argument("--release-ref", required=True)
     prepared.add_argument("--private-main-sha", required=True)
     prepared.add_argument("--private-release-sha", required=True)
     prepared.add_argument("--public-candidate-branch", required=True)
@@ -384,6 +387,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.records_root,
                 candidate=args.candidate,
                 attempt=args.attempt,
+                release_ref=args.release_ref,
                 private_main_sha=args.private_main_sha,
                 private_release_sha=args.private_release_sha,
                 public_candidate_branch=args.public_candidate_branch,

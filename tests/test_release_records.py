@@ -23,6 +23,7 @@ class ReleaseRecordsTests(unittest.TestCase):
                 records_root,
                 candidate="2026-07-01",
                 attempt=1,
+                release_ref="main",
                 private_main_sha="a" * 40,
                 private_release_sha="b" * 40,
                 public_candidate_branch="release-candidate/2026-07-01-attempt-001",
@@ -41,6 +42,7 @@ class ReleaseRecordsTests(unittest.TestCase):
         self.assertEqual(attempt["candidate"], "2026-07-01")
         self.assertEqual(attempt["attempt"], 1)
         self.assertEqual(attempt["status"], "candidate_prepared")
+        self.assertEqual(attempt["release_ref"], "main")
         self.assertEqual(attempt["public_candidate_sha"], None)
         self.assertEqual(attempt["checks"]["private_compile_test"], "passed")
         self.assertEqual(attempt["checks"]["public_release_candidate_checks"], "pending")
@@ -56,6 +58,7 @@ class ReleaseRecordsTests(unittest.TestCase):
                 records_root,
                 candidate="2026-07-01",
                 attempt=2,
+                release_ref="main",
                 private_main_sha="a" * 40,
                 private_release_sha="b" * 40,
                 public_candidate_branch="release-candidate/2026-07-01-attempt-002",
@@ -92,6 +95,7 @@ class ReleaseRecordsTests(unittest.TestCase):
                 records_root,
                 candidate="2026-07-01",
                 attempt=1,
+                release_ref="main",
                 private_main_sha="a" * 40,
                 private_release_sha="b" * 40,
                 public_candidate_branch="release-candidate/2026-07-01-attempt-001",
@@ -135,6 +139,7 @@ class ReleaseRecordsTests(unittest.TestCase):
                 records_root,
                 candidate="2026-07-01",
                 attempt=1,
+                release_ref="main",
                 private_main_sha="a" * 40,
                 private_release_sha="b" * 40,
                 public_candidate_branch="release-candidate/2026-07-01-attempt-001",
@@ -189,6 +194,7 @@ class ReleaseRecordsTests(unittest.TestCase):
                 records_root,
                 candidate="2026-07-01",
                 attempt=1,
+                release_ref="main",
                 private_main_sha="a" * 40,
                 private_release_sha="b" * 40,
                 public_candidate_branch="release-candidate/2026-07-01-attempt-001",
@@ -232,6 +238,7 @@ class ReleaseRecordsTests(unittest.TestCase):
                 records_root,
                 candidate="2026-07-01",
                 attempt=1,
+                release_ref="main",
                 private_main_sha="a" * 40,
                 private_release_sha="b" * 40,
                 public_candidate_branch="release-candidate/2026-07-01-attempt-001",
@@ -259,6 +266,7 @@ class ReleaseRecordsTests(unittest.TestCase):
                 records_root,
                 candidate="2026-07-01",
                 attempt=1,
+                release_ref="main",
                 private_main_sha="a" * 40,
                 private_release_sha="b" * 40,
                 public_candidate_branch="release-candidate/2026-07-01-attempt-001",
@@ -298,6 +306,7 @@ class ReleaseRecordsTests(unittest.TestCase):
                     records_root,
                     candidate="2026-07-01",
                     attempt=3,
+                    release_ref="main",
                     private_main_sha="a" * 40,
                     private_release_sha="b" * 40,
                     public_candidate_branch="release-candidate/2026-07-01-attempt-002",
@@ -350,6 +359,8 @@ class ReleaseRecordsTests(unittest.TestCase):
                     "2026-07-01",
                     "--attempt",
                     "1",
+                    "--release-ref",
+                    "main",
                     "--private-main-sha",
                     "a" * 40,
                     "--private-release-sha",

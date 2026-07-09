@@ -31,6 +31,7 @@ def seed_candidate_pushed_record(records_root: pathlib.Path) -> pathlib.Path:
         records_root,
         candidate="2026-07-01",
         attempt=1,
+        release_ref="main",
         private_main_sha="a" * 40,
         private_release_sha="b" * 40,
         public_candidate_branch="release-candidate/2026-07-01-attempt-001",

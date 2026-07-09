@@ -73,6 +73,14 @@ def validate_inventory(root: pathlib.Path) -> list[str]:
     return [f"missing public bootstrap file: {relative}" for relative in REQUIRED_FILES if not (root / relative).is_file()]
 
 
+def validate_no_symlinks(root: pathlib.Path) -> list[str]:
+    errors: list[str] = []
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            errors.append(f"public bootstrap path must not be a symlink: {path.relative_to(root).as_posix()}")
+    return errors
+
+
 def validate_release_workflow(root: pathlib.Path) -> list[str]:
     workflow_path = root / ".github" / "workflows" / "release.yml"
     if not workflow_path.is_file():
@@ -140,9 +148,9 @@ def validate_codeql_workflow(root: pathlib.Path) -> list[str]:
         "name: codeql",
         "security-events: write",
         "    name: codeql",
-        "github/codeql-action/init@v3",
+        "github/codeql-action/init@v4",
         "languages: python",
-        "github/codeql-action/analyze@v3",
+        "github/codeql-action/analyze@v4",
     ):
         if fragment not in text:
             errors.append(f"codeql workflow missing fragment: {fragment}")
@@ -220,6 +228,7 @@ def validate_public_bootstrap(bootstrap_root: pathlib.Path | str) -> dict[str, A
         raise InputError(f"bootstrap root is not a directory: {root}")
     errors = [
         *validate_inventory(root),
+        *validate_no_symlinks(root),
         *validate_release_workflow(root),
         *validate_codeql_workflow(root),
         *validate_semantic_release(root),

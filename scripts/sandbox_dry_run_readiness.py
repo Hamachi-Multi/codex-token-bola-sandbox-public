@@ -15,22 +15,17 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import promotion_eligibility
 import public_repo_bootstrap
-import release_records
 
 
 REPO_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 REQUIRED_FIELDS = [
     "sandbox_public_repo",
     "public_main_branch",
-    "candidate",
-    "attempt",
-    "public_candidate_branch",
-    "public_candidate_base_sha",
-    "expected_public_candidate_sha",
     "required_public_checks",
     "protected_environments",
     "github_apps",
     "environment_secrets",
+    "private_repo_variables",
     "public_repo_variables",
     "run_mode",
 ]
@@ -40,6 +35,7 @@ REQUIRED_PROTECTED_ENVIRONMENTS = {
     "release_publish": "public-release-publish",
 }
 REQUIRED_GITHUB_APPS = ["snapshot", "promotion", "release_tag"]
+REQUIRED_PRIVATE_REPO_VARIABLES = ["PUBLIC_RELEASE_REPO", "SNAPSHOT_AUTHOR_EMAIL"]
 REQUIRED_ENVIRONMENT_SECRETS = {
     "private": {
         "production-release-export": ["SNAPSHOT_APP_ID", "SNAPSHOT_PRIVATE_KEY"],
@@ -55,8 +51,8 @@ REQUIRED_PUBLIC_REPO_VARIABLES = ["PROMOTION_APP_ACTOR", "SNAPSHOT_AUTHOR_EMAIL"
 NEXT_INPUTS = [
     "replace example sandbox_public_repo with the live sandbox repo before live run",
     "install snapshot, promotion, and release-tag GitHub Apps on the sandbox public repo",
+    "configure private repo variables for public repo name and snapshot author email",
     "configure environment secrets for release export, main promotion, and release publish",
-    "capture live public main base SHA before pushing the sandbox candidate branch",
 ]
 
 
@@ -85,47 +81,6 @@ def validate_repo(config: dict[str, Any]) -> list[str]:
     if not isinstance(repo, str) or not REPO_NAME_RE.match(repo):
         return ["sandbox_public_repo must use owner/repo format"]
     return []
-
-
-def validate_candidate_contract(config: dict[str, Any]) -> list[str]:
-    errors: list[str] = []
-    candidate = config.get("candidate")
-    attempt = config.get("attempt")
-    branch = config.get("public_candidate_branch")
-    if not isinstance(candidate, str):
-        errors.append("candidate must be a string")
-        candidate = ""
-    if type(attempt) is not int:
-        errors.append("attempt must be an integer")
-        attempt = 0
-    if not isinstance(branch, str):
-        errors.append("public_candidate_branch must be a string")
-        branch = ""
-
-    if isinstance(candidate, str) and type(attempt) is int and isinstance(branch, str):
-        try:
-            release_records.validate_public_candidate_branch(branch, candidate, attempt)
-        except release_records.InputError as exc:
-            errors.append(str(exc))
-    return errors
-
-
-def validate_sha_fields(config: dict[str, Any]) -> list[str]:
-    labels = {
-        "public_candidate_base_sha": "public candidate base SHA",
-        "expected_public_candidate_sha": "expected public candidate SHA",
-    }
-    errors: list[str] = []
-    for field, label in labels.items():
-        value = config.get(field)
-        if not isinstance(value, str):
-            errors.append(f"{label} must be a string")
-            continue
-        try:
-            release_records.validate_sha(value, label)
-        except release_records.InputError as exc:
-            errors.append(str(exc))
-    return errors
 
 
 def validate_public_checks(config: dict[str, Any]) -> list[str]:
@@ -179,6 +134,13 @@ def validate_environment_secrets(config: dict[str, Any]) -> list[str]:
     return errors
 
 
+def validate_private_repo_variables(config: dict[str, Any]) -> list[str]:
+    variables = config.get("private_repo_variables")
+    if variables != REQUIRED_PRIVATE_REPO_VARIABLES:
+        return [f"private_repo_variables must be: {', '.join(REQUIRED_PRIVATE_REPO_VARIABLES)}"]
+    return []
+
+
 def validate_public_repo_variables(config: dict[str, Any]) -> list[str]:
     variables = config.get("public_repo_variables")
     if variables != REQUIRED_PUBLIC_REPO_VARIABLES:
@@ -210,12 +172,11 @@ def validate_sandbox_dry_run_readiness(repo_root: pathlib.Path | str, config_pat
         warnings.append("sandbox_public_repo is an example value")
 
     errors.extend(validate_repo(config))
-    errors.extend(validate_candidate_contract(config))
-    errors.extend(validate_sha_fields(config))
     errors.extend(validate_public_checks(config))
     errors.extend(validate_protected_environments(config))
     errors.extend(validate_github_apps(config))
     errors.extend(validate_environment_secrets(config))
+    errors.extend(validate_private_repo_variables(config))
     errors.extend(validate_public_repo_variables(config))
     if repo_root.is_dir():
         errors.extend(validate_public_bootstrap(repo_root))
