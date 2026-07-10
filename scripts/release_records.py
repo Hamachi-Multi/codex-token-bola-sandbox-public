@@ -27,7 +27,8 @@ ALLOWED_TRANSITIONS = {
     "pending": {"approved", "failed"},
     "approved": {"candidate_prepared", "failed"},
     "candidate_prepared": {"candidate_pushed", "failed"},
-    "candidate_pushed": {"promoted", "failed"},
+    "candidate_pushed": {"promotion_started", "failed"},
+    "promotion_started": {"promoted", "failed"},
     "promoted": {"published", "failed"},
 }
 
@@ -201,9 +202,50 @@ def mark_candidate_pushed(
     records_root = pathlib.Path(records_root)
     path = attempt_record_path(records_root, candidate, attempt)
     record = read_json(path)
-    validate_transition(str(record.get("status") or ""), "candidate_pushed")
+    status = record.get("status")
+    if not isinstance(status, str) or not status:
+        raise InputError("release record status must be a non-empty string")
+    validate_transition(status, "candidate_pushed")
     record["status"] = "candidate_pushed"
     record["public_candidate_sha"] = validate_sha(public_candidate_sha, "public candidate SHA")
+    record["updated_at"] = updated_at
+    atomic_write_json(path, record)
+    write_summary_index(records_root, record)
+    return {"ok": True, "status": record["status"], "record": attempt_record_relative_path(candidate, attempt)}
+
+
+def mark_promotion_started(
+    records_root: pathlib.Path | str,
+    *,
+    candidate: str,
+    attempt: int,
+    public_candidate_sha: str,
+    updated_at: str,
+) -> dict[str, Any]:
+    records_root = pathlib.Path(records_root)
+    path = attempt_record_path(records_root, candidate, attempt)
+    record = read_json(path)
+    public_candidate_sha = validate_sha(public_candidate_sha, "public candidate SHA")
+    status = record.get("status")
+    if not isinstance(status, str) or not status:
+        raise InputError("release record status must be a non-empty string")
+
+    if status == "promotion_started":
+        if record.get("public_candidate_sha") != public_candidate_sha:
+            raise InputError("public candidate SHA must match existing promotion_started record")
+        if record.get("public_main_sha"):
+            raise InputError("promotion_started record public_main_sha must be empty")
+    else:
+        validate_transition(status, "promotion_started")
+        if record.get("public_candidate_sha") != public_candidate_sha:
+            raise InputError("public candidate SHA must match release record public_candidate_sha")
+        if record.get("public_main_sha"):
+            raise InputError("candidate record public_main_sha must be empty before promotion")
+
+    checks = merge_checks(record.get("checks"))
+    checks["public_main_promotion"] = "started"
+    record["status"] = "promotion_started"
+    record["checks"] = checks
     record["updated_at"] = updated_at
     atomic_write_json(path, record)
     write_summary_index(records_root, record)
@@ -221,7 +263,10 @@ def mark_promoted(
     records_root = pathlib.Path(records_root)
     path = attempt_record_path(records_root, candidate, attempt)
     record = read_json(path)
-    validate_transition(str(record.get("status") or ""), "promoted")
+    status = record.get("status")
+    if not isinstance(status, str) or not status:
+        raise InputError("release record status must be a non-empty string")
+    validate_transition(status, "promoted")
     public_main_sha = validate_sha(public_main_sha, "public main SHA")
     if record.get("public_candidate_sha") != public_main_sha:
         raise InputError("public main SHA must match release record public_candidate_sha")
@@ -250,7 +295,10 @@ def mark_published(
     records_root = pathlib.Path(records_root)
     path = attempt_record_path(records_root, candidate, attempt)
     record = read_json(path)
-    validate_transition(str(record.get("status") or ""), "published")
+    status = record.get("status")
+    if not isinstance(status, str) or not status:
+        raise InputError("release record status must be a non-empty string")
+    validate_transition(status, "published")
     if not version:
         raise InputError("version must be non-empty")
     if not tag:
@@ -283,7 +331,10 @@ def mark_failed(
     records_root = pathlib.Path(records_root)
     path = attempt_record_path(records_root, candidate, attempt)
     record = read_json(path)
-    validate_transition(str(record.get("status") or ""), "failed")
+    status = record.get("status")
+    if not isinstance(status, str) or not status:
+        raise InputError("release record status must be a non-empty string")
+    validate_transition(status, "failed")
     if not failure_stage:
         raise InputError("failure stage must be non-empty")
     if not failure_reason:
@@ -350,6 +401,13 @@ def build_parser() -> argparse.ArgumentParser:
     pushed.add_argument("--public-candidate-sha", required=True)
     pushed.add_argument("--updated-at", required=True)
 
+    promotion_started = subparsers.add_parser("promotion-started")
+    promotion_started.add_argument("--records-root", required=True, type=pathlib.Path)
+    promotion_started.add_argument("--candidate", required=True)
+    promotion_started.add_argument("--attempt", required=True, type=int)
+    promotion_started.add_argument("--public-candidate-sha", required=True)
+    promotion_started.add_argument("--updated-at", required=True)
+
     promoted = subparsers.add_parser("promoted")
     promoted.add_argument("--records-root", required=True, type=pathlib.Path)
     promoted.add_argument("--candidate", required=True)
@@ -399,6 +457,14 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.command == "candidate-pushed":
             result = mark_candidate_pushed(
+                args.records_root,
+                candidate=args.candidate,
+                attempt=args.attempt,
+                public_candidate_sha=args.public_candidate_sha,
+                updated_at=args.updated_at,
+            )
+        elif args.command == "promotion-started":
+            result = mark_promotion_started(
                 args.records_root,
                 candidate=args.candidate,
                 attempt=args.attempt,

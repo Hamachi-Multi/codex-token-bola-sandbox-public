@@ -51,6 +51,19 @@ def seed_candidate_pushed_record(records_root: pathlib.Path) -> pathlib.Path:
     return records_root / "2026-07-01" / "attempt-001.json"
 
 
+def seed_promotion_started_record(records_root: pathlib.Path) -> pathlib.Path:
+    records = load_records_module()
+    record_path = seed_candidate_pushed_record(records_root)
+    records.mark_promotion_started(
+        records_root,
+        candidate="2026-07-01",
+        attempt=1,
+        public_candidate_sha="e" * 40,
+        updated_at="2026-07-01T00:12:00Z",
+    )
+    return record_path
+
+
 def matching_public_state(**overrides) -> dict[str, object]:
     state = {
         "public_candidate_branch": "release-candidate/2026-07-01-attempt-001",
@@ -76,6 +89,72 @@ class PromotionEligibilityTests(unittest.TestCase):
             )
 
         self.assertEqual(result, {"ok": True, "errors": [], "promotion_target_sha": "e" * 40})
+
+    def test_promotion_started_record_is_eligible_when_expected(self) -> None:
+        promotion = load_promotion_module()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            records_root = pathlib.Path(tmp_dir) / "release" / "records"
+            record_path = seed_promotion_started_record(records_root)
+
+            result = promotion.validate_promotion_eligibility(
+                record_path,
+                matching_public_state(),
+                expected_public_candidate_sha="e" * 40,
+                expected_status="promotion_started",
+            )
+
+        self.assertEqual(result, {"ok": True, "errors": [], "promotion_target_sha": "e" * 40})
+
+    def test_promotion_started_record_is_eligible_when_multiple_statuses_are_expected(self) -> None:
+        promotion = load_promotion_module()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            records_root = pathlib.Path(tmp_dir) / "release" / "records"
+            record_path = seed_promotion_started_record(records_root)
+
+            result = promotion.validate_promotion_eligibility(
+                record_path,
+                matching_public_state(),
+                expected_public_candidate_sha="e" * 40,
+                expected_status=("candidate_pushed", "promotion_started"),
+            )
+
+        self.assertEqual(result, {"ok": True, "errors": [], "promotion_target_sha": "e" * 40})
+
+    def test_candidate_pushed_record_is_rejected_when_promotion_started_is_expected(self) -> None:
+        promotion = load_promotion_module()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            records_root = pathlib.Path(tmp_dir) / "release" / "records"
+            record_path = seed_candidate_pushed_record(records_root)
+
+            result = promotion.validate_promotion_eligibility(
+                record_path,
+                matching_public_state(),
+                expected_public_candidate_sha="e" * 40,
+                expected_status="promotion_started",
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("release record status must be promotion_started", result["errors"])
+
+    def test_status_error_lists_multiple_expected_statuses(self) -> None:
+        promotion = load_promotion_module()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            records_root = pathlib.Path(tmp_dir) / "release" / "records"
+            record_path = seed_candidate_pushed_record(records_root)
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            record["status"] = "candidate_prepared"
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+
+            result = promotion.validate_promotion_eligibility(
+                record_path,
+                matching_public_state(),
+                expected_public_candidate_sha="e" * 40,
+                expected_status=("candidate_pushed", "promotion_started"),
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("release record status must be candidate_pushed or promotion_started", result["errors"])
+
 
     def test_status_must_be_candidate_pushed(self) -> None:
         promotion = load_promotion_module()

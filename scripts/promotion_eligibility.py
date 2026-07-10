@@ -39,13 +39,15 @@ def validate_promotion_eligibility(
     public_state: dict[str, Any],
     *,
     expected_public_candidate_sha: str,
+    expected_status: str | tuple[str, ...] = "candidate_pushed",
 ) -> dict[str, Any]:
     record = read_json(pathlib.Path(record_path), "release record")
     errors: list[str] = []
     record_public_candidate_sha = record.get("public_candidate_sha")
+    expected_statuses = (expected_status,) if isinstance(expected_status, str) else expected_status
 
-    if record.get("status") != "candidate_pushed":
-        errors.append("release record status must be candidate_pushed")
+    if record.get("status") not in expected_statuses:
+        errors.append(f"release record status must be {' or '.join(expected_statuses)}")
     if record_public_candidate_sha != expected_public_candidate_sha:
         errors.append("release record public_candidate_sha does not match expected public candidate SHA")
     if public_state.get("public_candidate_branch") != record.get("public_candidate_branch"):
@@ -75,6 +77,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--record", required=True, type=pathlib.Path)
     parser.add_argument("--public-state", required=True, type=pathlib.Path)
     parser.add_argument("--expected-public-candidate-sha", required=True)
+    parser.add_argument(
+        "--expected-status",
+        action="append",
+        choices=("candidate_pushed", "promotion_started"),
+        default=None,
+    )
     return parser
 
 
@@ -86,6 +94,7 @@ def main(argv: list[str] | None = None) -> int:
             args.record,
             public_state,
             expected_public_candidate_sha=args.expected_public_candidate_sha,
+            expected_status=tuple(args.expected_status or ["candidate_pushed"]),
         )
     except InputError as exc:
         print(json.dumps({"ok": False, "errors": [str(exc)]}, ensure_ascii=False, separators=(",", ":")))

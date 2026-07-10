@@ -87,6 +87,96 @@ class ReleaseRecordsTests(unittest.TestCase):
         self.assertEqual(summary["latest_status"], "candidate_pushed")
         self.assertEqual(summary["public_main_sha"], "")
 
+    def test_promotion_started_updater_marks_started_check_and_summary(self) -> None:
+        records = load_release_records_module()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            records_root = pathlib.Path(tmp_dir) / "release" / "records"
+            records.write_candidate_prepared(
+                records_root,
+                candidate="2026-07-01",
+                attempt=1,
+                release_ref="main",
+                private_main_sha="a" * 40,
+                private_release_sha="b" * 40,
+                public_candidate_branch="release-candidate/2026-07-01-attempt-001",
+                public_candidate_base_sha="c" * 40,
+                snapshot_manifest_digest="sha256:" + "d" * 64,
+                approver="release-owner",
+                created_at="2026-07-01T00:00:00Z",
+                updated_at="2026-07-01T00:05:00Z",
+            )
+            records.mark_candidate_pushed(
+                records_root,
+                candidate="2026-07-01",
+                attempt=1,
+                public_candidate_sha="e" * 40,
+                updated_at="2026-07-01T00:10:00Z",
+            )
+
+            result = records.mark_promotion_started(
+                records_root,
+                candidate="2026-07-01",
+                attempt=1,
+                public_candidate_sha="e" * 40,
+                updated_at="2026-07-01T00:12:00Z",
+            )
+
+            attempt = json.loads((records_root / "2026-07-01" / "attempt-001.json").read_text(encoding="utf-8"))
+            summary = json.loads((records_root / "2026-07-01.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(result["status"], "promotion_started")
+        self.assertEqual(attempt["status"], "promotion_started")
+        self.assertEqual(attempt["public_main_sha"], "")
+        self.assertEqual(attempt["checks"]["public_main_promotion"], "started")
+        self.assertEqual(summary["latest_status"], "promotion_started")
+        self.assertEqual(summary["public_main_sha"], "")
+
+    def test_promotion_started_is_idempotent_for_same_candidate_sha(self) -> None:
+        records = load_release_records_module()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            records_root = pathlib.Path(tmp_dir) / "release" / "records"
+            records.write_candidate_prepared(
+                records_root,
+                candidate="2026-07-01",
+                attempt=1,
+                release_ref="main",
+                private_main_sha="a" * 40,
+                private_release_sha="b" * 40,
+                public_candidate_branch="release-candidate/2026-07-01-attempt-001",
+                public_candidate_base_sha="c" * 40,
+                snapshot_manifest_digest="sha256:" + "d" * 64,
+                approver="release-owner",
+                created_at="2026-07-01T00:00:00Z",
+                updated_at="2026-07-01T00:05:00Z",
+            )
+            records.mark_candidate_pushed(
+                records_root,
+                candidate="2026-07-01",
+                attempt=1,
+                public_candidate_sha="e" * 40,
+                updated_at="2026-07-01T00:10:00Z",
+            )
+            records.mark_promotion_started(
+                records_root,
+                candidate="2026-07-01",
+                attempt=1,
+                public_candidate_sha="e" * 40,
+                updated_at="2026-07-01T00:12:00Z",
+            )
+
+            result = records.mark_promotion_started(
+                records_root,
+                candidate="2026-07-01",
+                attempt=1,
+                public_candidate_sha="e" * 40,
+                updated_at="2026-07-01T00:13:00Z",
+            )
+
+            attempt = json.loads((records_root / "2026-07-01" / "attempt-001.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(result["status"], "promotion_started")
+        self.assertEqual(attempt["updated_at"], "2026-07-01T00:13:00Z")
+
     def test_promoted_updater_sets_public_main_sha_and_summary(self) -> None:
         records = load_release_records_module()
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -111,6 +201,13 @@ class ReleaseRecordsTests(unittest.TestCase):
                 attempt=1,
                 public_candidate_sha="e" * 40,
                 updated_at="2026-07-01T00:10:00Z",
+            )
+            records.mark_promotion_started(
+                records_root,
+                candidate="2026-07-01",
+                attempt=1,
+                public_candidate_sha="e" * 40,
+                updated_at="2026-07-01T00:12:00Z",
             )
 
             result = records.mark_promoted(
@@ -155,6 +252,13 @@ class ReleaseRecordsTests(unittest.TestCase):
                 attempt=1,
                 public_candidate_sha="e" * 40,
                 updated_at="2026-07-01T00:10:00Z",
+            )
+            records.mark_promotion_started(
+                records_root,
+                candidate="2026-07-01",
+                attempt=1,
+                public_candidate_sha="e" * 40,
+                updated_at="2026-07-01T00:12:00Z",
             )
             records.mark_promoted(
                 records_root,
@@ -230,7 +334,7 @@ class ReleaseRecordsTests(unittest.TestCase):
         self.assertEqual(attempt["failure_reason"], "public main drifted")
         self.assertEqual(summary["latest_status"], "failed")
 
-    def test_promoted_requires_candidate_pushed_state(self) -> None:
+    def test_promoted_requires_promotion_started_state(self) -> None:
         records = load_release_records_module()
         with tempfile.TemporaryDirectory() as tmp_dir:
             records_root = pathlib.Path(tmp_dir) / "release" / "records"
@@ -247,6 +351,14 @@ class ReleaseRecordsTests(unittest.TestCase):
                 approver="release-owner",
                 created_at="2026-07-01T00:00:00Z",
                 updated_at="2026-07-01T00:05:00Z",
+            )
+
+            records.mark_candidate_pushed(
+                records_root,
+                candidate="2026-07-01",
+                attempt=1,
+                public_candidate_sha="e" * 40,
+                updated_at="2026-07-01T00:10:00Z",
             )
 
             with self.assertRaisesRegex(records.InputError, "invalid release record transition"):
