@@ -198,3 +198,5 @@ make ui-check
 ```
 
 For a running local dashboard, restart the server first, then run `make ui-check-live` against the live instance.
+
+Public ops product-path policy probe
