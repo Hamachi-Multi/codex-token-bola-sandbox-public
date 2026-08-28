@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 
 from playwright_dashboard_helpers import (
     assert_true,
@@ -20,7 +21,7 @@ def check_turns_and_selected_turn(page, base_url: str) -> None:
     page.locator('button[data-view-target="turns"]').click()
     page.wait_for_selector("#turn-list tr[data-turn]", state="attached", timeout=10_000)
     turn_view_focus_index = page.locator("#turn-list").evaluate(
-        "() => Array.from(document.querySelectorAll('#turn-list tr[data-turn]')).indexOf(document.activeElement)"
+        "() => Array.from(document.querySelectorAll('#turn-list tr[data-turn] .row-select-button')).indexOf(document.activeElement)"
     )
     assert_true(turn_view_focus_index >= 0, f"turns view should focus a turn row on entry: {turn_view_focus_index}")
 
@@ -81,13 +82,84 @@ def check_turns_and_selected_turn(page, base_url: str) -> None:
     session_options = fetch_json(f"{base_url}/api/session-options")["rows"]
     assert_true(page.locator("#session-picker-button").is_visible(), "session filter is not visible")
     assert_true(page.locator("#project").count() == 0, "project filter should not remain in the header")
+    page.locator("#session-picker-button").click()
+    page.wait_for_function("() => document.activeElement === document.querySelector('#session-search')")
+    session_picker_semantics = page.evaluate(
+        """
+        () => ({
+          role: document.querySelector('#session-search').getAttribute('role'),
+          expanded: document.querySelector('#session-search').getAttribute('aria-expanded'),
+          activeDescendant: document.querySelector('#session-search').getAttribute('aria-activedescendant'),
+          tabbableOptions: [...document.querySelectorAll('#session-options [role="option"]')].filter(option => option.tabIndex >= 0).length,
+        })
+        """
+    )
+    assert_true(
+        session_picker_semantics["role"] == "combobox"
+        and session_picker_semantics["expanded"] == "true"
+        and session_picker_semantics["activeDescendant"].startswith("session-option-")
+        and session_picker_semantics["tabbableOptions"] == 0,
+        f"session picker should use active-descendant combobox semantics: {session_picker_semantics}",
+    )
+    page.keyboard.press("Tab")
+    assert_true(page.locator("#session-picker-popover").is_hidden(), "Tab should close the session picker")
     if session_options:
         selected_session = session_options[0]["session_id"]
+        pending_search_routes = []
+
+        def hold_stale_session_search(route) -> None:
+            if "q=delayed-selection" in route.request.url:
+                pending_search_routes.append(route)
+                return
+            route.continue_()
+
+        page.route("**/api/session-options?*", hold_stale_session_search)
+        try:
+            page.locator("#session-picker-button").click()
+            page.locator("#session-search").fill("delayed-selection")
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not pending_search_routes:
+                page.wait_for_timeout(25)
+            assert_true(pending_search_routes, "expected one held session search request")
+            page.locator(f'#session-options [data-session-id="{selected_session}"]').click()
+            page.wait_for_function(
+                "sessionId => document.querySelector('#session').value === sessionId",
+                arg=selected_session,
+                timeout=5_000,
+            )
+            pending_search_routes[0].fulfill(
+                status=200,
+                content_type="application/json",
+                body='{"rows": []}',
+            )
+            page.wait_for_timeout(100)
+            stale_search_state = page.evaluate(
+                """
+                () => ({
+                  value: document.querySelector('#session').value,
+                  label: document.querySelector('#session-picker-label').textContent,
+                  stored: JSON.parse(localStorage.getItem('bola-dashboard-settings') || '{}').session_id || '',
+                  popoverHidden: document.querySelector('#session-picker-popover').hidden,
+                })
+                """
+            )
+            assert_true(
+                stale_search_state["value"] == selected_session
+                and stale_search_state["stored"] == selected_session
+                and stale_search_state["popoverHidden"]
+                and compact_session_id(selected_session) in stale_search_state["label"],
+                f"stale session search should not overwrite the committed selection: {stale_search_state}",
+            )
+        finally:
+            page.unroute("**/api/session-options?*", hold_stale_session_search)
         page.locator("#session-picker-button").click()
         page.locator("#session-search").fill(selected_session[-4:])
         page.locator(f'#session-options [data-session-id="{selected_session}"]').click()
-        page.wait_for_load_state("networkidle")
-        page.wait_for_selector("#turn-list tr[data-turn]", timeout=10_000)
+        page.wait_for_function(
+            "(sessionId) => { const rows = [...document.querySelectorAll('#turn-list tr[data-turn]')]; return rows.length > 0 && rows.every(row => row.dataset.session === sessionId); }",
+            arg=selected_session,
+            timeout=10_000,
+        )
         assert_true(compact_session_id(selected_session) in page.locator("#session-picker-button").inner_text(), "selected session label did not update")
         session_dashboard = fetch_json(f"{base_url}/api/dashboard?days=7&limit=100&session_id={selected_session}")
         selected_rows = page.locator("#turn-list tr[data-turn]").evaluate_all(
@@ -103,21 +175,19 @@ def check_turns_and_selected_turn(page, base_url: str) -> None:
         )
         page.locator("#session-picker-button").click()
         page.locator('#session-options [data-session-id=""]').click()
-        page.wait_for_load_state("networkidle")
-        page.wait_for_selector("#turn-list tr[data-turn]", timeout=10_000)
+        page.wait_for_function("() => document.querySelectorAll('#turn-list tr[data-turn]').length > 6", timeout=10_000)
     page.locator("#turn-page-size").select_option("10")
-    page.wait_for_load_state("networkidle")
-    page.wait_for_selector("#turn-list tr[data-turn]", timeout=10_000)
+    page.wait_for_function("() => document.querySelectorAll('#turn-list tr[data-turn]').length === 10", timeout=10_000)
     rendered_turn_rows = page.locator("#turn-list tr[data-turn]").count()
     assert_true(
         rendered_turn_rows == min(10, dashboard["turns"]["total"]),
         f"page rows did not apply to turns list: {rendered_turn_rows}",
     )
     if rendered_turn_rows > 1:
-        page.locator("#turn-list tr[data-turn]").first.focus()
+        page.locator("#turn-list tr[data-turn] .row-select-button").first.focus()
         page.keyboard.press("ArrowDown")
         turn_focus_state = page.locator("#turn-list").evaluate(
-            "() => { const rows = Array.from(document.querySelectorAll('#turn-list tr[data-turn]')); return {focused: rows.indexOf(document.activeElement), selected: rows.findIndex((row) => row.classList.contains('selected'))}; }"
+            "() => { const buttons = Array.from(document.querySelectorAll('#turn-list tr[data-turn] .row-select-button')); const rows = Array.from(document.querySelectorAll('#turn-list tr[data-turn]')); return {focused: buttons.indexOf(document.activeElement), selected: rows.findIndex((row) => row.classList.contains('selected'))}; }"
         )
         assert_true(turn_focus_state == {"focused": 1, "selected": 1}, f"ArrowDown should move focused and selected turn row to next row: {turn_focus_state}")
         selected_turn_background_before_hover = page.locator("#turn-list tr.selected td").first.evaluate("(el) => getComputedStyle(el).backgroundColor")
@@ -128,12 +198,12 @@ def check_turns_and_selected_turn(page, base_url: str) -> None:
             f"selected turn row hover should not change active background: before={selected_turn_background_before_hover}, after={selected_turn_background_after_hover}",
         )
         turn_focus_style = page.locator("#turn-list").evaluate(
-            "() => { const active = document.activeElement; const firstCell = active ? active.querySelector('td') : null; return {rowOutline: active ? getComputedStyle(active).outlineStyle : '', cellOutline: firstCell ? getComputedStyle(firstCell).outlineStyle : '', background: firstCell ? getComputedStyle(firstCell).backgroundColor : ''}; }"
+            "() => { const active = document.activeElement; const cell = active?.closest('td'); return {buttonOutline: active ? getComputedStyle(active).outlineStyle : '', background: cell ? getComputedStyle(cell).backgroundColor : ''}; }"
         )
-        assert_true(turn_focus_style["rowOutline"] == "none" and turn_focus_style["cellOutline"] == "none", f"focused turn row should match hover without outline: {turn_focus_style}")
+        assert_true(turn_focus_style["buttonOutline"] != "none", f"focused turn selector should expose a visible outline: {turn_focus_style}")
         page.keyboard.press("ArrowUp")
         turn_focus_state = page.locator("#turn-list").evaluate(
-            "() => { const rows = Array.from(document.querySelectorAll('#turn-list tr[data-turn]')); return {focused: rows.indexOf(document.activeElement), selected: rows.findIndex((row) => row.classList.contains('selected'))}; }"
+            "() => { const buttons = Array.from(document.querySelectorAll('#turn-list tr[data-turn] .row-select-button')); const rows = Array.from(document.querySelectorAll('#turn-list tr[data-turn]')); return {focused: buttons.indexOf(document.activeElement), selected: rows.findIndex((row) => row.classList.contains('selected'))}; }"
         )
         assert_true(turn_focus_state == {"focused": 0, "selected": 0}, f"ArrowUp should move focused and selected turn row to previous row: {turn_focus_state}")
         page.wait_for_function("() => (document.querySelector('#detail')?.textContent || '').includes('Call Summary')")
@@ -266,9 +336,9 @@ def check_turns_and_selected_turn(page, base_url: str) -> None:
             assert_true(detail_layout["toolRows"] == 0 and not detail_layout["hasToolToggle"], f"empty selected turn tool summary should not render rows or controls: {detail_layout}")
         assert_true(detail_layout["sections"] == expected_sections, f"selected turn sections are not in the expected order: {detail_layout}")
     page.locator("#turn-page-size").select_option("25")
-    page.wait_for_load_state("networkidle")
     page.wait_for_selector("#turn-list tr[data-turn]", timeout=10_000)
-    expected_datetime = f"{compact_date(rows[0].get('captured_at') or '')} {compact_time(rows[0].get('captured_at') or '')}"
+    first_prompt_at = rows[0].get("started_at") or rows[0].get("captured_at") or ""
+    expected_datetime = f"{compact_date(first_prompt_at)} {compact_time(first_prompt_at)}"
     rendered_datetime = page.locator("#turn-list tr[data-turn] .datetime-cell").first.text_content()
     assert_true(
         rendered_datetime == expected_datetime,
@@ -294,12 +364,15 @@ def check_turns_and_selected_turn(page, base_url: str) -> None:
         )
     assert_true(" / " in detail_session, f"selected turn identity metadata is missing session/date context: {detail_session!r}")
 
-    captured = [row.get("captured_at") or "" for row in rows]
-    assert_true(captured == sorted(captured, reverse=True), f"turn rows are not latest-first: {captured}")
+    prompt_times = [row.get("started_at") or row.get("captured_at") or "" for row in rows]
+    assert_true(prompt_times == sorted(prompt_times, reverse=True), f"turn rows are not latest-first: {prompt_times}")
 
     page.locator('#turn-list [data-turn-sort="credits"]').click()
-    page.wait_for_load_state("networkidle")
     page.wait_for_selector('#turn-list th[aria-sort="descending"] [data-turn-sort="credits"]', timeout=10_000)
+    turn_sort_focus_restored = page.locator('#turn-list [data-turn-sort="credits"]').evaluate(
+        "button => document.activeElement === button"
+    )
+    assert_true(turn_sort_focus_restored, "turn sort should restore focus to the replacement header button")
     credits_desc = fetch_json(f"{base_url}/api/dashboard?days=7&limit=100&page=1&per_page=5&sort=credits&sort_dir=desc")[
         "turns"
     ]["rows"]
@@ -315,7 +388,6 @@ def check_turns_and_selected_turn(page, base_url: str) -> None:
     )
 
     page.locator('#turn-list [data-turn-sort="credits"]').click()
-    page.wait_for_load_state("networkidle")
     page.wait_for_selector('#turn-list th[aria-sort="ascending"] [data-turn-sort="credits"]', timeout=10_000)
     credits_asc = fetch_json(f"{base_url}/api/dashboard?days=7&limit=100&page=1&per_page=5&sort=credits&sort_dir=asc")[
         "turns"

@@ -14,6 +14,7 @@ try:
         load_module,
         mock,
         pathlib,
+        sqlite3,
         tempfile,
         timezone,
         unittest,
@@ -32,10 +33,12 @@ except ModuleNotFoundError:
         load_module,
         mock,
         pathlib,
+        sqlite3,
         tempfile,
         timezone,
         unittest,
     )
+
 
 class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.TestCase):
     LEGACY_CLEANUP_ROW_FIELDS = {
@@ -58,7 +61,7 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
             raw_dir = base / "raw"
             archive_dir = raw_dir / "archive"
             archive_dir.mkdir(parents=True)
-            current = cleanup.raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
+            current = cleanup._preview.raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
             raw_prompt = pathlib.Path(current["path"])
 
             old_turn = _turn_raw("s1", "old", 100) | {"captured_at": "2026-01-01T00:00:00Z"}
@@ -71,14 +74,16 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
 
             mixed_archive = archive_dir / "prompt-usage.raw.jsonl.20260110.jsonl.gz"
             archive_payload = (
-                json.dumps(_turn_raw("s2", "arch-old", 100) | {"captured_at": "2026-01-01T00:00:00Z"}) + "\n"
-                + json.dumps(_turn_raw("s2", "arch-new", 200) | {"captured_at": "2026-01-10T00:00:00Z"}) + "\n"
+                json.dumps(_turn_raw("s2", "arch-old", 100) | {"captured_at": "2026-01-01T00:00:00Z"})
+                + "\n"
+                + json.dumps(_turn_raw("s2", "arch-new", 200) | {"captured_at": "2026-01-10T00:00:00Z"})
+                + "\n"
             ).encode()
             with gzip.open(mixed_archive, "wt", encoding="utf-8") as handle:
                 handle.write(archive_payload.decode())
-            cleanup.raw_segments.write_manifest(
+            cleanup._preview.raw_segments.write_manifest(
                 base,
-                cleanup.raw_segments.empty_manifest(base)
+                cleanup._preview.raw_segments.empty_manifest(base)
                 | {
                     "segments": [
                         _raw_segment(
@@ -100,7 +105,7 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
             result = cleanup.delete_logs_older_than(base, cutoff_unix)
 
             kept_rows = []
-            for segment in cleanup.raw_segments.read_manifest(base).get("segments", []):
+            for segment in cleanup._preview.raw_segments.read_manifest(base).get("segments", []):
                 path = pathlib.Path(str(segment.get("path") or ""))
                 if path.suffix == ".gz":
                     with gzip.open(path, "rt", encoding="utf-8") as handle:
@@ -120,7 +125,7 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
             raw_dir = base / "raw"
             archive_dir = raw_dir / "archive"
             archive_dir.mkdir(parents=True)
-            current = cleanup.raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
+            current = cleanup._preview.raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
             raw_prompt = pathlib.Path(current["path"])
             raw_prompt.write_text(
                 "".join(
@@ -135,16 +140,13 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
             cutoff_unix = datetime.fromisoformat("2026-01-08T00:00:00+00:00").timestamp()
 
             result = cleanup.delete_logs_older_than(base, cutoff_unix)
-            state = json.loads((base / "state" / "retention-pruned-turns.json").read_text(encoding="utf-8"))
+            with sqlite3.connect(base / "state" / "retention-pruned-turns.sqlite") as con:
+                state_rows = con.execute("select session_id, turn_id, state from pruned_turns order by session_id, turn_id").fetchall()
 
         self.assertEqual(result["deleted_turns"], 1)
-        self.assertEqual(state["cutoff_unix"], cutoff_unix)
-        self.assertEqual(
-            [(row["session_id"], row["turn_id"]) for row in state["pruned_turns"]],
-            [("parent", "old-parent")],
-        )
+        self.assertEqual(state_rows, [("parent", "old-parent", "committed")])
 
-    def test_log_cleanup_retention_deletes_old_pending_turn_state(self) -> None:
+    def test_log_cleanup_retention_preserves_pending_turn_state(self) -> None:
         cleanup = load_module("dashboard_cleanup_retention_pending_turn_state_test", ROOT / "scripts" / "dashboard_cleanup.py")
         with tempfile.TemporaryDirectory() as tmp_dir:
             base = pathlib.Path(tmp_dir) / "token-usage"
@@ -173,14 +175,14 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
             service_exists = service_state.exists()
 
         self.assertEqual(result["deleted_rows"], 0)
-        self.assertEqual(result["deleted_state_files"], 1)
-        self.assertFalse(old_exists)
+        self.assertEqual(result["deleted_state_files"], 0)
+        self.assertTrue(old_exists)
         self.assertTrue(new_exists)
         self.assertTrue(service_exists)
 
     def test_log_cleanup_preview_does_not_reconcile_pending_apply_marker(self) -> None:
         cleanup = load_module("cleanup_preview_readonly_apply_marker_test", ROOT / "scripts" / "dashboard_cleanup.py")
-        raw_segments = cleanup.raw_segments
+        raw_segments = cleanup._preview.raw_segments
         with tempfile.TemporaryDirectory() as tmp:
             base = pathlib.Path(tmp) / "token-usage"
             archive = base / "raw" / "archive"
@@ -193,7 +195,16 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
             previous_manifest = raw_segments.empty_manifest(base) | {"segments": [old]}
             next_manifest = raw_segments.empty_manifest(base) | {"segments": []}
             raw_segments.write_manifest(base, previous_manifest)
-            raw_segments.write_apply_marker(base, {"phase": "manifest_pending", "previous_manifest": previous_manifest, "source_segments": [old], "retained_segments": [], "next_manifest": next_manifest})
+            raw_segments.write_apply_marker(
+                base,
+                {
+                    "phase": "manifest_pending",
+                    "previous_manifest": previous_manifest,
+                    "source_segments": [old],
+                    "retained_segments": [],
+                    "next_manifest": next_manifest,
+                },
+            )
 
             with self.assertRaises(raw_segments.ManifestError):
                 cleanup.retention_preview(base, datetime(2026, 5, 20, tzinfo=timezone.utc).timestamp())
@@ -210,18 +221,20 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
             state.mkdir(parents=True)
             (state / "raw-segments-manifest.json").write_text("{broken-json", encoding="utf-8")
 
-            with self.assertRaises(cleanup.raw_segments.ManifestError):
+            with self.assertRaises(cleanup._preview.raw_segments.ManifestError):
                 cleanup.retention_preview(base, datetime(2026, 5, 20, tzinfo=timezone.utc).timestamp())
 
     def test_log_cleanup_preview_includes_active_current_segment(self) -> None:
         cleanup = load_module("cleanup_preview_current_segment_test", ROOT / "scripts" / "dashboard_cleanup.py")
-        raw_segments = cleanup.raw_segments
+        raw_segments = cleanup._preview.raw_segments
         with tempfile.TemporaryDirectory() as tmp:
             base = pathlib.Path(tmp) / "token-usage"
             current_dir = base / "raw" / "current"
             current_dir.mkdir(parents=True)
             current_path = current_dir / "prompt-usage.raw.jsonl.current.1777593600000000000.jsonl"
-            current_path.write_text(json.dumps(_turn_raw("s-current", "old", total=100) | {"captured_at": "2026-05-01T00:00:00+00:00"}) + "\n", encoding="utf-8")
+            current_path.write_text(
+                json.dumps(_turn_raw("s-current", "old", total=100) | {"captured_at": "2026-05-01T00:00:00+00:00"}) + "\n", encoding="utf-8"
+            )
             raw_segments.write_current_pointer(
                 base,
                 {
@@ -245,7 +258,7 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
 
     def test_log_cleanup_preview_indexes_current_segment_without_repeated_full_scan(self) -> None:
         cleanup = load_module("cleanup_preview_current_segment_index_test", ROOT / "scripts" / "dashboard_cleanup.py")
-        raw_segments = cleanup.raw_segments
+        raw_segments = cleanup._preview.raw_segments
         with tempfile.TemporaryDirectory() as tmp:
             base = pathlib.Path(tmp) / "token-usage"
             current_dir = base / "raw" / "current"
@@ -272,7 +285,7 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
             raw_scan_calls = 0
             index_scan_calls = 0
             original_raw_scan = raw_segments._retention.scan_segment_file_for_cutoff
-            original_index_scan = cleanup._retention.scan_retention_source_for_index_from_offset
+            original_index_scan = cleanup._index.scan_retention_source_for_index_from_offset
 
             def counted_raw_scan(*args: Any, **kwargs: Any) -> dict[str, int]:
                 nonlocal raw_scan_calls
@@ -285,7 +298,10 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
                     index_scan_calls += 1
                 return original_index_scan(*args, **kwargs)
 
-            with mock.patch.object(raw_segments._retention, "scan_segment_file_for_cutoff", side_effect=counted_raw_scan), mock.patch.object(cleanup._retention, "scan_retention_source_for_index_from_offset", side_effect=counted_index_scan):
+            with (
+                mock.patch.object(raw_segments._retention, "scan_segment_file_for_cutoff", side_effect=counted_raw_scan),
+                mock.patch.object(cleanup._index, "scan_retention_source_for_index_from_offset", side_effect=counted_index_scan),
+            ):
                 first = cleanup.retention_preview(base, cutoff)
                 second = cleanup.retention_preview(base, later_cutoff)
 
@@ -296,7 +312,7 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
 
     def test_log_cleanup_preview_incrementally_indexes_appended_current_segment(self) -> None:
         cleanup = load_module("cleanup_preview_current_segment_append_index_test", ROOT / "scripts" / "dashboard_cleanup.py")
-        raw_segments = cleanup.raw_segments
+        raw_segments = cleanup._preview.raw_segments
         with tempfile.TemporaryDirectory() as tmp:
             base = pathlib.Path(tmp) / "token-usage"
             current_dir = base / "raw" / "current"
@@ -321,14 +337,14 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
             )
             cutoff = datetime(2026, 5, 20, tzinfo=timezone.utc).timestamp()
             offsets: list[int] = []
-            original_index_scan = cleanup._retention.scan_retention_source_for_index_from_offset
+            original_index_scan = cleanup._index.scan_retention_source_for_index_from_offset
 
             def counted_index_scan(path: pathlib.Path, offset: int, **kwargs: Any) -> dict[str, Any]:
                 if pathlib.Path(path) == current_path:
                     offsets.append(offset)
                 return original_index_scan(path, offset, **kwargs)
 
-            with mock.patch.object(cleanup._retention, "scan_retention_source_for_index_from_offset", side_effect=counted_index_scan):
+            with mock.patch.object(cleanup._index, "scan_retention_source_for_index_from_offset", side_effect=counted_index_scan):
                 first = cleanup.retention_preview(base, cutoff)
                 initial_size = current_path.stat().st_size
                 with current_path.open("a", encoding="utf-8") as handle:
@@ -342,7 +358,7 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
 
     def test_log_cleanup_preview_rejects_pending_rotation_marker(self) -> None:
         cleanup = load_module("cleanup_preview_pending_rotation_test", ROOT / "scripts" / "dashboard_cleanup.py")
-        raw_segments = cleanup.raw_segments
+        raw_segments = cleanup._preview.raw_segments
         with tempfile.TemporaryDirectory() as tmp:
             base = pathlib.Path(tmp) / "token-usage"
             current_dir = base / "raw" / "current"
@@ -351,10 +367,32 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
             new_path = current_dir / "prompt-usage.raw.jsonl.current.1779235200000000000.jsonl"
             old_path.write_text(json.dumps(_turn_raw("s-current", "old", total=100) | {"captured_at": "2026-05-01T00:00:00+00:00"}) + "\n", encoding="utf-8")
             new_path.write_text("", encoding="utf-8")
-            old_segment = {"id": "prompt-usage.raw.jsonl.current.1777593600000000000", "kind": "prompt_usage", "path": str(old_path), "source_name": "prompt-usage.raw.jsonl", "created_at_unix": 1777593600.0}
-            new_segment = {"id": "prompt-usage.raw.jsonl.current.1779235200000000000", "kind": "prompt_usage", "path": str(new_path), "source_name": "prompt-usage.raw.jsonl", "created_at_unix": 1779235200.0}
+            old_segment = {
+                "id": "prompt-usage.raw.jsonl.current.1777593600000000000",
+                "kind": "prompt_usage",
+                "path": str(old_path),
+                "source_name": "prompt-usage.raw.jsonl",
+                "created_at_unix": 1777593600.0,
+            }
+            new_segment = {
+                "id": "prompt-usage.raw.jsonl.current.1779235200000000000",
+                "kind": "prompt_usage",
+                "path": str(new_path),
+                "source_name": "prompt-usage.raw.jsonl",
+                "created_at_unix": 1779235200.0,
+            }
             raw_segments.write_current_pointer(base, {"current": {"prompt_usage": new_segment}})
-            raw_segments.write_pending_rotation(base, {"operation": "rotate_current_segment", "phase": "manifest_pending", "kind": "prompt_usage", "old_segment": old_segment, "new_segment": new_segment, "created_at_unix": 1.0})
+            raw_segments.write_pending_rotation(
+                base,
+                {
+                    "operation": "rotate_current_segment",
+                    "phase": "manifest_pending",
+                    "kind": "prompt_usage",
+                    "old_segment": old_segment,
+                    "new_segment": new_segment,
+                    "created_at_unix": 1.0,
+                },
+            )
 
             with self.assertRaises(raw_segments.ManifestError):
                 cleanup.retention_preview(base, datetime(2026, 5, 20, tzinfo=timezone.utc).timestamp())
@@ -371,13 +409,13 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
                 handle.write(payload)
             segment_path = archive_dir / "prompt-usage.raw.jsonl.20260501000000.20260501000000.1.jsonl.gz"
             segment_path.symlink_to(external)
-            cleanup.raw_segments.write_manifest(
+            cleanup._preview.raw_segments.write_manifest(
                 base,
-                cleanup.raw_segments.empty_manifest(base)
+                cleanup._preview.raw_segments.empty_manifest(base)
                 | {"segments": [_raw_segment(segment_path, payload=payload.encode(), min_time=1777593600.0, max_time=1777593600.0, rows=1)]},
             )
 
-            with self.assertRaises(cleanup.raw_segments.ManifestError):
+            with self.assertRaises(cleanup._preview.raw_segments.ManifestError):
                 cleanup.retention_preview(base, datetime(2026, 5, 20, tzinfo=timezone.utc).timestamp())
 
     def test_log_cleanup_retention_preview_reuses_cache_until_sources_change(self) -> None:
@@ -386,7 +424,7 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
             base = pathlib.Path(tmp_dir) / "token-usage"
             raw_dir = base / "raw"
             raw_dir.mkdir(parents=True)
-            current = cleanup.raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
+            current = cleanup._preview.raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
             raw_prompt = pathlib.Path(current["path"])
             raw_prompt.write_text(
                 json.dumps(_turn_raw("s1", "old", 100) | {"captured_at": "2026-01-01T00:00:00Z"}) + "\n",
@@ -394,12 +432,11 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
             )
             cutoff_unix = datetime.fromisoformat("2026-01-08T00:00:00+00:00").timestamp()
 
-            with mock.patch.object(cleanup._retention, "scan_retention_source_for_index", wraps=cleanup._retention.scan_retention_source_for_index) as scan:
+            with mock.patch.object(cleanup._index, "scan_retention_source_for_index", wraps=cleanup._index.scan_retention_source_for_index) as scan:
                 first = cleanup.retention_preview(base, cutoff_unix)
                 second = cleanup.retention_preview(base, cutoff_unix)
                 raw_prompt.write_text(
-                    raw_prompt.read_text(encoding="utf-8")
-                    + json.dumps(_turn_raw("s1", "new", 200) | {"captured_at": "2026-01-10T00:00:00Z"}) + "\n",
+                    raw_prompt.read_text(encoding="utf-8") + json.dumps(_turn_raw("s1", "new", 200) | {"captured_at": "2026-01-10T00:00:00Z"}) + "\n",
                     encoding="utf-8",
                 )
                 third = cleanup.retention_preview(base, cutoff_unix)
@@ -426,13 +463,31 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
             cutoff_unix = datetime.fromisoformat("2026-01-08T00:00:00+00:00").timestamp()
             first = cleanup.retention_preview_signature(base, cutoff_unix)
             current_path.write_text(
-                current_path.read_text(encoding="utf-8")
-                + json.dumps(_turn_raw("s1", "older", 100) | {"captured_at": "2026-01-02T00:00:00Z"}) + "\n",
+                current_path.read_text(encoding="utf-8") + json.dumps(_turn_raw("s1", "older", 100) | {"captured_at": "2026-01-02T00:00:00Z"}) + "\n",
                 encoding="utf-8",
             )
             second = cleanup.retention_preview_signature(base, cutoff_unix)
 
         self.assertNotEqual(first, second)
+
+    def test_retention_preview_signature_preserves_public_payload_shape(self) -> None:
+        cleanup = load_module("cleanup_signature_shape_test", ROOT / "scripts" / "dashboard_cleanup.py")
+        raw_segments = load_module("raw_segments_signature_shape_test", ROOT / "scripts" / "raw_segments.py")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = pathlib.Path(tmp_dir) / "token-usage"
+            raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
+            cutoff_unix = datetime.fromisoformat("2026-01-08T00:00:00+00:00").timestamp()
+            payload = {
+                "cutoff_unix": float(cutoff_unix),
+                "sources": (),
+                "current_sources": cleanup._index.current_retention_source_signature(base),
+                "manifest": cleanup._preview.raw_segments.manifest_signature(base),
+            }
+            expected = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+
+            actual = cleanup.retention_preview_signature(base, cutoff_unix)
+
+        self.assertEqual(actual, expected)
 
     def test_retention_preview_uses_manifest_segment_bounds_without_rescanning_gzip(self) -> None:
         cleanup = load_module("cleanup_segment_preview_test", ROOT / "scripts" / "dashboard_cleanup.py")
@@ -460,6 +515,7 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
                             "path": str(old_segment),
                             "format": "jsonl.gz",
                             "source_name": "prompt-usage.raw.jsonl",
+                            "time_basis": "started_at",
                             "min_time_unix": 1777593600.0,
                             "max_time_unix": 1777593600.0,
                             "rows": 1,
@@ -478,6 +534,7 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
                             "path": str(retained_segment),
                             "format": "jsonl.gz",
                             "source_name": "prompt-usage.raw.jsonl",
+                            "time_basis": "started_at",
                             "min_time_unix": 1779494400.0,
                             "max_time_unix": 1779494400.0,
                             "rows": 1,
@@ -499,6 +556,58 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
         self.assertEqual(preview["deletable_rows"], 1)
         self.assertEqual(preview["affected_files"], 1)
         self.assertTrue(preview["from_manifest"])
+
+    def test_retention_preview_rescans_legacy_capture_time_manifest_using_prompt_start(self) -> None:
+        cleanup = load_module("cleanup_legacy_prompt_time_preview_test", ROOT / "scripts" / "dashboard_cleanup.py")
+        raw_segments = load_module("raw_segments_legacy_prompt_time_preview_test", ROOT / "scripts" / "raw_segments.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp)
+            archive = base / "raw" / "archive"
+            archive.mkdir(parents=True)
+            segment_path = archive / "prompt-usage.raw.jsonl.legacy.jsonl.gz"
+            payload = (
+                json.dumps(
+                    _turn_raw("s1", "old", total=100)
+                    | {
+                        "started_at": "2026-05-01T00:00:00+00:00",
+                        "captured_at": "2026-05-23T00:00:00+00:00",
+                    }
+                )
+                + "\n"
+            )
+            with gzip.open(segment_path, "wt", encoding="utf-8") as handle:
+                handle.write(payload)
+            raw_segments.write_manifest(
+                base,
+                raw_segments.empty_manifest(base)
+                | {
+                    "segments": [
+                        {
+                            "id": "prompt-usage.raw.jsonl.legacy",
+                            "kind": "prompt_usage",
+                            "path": str(segment_path),
+                            "format": "jsonl.gz",
+                            "source_name": "prompt-usage.raw.jsonl",
+                            "min_time_unix": 1779494400.0,
+                            "max_time_unix": 1779494400.0,
+                            "rows": 1,
+                            "undated_rows": 0,
+                            "corrupt_rows": 0,
+                            "unknown_rows": 0,
+                            "days": [[1779494400, 1, len(payload.encode("utf-8"))]],
+                            "bytes": segment_path.stat().st_size,
+                            "uncompressed_bytes": len(payload.encode("utf-8")),
+                            "sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+                            "status": "closed",
+                        }
+                    ]
+                },
+            )
+
+            preview = cleanup.retention_preview(base, datetime(2026, 5, 20, tzinfo=timezone.utc).timestamp())
+
+        self.assertEqual(preview["deletable_rows"], 1)
+        self.assertEqual(preview["affected_files"], 1)
 
     def test_retention_preview_rejects_missing_day_histogram_for_mixed_segment(self) -> None:
         cleanup = load_module("cleanup_segment_preview_missing_days_test", ROOT / "scripts" / "dashboard_cleanup.py")
@@ -524,6 +633,7 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
                             "path": str(mixed_segment),
                             "format": "jsonl.gz",
                             "source_name": "prompt-usage.raw.jsonl",
+                            "time_basis": "started_at",
                             "min_time_unix": 1777593600.0,
                             "max_time_unix": 1779494400.0,
                             "rows": 2,
@@ -539,7 +649,7 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
                 },
             )
 
-            with self.assertRaises(cleanup.raw_segments.ManifestError):
+            with self.assertRaises(cleanup._preview.raw_segments.ManifestError):
                 cleanup.retention_preview(base, datetime(2026, 5, 20, tzinfo=timezone.utc).timestamp())
 
     def test_retention_preview_non_day_cutoff_scans_manifest_mixed_segment_exactly(self) -> None:
@@ -684,7 +794,7 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
             raw_dir = base / "raw"
             archive_dir = raw_dir / "archive"
             archive_dir.mkdir(parents=True)
-            current = cleanup.raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
+            current = cleanup._preview.raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
             raw_prompt = pathlib.Path(current["path"])
             raw_prompt.write_text(
                 "".join(
@@ -698,9 +808,9 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
             )
             cutoff_unix = datetime.fromisoformat("2026-01-08T00:00:00+00:00").timestamp()
             cleanup.rebuild_retention_index(base)
-            cleanup.RETENTION_PREVIEW_CACHE.clear()
+            cleanup.clear_retention_preview_cache()
 
-            with mock.patch.object(cleanup._retention, "preview_jsonl_for_retention", wraps=cleanup._retention.preview_jsonl_for_retention) as preview:
+            with mock.patch.object(cleanup._index, "preview_retention_source", wraps=cleanup._index.preview_retention_source) as preview:
                 result = cleanup.retention_preview(base, cutoff_unix)
 
         self.assertEqual(result["scanned_rows"], 2)
@@ -718,16 +828,18 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
             base = pathlib.Path(tmp_dir) / "token-usage"
             raw_dir = base / "raw"
             raw_dir.mkdir(parents=True)
-            current = cleanup.raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
+            current = cleanup._preview.raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
             raw_prompt = pathlib.Path(current["path"])
             raw_prompt.write_text(
-                json.dumps(_turn_raw("s1", "old", 100) | {"captured_at": "2026-01-01T00:00:00Z"}) + "\n"
-                + json.dumps(_turn_raw("s1", "new", 100) | {"captured_at": "2026-01-10T00:00:00Z"}) + "\n",
+                json.dumps(_turn_raw("s1", "old", 100) | {"captured_at": "2026-01-01T00:00:00Z"})
+                + "\n"
+                + json.dumps(_turn_raw("s1", "new", 100) | {"captured_at": "2026-01-10T00:00:00Z"})
+                + "\n",
                 encoding="utf-8",
             )
             cutoff_unix = datetime.fromisoformat("2026-01-08T00:00:00+00:00").timestamp()
 
-            with mock.patch.object(cleanup._retention, "write_retention_index", side_effect=AssertionError("GET preview must not write index")):
+            with mock.patch.object(cleanup._index, "write_retention_index", side_effect=AssertionError("GET preview must not write index")):
                 result = cleanup.retention_preview(base, cutoff_unix, refresh_index=False)
 
         self.assertEqual(result["scanned_rows"], 2)
@@ -741,7 +853,7 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
             base = pathlib.Path(tmp_dir) / "token-usage"
             raw_dir = base / "raw"
             raw_dir.mkdir(parents=True)
-            current = cleanup.raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
+            current = cleanup._preview.raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
             raw_prompt = pathlib.Path(current["path"])
             raw_prompt.write_text(
                 json.dumps(_turn_raw("s1", "old", 100) | {"captured_at": "2026-01-01T00:00:00Z"}) + "\n",
@@ -749,14 +861,13 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
             )
             cutoff_unix = datetime.fromisoformat("2026-01-08T00:00:00+00:00").timestamp()
             cleanup.rebuild_retention_index(base)
-            cleanup.RETENTION_PREVIEW_CACHE.clear()
+            cleanup.clear_retention_preview_cache()
             raw_prompt.write_text(
-                raw_prompt.read_text(encoding="utf-8")
-                + json.dumps(_turn_raw("s1", "new", 200) | {"captured_at": "2026-01-10T00:00:00Z"}) + "\n",
+                raw_prompt.read_text(encoding="utf-8") + json.dumps(_turn_raw("s1", "new", 200) | {"captured_at": "2026-01-10T00:00:00Z"}) + "\n",
                 encoding="utf-8",
             )
 
-            with mock.patch.object(cleanup._retention, "scan_retention_source_for_index", side_effect=AssertionError("full rescan")):
+            with mock.patch.object(cleanup._index, "scan_retention_source_for_index", side_effect=AssertionError("full rescan")):
                 result = cleanup.retention_preview(base, cutoff_unix)
 
         self.assertEqual(result["scanned_rows"], 2)
@@ -769,17 +880,19 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
             base = pathlib.Path(tmp_dir) / "token-usage"
             raw_dir = base / "raw"
             raw_dir.mkdir(parents=True)
-            current = cleanup.raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
+            current = cleanup._preview.raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
             raw_prompt = pathlib.Path(current["path"])
             raw_prompt.write_text(
                 json.dumps(_turn_raw("s1", "old", 100) | {"captured_at": "2026-01-01T00:00:00Z"}) + "\n",
                 encoding="utf-8",
             )
             cleanup.rebuild_retention_index(base)
-            cleanup.RETENTION_PREVIEW_CACHE.clear()
+            cleanup.clear_retention_preview_cache()
             raw_prompt.write_text(
-                json.dumps(_turn_raw("s1", "new-prefix", 200) | {"captured_at": "2026-01-10T00:00:00Z"}) + "\n"
-                + json.dumps(_turn_raw("s1", "new-tail", 200) | {"captured_at": "2026-01-11T00:00:00Z"}) + "\n",
+                json.dumps(_turn_raw("s1", "new-prefix", 200) | {"captured_at": "2026-01-10T00:00:00Z"})
+                + "\n"
+                + json.dumps(_turn_raw("s1", "new-tail", 200) | {"captured_at": "2026-01-11T00:00:00Z"})
+                + "\n",
                 encoding="utf-8",
             )
             cutoff_unix = datetime.fromisoformat("2026-01-08T00:00:00+00:00").timestamp()
@@ -791,7 +904,7 @@ class DashboardCleanupRetentionPreviewTests(DashboardFixtureMixin, unittest.Test
 
     def test_log_cleanup_retention_index_rebuild_includes_current_segments(self) -> None:
         cleanup = load_module("dashboard_cleanup_current_index_rebuild_test", ROOT / "scripts" / "dashboard_cleanup.py")
-        raw_segments = cleanup.raw_segments
+        raw_segments = cleanup._preview.raw_segments
         with tempfile.TemporaryDirectory() as tmp_dir:
             base = pathlib.Path(tmp_dir) / "token-usage"
             current_dir = base / "raw" / "current"

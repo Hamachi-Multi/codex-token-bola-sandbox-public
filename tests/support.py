@@ -56,7 +56,7 @@ __all__ = [
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 def dashboard_asset_bundle() -> str:
-    assets = ROOT / "assets"
+    assets = ROOT / "scripts" / "assets"
     dashboard_js = assets / "dashboard.js"
     module_paths = sorted(path for path in (assets / "dashboard").rglob("*.js") if path.is_file())
     paths = [assets / "dashboard.html", assets / "dashboard.css", dashboard_js, *module_paths]
@@ -120,6 +120,7 @@ def _raw_segment(
         "path": str(path),
         "format": "jsonl.gz" if path.name.endswith(".gz") else "jsonl",
         "source_name": source,
+        "time_basis": "started_at",
         "min_time_unix": min_time,
         "max_time_unix": max_time,
         "rows": rows,
@@ -141,7 +142,7 @@ def seed_retention_derived_outputs(base: pathlib.Path) -> dict[str, pathlib.Path
     paths = {
         "prompt": normalized_dir / "prompt-usage.normalized.jsonl",
         "state": normalized_dir / "normalize-state.json",
-        "db": analytics_dir / "token-usage.sqlite",
+        "db": analytics_dir / "bola.sqlite",
     }
     paths["prompt"].write_text("existing prompt derived\n", encoding="utf-8")
     paths["state"].write_text('{"existing":true}\n', encoding="utf-8")
@@ -176,7 +177,9 @@ class DashboardFixtureMixin:
               non_cached_input_tokens integer,
               output_tokens integer,
               reasoning_output_tokens integer,
-              model_call_count integer
+              model_call_count integer,
+              started_at_unix integer generated always as (captured_at_unix) virtual,
+              started_at text generated always as (captured_at) virtual
             );
             create table model_call_summaries (
               session_id text,

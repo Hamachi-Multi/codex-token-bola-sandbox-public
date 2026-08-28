@@ -9,7 +9,10 @@ import pathlib
 import time
 from typing import Any
 
+import raw_segment_markers
+
 from raw_segments_common import (
+    PROMPT_TIME_BASIS,
     ManifestError,
     acquire_raw_segment_lock,
     acquire_raw_segment_manifest_lock,
@@ -18,7 +21,7 @@ from raw_segments_common import (
 )
 from raw_segments_state import (
     clear_pending_rotation,
-    read_pending_rotation,
+    load_pending_rotation,
     source_name_for_kind,
     strict_read_current_pointer,
     strict_read_manifest,
@@ -85,6 +88,7 @@ def closed_segment_from_current(current: dict[str, Any], scan: dict[str, Any], *
         "path": str(pathlib.Path(str(current["path"]))),
         "format": "jsonl",
         "source_name": current.get("source_name") or source_name_for_kind(kind),
+        "time_basis": PROMPT_TIME_BASIS,
         "created_at_unix": current.get("created_at_unix"),
         "closed_at_unix": time.time(),
         "min_time_unix": scan["min_time_unix"],
@@ -124,34 +128,25 @@ def unlink_empty_closed_segment(base: pathlib.Path, closed_segment: dict[str, An
         path.unlink()
 
 
-def pending_rotation_entries(marker: dict[str, Any]) -> list[tuple[str, dict[str, Any], dict[str, Any]]]:
-    if marker.get("operation") == "rotate_current_segment":
-        kind = str(marker.get("kind") or "")
-        old_segment = marker.get("old_segment")
-        new_segment = marker.get("new_segment")
-        if not isinstance(old_segment, dict) or not isinstance(new_segment, dict):
-            raise ManifestError("pending raw segment rotation marker is missing segment identity")
-        return [(kind, old_segment, new_segment)]
-    if marker.get("operation") == "rotate_current_segments":
-        segments = marker.get("segments")
-        if not isinstance(segments, dict) or not segments:
-            raise ManifestError("pending raw segment rotation marker is missing segment identities")
-        entries = []
-        for kind, pair in sorted(segments.items()):
-            if not isinstance(pair, dict):
-                raise ManifestError("pending raw segment rotation marker has invalid segment pair")
-            old_segment = pair.get("old_segment")
-            new_segment = pair.get("new_segment")
-            if not isinstance(old_segment, dict) or not isinstance(new_segment, dict):
-                raise ManifestError("pending raw segment rotation marker is missing segment identity")
-            entries.append((str(kind), old_segment, new_segment))
-        return entries
-    raise ManifestError(f"unsupported pending raw segment rotation operation: {marker.get('operation')}")
+def pending_rotation_entries(marker: raw_segment_markers.RotationMarker) -> list[tuple[str, dict[str, Any], dict[str, Any]]]:
+    if isinstance(marker, raw_segment_markers.SingleRotationMarker):
+        return [(marker.kind, marker.old_segment, marker.new_segment)]
+    return [
+        (kind, pair["old_segment"], pair["new_segment"])
+        for kind, pair in sorted(marker.segments.items())
+    ]
 
 
-def finish_rotated_segment(base: pathlib.Path, marker: dict[str, Any], *, clear_marker: bool = True, unlink_empty: bool = False) -> dict[str, Any]:
-    kind = str(marker.get("kind") or "")
-    old_segment = validate_current_segment_entry(base, marker.get("old_segment") or {}, kind=kind)
+def finish_rotated_segment(
+    base: pathlib.Path,
+    marker: raw_segment_markers.SingleRotationMarker | dict[str, Any],
+    *,
+    clear_marker: bool = True,
+    unlink_empty: bool = False,
+) -> dict[str, Any]:
+    kind = marker.kind if isinstance(marker, raw_segment_markers.SingleRotationMarker) else str(marker.get("kind") or "")
+    old_value = marker.old_segment if isinstance(marker, raw_segment_markers.SingleRotationMarker) else marker.get("old_segment") or {}
+    old_segment = validate_current_segment_entry(base, old_value, kind=kind)
     scan = scan_segment_file(pathlib.Path(str(old_segment["path"])), kind=kind)
     closed_segment = closed_segment_from_current(old_segment, scan, kind=kind)
     append_closed_segment(base, closed_segment)
@@ -163,16 +158,16 @@ def finish_rotated_segment(base: pathlib.Path, marker: dict[str, Any], *, clear_
 
 
 def reconcile_pending_rotation(base: pathlib.Path) -> None:
-    marker = read_pending_rotation(base)
+    marker = load_pending_rotation(base)
     if marker is None:
         return
-    closed_segments = marker.get("closed_segments") if isinstance(marker.get("closed_segments"), dict) else {}
+    closed_segments = marker.closed_segments if isinstance(marker, raw_segment_markers.BatchRotationMarker) else {}
     entries = []
     for kind, old_segment, new_segment in pending_rotation_entries(marker):
         new_valid = validate_current_segment_entry(base, new_segment, kind=kind)
         closed_segment = closed_segments.get(kind) if isinstance(closed_segments, dict) else None
         allow_missing_empty_old = (
-            marker.get("operation") == "rotate_current_segments"
+            isinstance(marker, raw_segment_markers.BatchRotationMarker)
             and isinstance(closed_segment, dict)
             and int(closed_segment.get("rows") or 0) == 0
         )
@@ -194,7 +189,7 @@ def reconcile_pending_rotation(base: pathlib.Path) -> None:
             if isinstance(current, dict) and current.get("path") == str(old_segment["path"]):
                 old_still_current.append(kind)
         if old_still_current:
-            if marker.get("phase") == "pointer_pending" and len(old_still_current) == len(entries):
+            if marker.phase is raw_segment_markers.RotationPhase.POINTER_PENDING and len(old_still_current) == len(entries):
                 for _kind, _old_segment, new_segment, _skip_finish in entries:
                     new_path = pathlib.Path(str(new_segment.get("path") or ""))
                     try:
@@ -206,9 +201,10 @@ def reconcile_pending_rotation(base: pathlib.Path) -> None:
                 clear_pending_rotation(base)
                 return
             raise ManifestError(f"pending rotation old segment is still current: {old_still_current}")
-        marker["phase"] = "manifest_pending"
-        write_pending_rotation(base, marker)
-    unlink_empty = marker.get("operation") == "rotate_current_segments"
+        if marker.phase is raw_segment_markers.RotationPhase.POINTER_PENDING:
+            marker = marker.mark_manifest_pending()
+            write_pending_rotation(base, marker)
+    unlink_empty = isinstance(marker, raw_segment_markers.BatchRotationMarker)
     for kind, old_segment, _new_segment, skip_finish in entries:
         if skip_finish:
             continue
@@ -225,52 +221,70 @@ def rotate_current_segment(base: pathlib.Path, *, kind: str, source_name: str | 
         new_current = new_current_segment(base, kind=kind, source_name=source_name or str(old_current.get("source_name") or source_name_for_kind(kind)))
         pointer = strict_read_current_pointer(base)
         pointer.setdefault("current", {})[kind] = new_current
-        marker = {
-            "operation": "rotate_current_segment",
-            "phase": "pointer_pending",
-            "kind": kind,
-            "old_segment": old_current,
-            "new_segment": new_current,
-            "created_at_unix": time.time(),
-        }
+        marker = raw_segment_markers.SingleRotationMarker(
+            phase=raw_segment_markers.RotationPhase.POINTER_PENDING,
+            kind=kind,
+            old_segment=old_current,
+            new_segment=new_current,
+            created_at_unix=time.time(),
+        )
         write_pending_rotation(base, marker)
         write_current_pointer(base, pointer)
-        marker["phase"] = "manifest_pending"
+        marker = marker.mark_manifest_pending()
         write_pending_rotation(base, marker)
     closed_segment = finish_rotated_segment(base, marker)
     return {"closed_segment": closed_segment, "current_segment": new_current}
 
 
-def rotate_all_current_segments(base: pathlib.Path) -> dict[str, Any]:
-    reconcile_pending_rotation(base)
+def begin_rotate_all_current_segments_unlocked(base: pathlib.Path) -> dict[str, Any]:
+    """Swap every current pointer while the caller holds the raw segment lock."""
     kinds = ("prompt_usage",)
     old_segments: dict[str, dict[str, Any]] = {}
     new_segments: dict[str, dict[str, Any]] = {}
-    with acquire_raw_segment_lock(base):
-        strict_read_manifest(base)
-        pointer = strict_read_current_pointer(base)
-        for kind in kinds:
-            old_segments[kind] = ensure_current_segment(base, kind=kind, source_name=source_name_for_kind(kind))
-            new_segments[kind] = new_current_segment(base, kind=kind, source_name=source_name_for_kind(kind))
-            pointer.setdefault("current", {})[kind] = new_segments[kind]
-        marker = {
-            "operation": "rotate_current_segments",
-            "phase": "pointer_pending",
-            "segments": {kind: {"old_segment": old_segments[kind], "new_segment": new_segments[kind]} for kind in kinds},
-            "created_at_unix": time.time(),
-        }
-        write_pending_rotation(base, marker)
-        write_current_pointer(base, pointer)
-        marker["phase"] = "manifest_pending"
-        write_pending_rotation(base, marker)
+    strict_read_manifest(base)
+    pointer = strict_read_current_pointer(base)
+    for kind in kinds:
+        old_segments[kind] = ensure_current_segment(base, kind=kind, source_name=source_name_for_kind(kind))
+        new_segments[kind] = new_current_segment(base, kind=kind, source_name=source_name_for_kind(kind))
+        pointer.setdefault("current", {})[kind] = new_segments[kind]
+    marker = raw_segment_markers.BatchRotationMarker(
+        phase=raw_segment_markers.RotationPhase.POINTER_PENDING,
+        segments={kind: {"old_segment": old_segments[kind], "new_segment": new_segments[kind]} for kind in kinds},
+        created_at_unix=time.time(),
+        closed_segments={},
+    )
+    write_pending_rotation(base, marker)
+    write_current_pointer(base, pointer)
+    marker = marker.mark_manifest_pending()
+    write_pending_rotation(base, marker)
+    return {"kinds": kinds, "old_segments": old_segments, "new_segments": new_segments, "marker": marker}
+
+
+def finish_rotate_all_current_segments(base: pathlib.Path, rotation: dict[str, Any]) -> dict[str, Any]:
+    kinds = tuple(rotation["kinds"])
+    old_segments = rotation["old_segments"]
+    new_segments = rotation["new_segments"]
+    marker = rotation["marker"]
+    if not isinstance(marker, raw_segment_markers.BatchRotationMarker):
+        raise ManifestError("invalid batch rotation marker")
     closed_segments = {}
     for kind in kinds:
         scan = scan_segment_file(pathlib.Path(str(old_segments[kind]["path"])), kind=kind)
         closed_segment = closed_segment_from_current(old_segments[kind], scan, kind=kind)
         append_closed_segment(base, closed_segment)
-        marker.setdefault("closed_segments", {})[kind] = closed_segment
+        try:
+            marker = marker.record_closed_segment(kind, closed_segment)
+        except raw_segment_markers.MarkerValidationError as exc:
+            raise ManifestError(str(exc)) from exc
         write_pending_rotation(base, marker)
         unlink_empty_closed_segment(base, closed_segment)
         closed_segments[kind] = closed_segment
     clear_pending_rotation(base)
     return {kind: {"closed_segment": closed_segments[kind], "current_segment": new_segments[kind]} for kind in kinds}
+
+
+def rotate_all_current_segments(base: pathlib.Path) -> dict[str, Any]:
+    reconcile_pending_rotation(base)
+    with acquire_raw_segment_lock(base):
+        rotation = begin_rotate_all_current_segments_unlocked(base)
+    return finish_rotate_all_current_segments(base, rotation)

@@ -20,7 +20,7 @@ def check_theme_transition_stability(page) -> None:
     page.evaluate(
         """
         () => {
-          localStorage.setItem('codex-token-usage-dashboard-settings', JSON.stringify({themeMode: 'dark'}));
+          localStorage.setItem('bola-dashboard-settings', JSON.stringify({themeMode: 'dark'}));
         }
         """
     )
@@ -330,8 +330,11 @@ def check_toolbar(page) -> None:
           const runningWidth = Math.round(button.getBoundingClientRect().width * 1000) / 1000;
           const runningLabel = button.querySelector('.analyze-button-label').textContent;
           const runningAria = button.getAttribute('aria-label');
+          setAnalyzeButtonState('observing', 'building analytics database', 1, 48);
+          const observingLabel = button.querySelector('.analyze-button-label').textContent;
+          const observingAria = button.getAttribute('aria-label');
           setAnalyzeButtonState('idle', 'Analyze');
-          return {idleWidth, runningWidth, runningLabel, runningAria};
+          return {idleWidth, runningWidth, runningLabel, runningAria, observingLabel, observingAria};
         }
         """
     )
@@ -341,6 +344,48 @@ def check_toolbar(page) -> None:
         f"analyze button size changed when showing Cancel: {analyze_button_state}",
     )
     assert_true("Cancel analysis" in analyze_button_state["runningAria"], f"analyze cancel action is not exposed to assistive tech: {analyze_button_state}")
+    assert_true(
+        analyze_button_state["observingLabel"] == "Analyzing"
+        and "Observing analysis, 48%" in analyze_button_state["observingAria"],
+        f"observed analysis should expose a distinct busy state: {analyze_button_state}",
+    )
+    for viewport_width in (768, 900, 1061, 1100, 1280):
+        page.set_viewport_size({"width": viewport_width, "height": 760})
+        intermediate_state = page.evaluate(
+            """
+            () => {
+              const rect = element => {
+                const value = element.getBoundingClientRect();
+                return {left: value.left, right: value.right, top: value.top, bottom: value.bottom};
+              };
+              const overlaps = (first, second) => (
+                first.left < second.right && first.right > second.left
+                && first.top < second.bottom && first.bottom > second.top
+              );
+              const appbar = rect(document.querySelector('.appbar'));
+              const brandItems = [...document.querySelectorAll('.brand-nav > *')].map(rect);
+              const toolbarItems = [...document.querySelectorAll('.toolbar > *')].map(rect);
+              const pairsOverlap = items => items.some((item, index) => items.slice(index + 1).some(other => overlaps(item, other)));
+              const theme = rect(document.querySelector('.theme-switcher'));
+              return {
+                viewportWidth: innerWidth,
+                bodyScrollWidth: document.documentElement.scrollWidth,
+                appbar,
+                theme,
+                brandOverlap: pairsOverlap(brandItems),
+                toolbarOverlap: pairsOverlap(toolbarItems),
+              };
+            }
+            """
+        )
+        assert_true(
+            intermediate_state["bodyScrollWidth"] == intermediate_state["viewportWidth"]
+            and not intermediate_state["brandOverlap"]
+            and not intermediate_state["toolbarOverlap"]
+            and intermediate_state["theme"]["left"] >= intermediate_state["appbar"]["left"]
+            and intermediate_state["theme"]["right"] <= intermediate_state["appbar"]["right"],
+            f"intermediate-width header controls should not overlap or escape the viewport: {intermediate_state}",
+        )
     page.set_viewport_size({"width": 1280, "height": 720})
     compact_appbar_state = page.evaluate(
         """
@@ -396,6 +441,7 @@ def check_toolbar(page) -> None:
           toggleLeft: Math.round(document.querySelector('.theme-toggle').getBoundingClientRect().left),
           navLeft: Math.round(document.querySelector('.page-nav').getBoundingClientRect().left),
           toggleRight: Math.round(document.querySelector('.theme-toggle').getBoundingClientRect().right),
+          toolbarLeft: Math.round(document.querySelector('.toolbar').getBoundingClientRect().left),
           viewportWidth: window.innerWidth,
           viewportHeight: window.innerHeight,
           pageWidth: document.documentElement.clientWidth,
@@ -407,8 +453,8 @@ def check_toolbar(page) -> None:
     assert_true(theme_initial_state["selectCount"] == 0, f"theme mode should not use a select control: {theme_initial_state}")
     assert_true(70 <= theme_initial_state["appbarHeight"] <= 74, f"theme toggle should not collapse or stretch the header: {theme_initial_state}")
     assert_true(theme_initial_state["subrowCount"] == 0, f"theme toggle should not reserve a header subrow: {theme_initial_state}")
-    assert_true(theme_initial_state["toggleTop"] > theme_initial_state["appbarBottom"], f"bottom theme toggle should sit outside the header: {theme_initial_state}")
-    assert_true(theme_initial_state["toggleBottom"] > theme_initial_state["firstContentTop"], f"theme toggle should live near the bottom viewport edge: {theme_initial_state}")
+    assert_true(theme_initial_state["toggleTop"] >= 0 and theme_initial_state["toggleBottom"] <= theme_initial_state["appbarBottom"], f"theme toggle should stay inside the header: {theme_initial_state}")
+    assert_true(theme_initial_state["firstContentTop"] > theme_initial_state["appbarBottom"], f"dashboard content should start below the header: {theme_initial_state}")
     assert_true(theme_initial_state["labelCount"] == 0, f"theme control should not show a separate Theme label: {theme_initial_state}")
     assert_true(theme_initial_state["lightText"] == "Light", f"light theme button should keep accessible text content: {theme_initial_state}")
     assert_true(theme_initial_state["darkText"] == "Dark", f"dark theme button should keep accessible text content: {theme_initial_state}")
@@ -420,12 +466,11 @@ def check_toolbar(page) -> None:
     assert_true(theme_initial_state["activeButtonOpacity"] == "0.96", f"active theme button should use opacity instead of a filled state: {theme_initial_state}")
     assert_true(theme_initial_state["toggleLeft"] > theme_initial_state["navLeft"], f"theme toggle should stay in the trailing appbar area: {theme_initial_state}")
     assert_true(theme_initial_state["switcherRight"] == theme_initial_state["toggleRight"], f"theme switcher should align as one trailing group: {theme_initial_state}")
-    assert_true(20 <= theme_initial_state["viewportWidth"] - theme_initial_state["toggleRight"] <= 24, f"theme toggle should sit slightly away from the viewport right edge: {theme_initial_state}")
-    assert_true(18 <= theme_initial_state["viewportHeight"] - theme_initial_state["toggleBottom"] <= 22, f"theme toggle should sit near the bottom viewport edge: {theme_initial_state}")
+    assert_true(theme_initial_state["toggleRight"] < theme_initial_state["toolbarLeft"], f"theme toggle should sit between navigation and toolbar controls: {theme_initial_state}")
     assert_true(theme_initial_state["lightPressed"] == "true" and theme_initial_state["darkPressed"] == "false", f"light mode should be active by default: {theme_initial_state}")
     page.locator('[data-theme-mode="dark"]').click()
     page.wait_for_function(
-        "() => document.documentElement.dataset.theme === 'dark' && JSON.parse(localStorage.getItem('codex-token-usage-dashboard-settings') || '{}').themeMode === 'dark'",
+        "() => document.documentElement.dataset.theme === 'dark' && JSON.parse(localStorage.getItem('bola-dashboard-settings') || '{}').themeMode === 'dark'",
         timeout=2_000,
     )
     theme_dark_state = page.evaluate(
@@ -434,14 +479,14 @@ def check_toolbar(page) -> None:
           theme: document.documentElement.dataset.theme || '',
           lightPressed: document.querySelector('[data-theme-mode="light"]').getAttribute('aria-pressed'),
           darkPressed: document.querySelector('[data-theme-mode="dark"]').getAttribute('aria-pressed'),
-          stored: JSON.parse(localStorage.getItem('codex-token-usage-dashboard-settings') || '{}').themeMode || '',
+          stored: JSON.parse(localStorage.getItem('bola-dashboard-settings') || '{}').themeMode || '',
         })
         """
     )
     assert_true(theme_dark_state == {"theme": "dark", "lightPressed": "false", "darkPressed": "true", "stored": "dark"}, f"dark icon should activate dark mode: {theme_dark_state}")
     page.locator('[data-theme-mode="light"]').click()
     page.wait_for_function(
-        "() => document.documentElement.dataset.theme === 'light' && JSON.parse(localStorage.getItem('codex-token-usage-dashboard-settings') || '{}').themeMode === 'light'",
+        "() => document.documentElement.dataset.theme === 'light' && JSON.parse(localStorage.getItem('bola-dashboard-settings') || '{}').themeMode === 'light'",
         timeout=2_000,
     )
     theme_light_state = page.evaluate(
@@ -450,7 +495,7 @@ def check_toolbar(page) -> None:
           theme: document.documentElement.dataset.theme || '',
           lightPressed: document.querySelector('[data-theme-mode="light"]').getAttribute('aria-pressed'),
           darkPressed: document.querySelector('[data-theme-mode="dark"]').getAttribute('aria-pressed'),
-          stored: JSON.parse(localStorage.getItem('codex-token-usage-dashboard-settings') || '{}').themeMode || '',
+          stored: JSON.parse(localStorage.getItem('bola-dashboard-settings') || '{}').themeMode || '',
         })
         """
     )
@@ -508,6 +553,7 @@ def check_toolbar(page) -> None:
           customDays: document.querySelector('#custom-days').value,
           label: document.querySelector('#days').options[document.querySelector('#days').selectedIndex].textContent,
           customOptions: Array.from(document.querySelectorAll('#days option')).filter((option) => option.value.includes('custom') && !option.hidden).length,
+          activeId: document.activeElement?.id || '',
         })
         """
     )
@@ -516,6 +562,7 @@ def check_toolbar(page) -> None:
     assert_true(custom_days_state["customDays"] == "14", f"custom days should store prompt value: {custom_days_state}")
     assert_true(custom_days_state["label"] == "~ 14 Days", f"custom days label should show applied value: {custom_days_state}")
     assert_true(custom_days_state["toolbarHeight"] == toolbar_height, f"custom prompt should not change toolbar row height: {custom_days_state}")
+    assert_true(custom_days_state["activeId"] == "days", f"Enter should restore focus to the time range select: {custom_days_state}")
     page.locator("#days").dispatch_event("pointerdown")
     page.locator("#days").select_option("custom")
     page.wait_for_selector("#custom-days-popover:not([hidden])", timeout=5_000)
@@ -532,12 +579,57 @@ def check_toolbar(page) -> None:
           daysValue: document.querySelector('#days').value,
           customDays: document.querySelector('#custom-days').value,
           label: document.querySelector('#days').options[document.querySelector('#days').selectedIndex].textContent,
+          activeId: document.activeElement?.id || '',
         })
         """
     )
     assert_true(custom_days_reselect_state["daysValue"] == "custom", f"reselecting custom days should keep custom selected: {custom_days_reselect_state}")
     assert_true(custom_days_reselect_state["customDays"] == "21", f"reselecting custom days should update value: {custom_days_reselect_state}")
     assert_true(custom_days_reselect_state["label"] == "~ 21 Days", f"reselecting custom days should update label: {custom_days_reselect_state}")
+    assert_true(custom_days_reselect_state["activeId"] == "days", f"Apply should restore focus to the time range select: {custom_days_reselect_state}")
+    page.locator("#days").dispatch_event("pointerdown")
+    page.locator("#days").select_option("custom")
+    page.wait_for_selector("#custom-days-popover:not([hidden])", timeout=5_000)
+    page.locator("#custom-days-input").fill("33")
+    page.locator("#custom-days-input").press("Escape")
+    custom_days_escape_state = page.evaluate(
+        """
+        () => ({
+          daysValue: document.querySelector('#days').value,
+          customDays: document.querySelector('#custom-days').value,
+          popoverHidden: document.querySelector('#custom-days-popover').hidden,
+          activeId: document.activeElement?.id || '',
+        })
+        """
+    )
+    assert_true(
+        custom_days_escape_state == {
+            "daysValue": "custom",
+            "customDays": "21",
+            "popoverHidden": True,
+            "activeId": "days",
+        },
+        f"Escape should discard edits and restore the time range focus: {custom_days_escape_state}",
+    )
+    page.locator("#days").dispatch_event("pointerdown")
+    page.locator("#days").select_option("custom")
+    page.wait_for_selector("#custom-days-popover:not([hidden])", timeout=5_000)
+    page.locator("#custom-days-input").fill("34")
+    page.locator("#refresh").click()
+    page.wait_for_selector("#custom-days-popover", state="hidden", timeout=5_000)
+    outside_close_state = page.evaluate(
+        """
+        () => ({
+          activeId: document.activeElement?.id || '',
+          customDays: document.querySelector('#custom-days').value,
+          popoverHidden: document.querySelector('#custom-days-popover').hidden,
+        })
+        """
+    )
+    assert_true(
+        outside_close_state == {"activeId": "refresh", "customDays": "21", "popoverHidden": True},
+        f"outside pointer close should preserve the clicked control focus and discard edits: {outside_close_state}",
+    )
     page.locator("#days").dispatch_event("pointerdown")
     page.locator("#days").select_option("custom")
     page.wait_for_selector("#custom-days-popover:not([hidden])", timeout=5_000)
@@ -553,8 +645,8 @@ def check_toolbar(page) -> None:
           label: document.querySelector('#days option[value="custom"]').textContent,
           selectedLabel: document.querySelector('#days').options[document.querySelector('#days').selectedIndex].textContent,
           popoverHidden: document.querySelector('#custom-days-popover').hidden,
-          storedDays: JSON.parse(localStorage.getItem('codex-token-usage-dashboard-settings') || '{}').days,
-          storedCustomDays: JSON.parse(localStorage.getItem('codex-token-usage-dashboard-settings') || '{}').customDays,
+          storedDays: JSON.parse(localStorage.getItem('bola-dashboard-settings') || '{}').days,
+          storedCustomDays: JSON.parse(localStorage.getItem('bola-dashboard-settings') || '{}').customDays,
         })
         """
     )
@@ -572,8 +664,8 @@ def check_toolbar(page) -> None:
         () => ({
           rowsControl: !!document.querySelector('#rows'),
           percentPopover: !!document.querySelector('#custom-percent-popover'),
-          storedRows: JSON.parse(localStorage.getItem('codex-token-usage-dashboard-settings') || '{}').rows,
-          storedCustomPercent: JSON.parse(localStorage.getItem('codex-token-usage-dashboard-settings') || '{}').customPercent,
+          storedRows: JSON.parse(localStorage.getItem('bola-dashboard-settings') || '{}').rows,
+          storedCustomPercent: JSON.parse(localStorage.getItem('bola-dashboard-settings') || '{}').customPercent,
         })
         """
     )

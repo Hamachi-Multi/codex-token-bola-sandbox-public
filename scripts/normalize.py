@@ -11,8 +11,7 @@ import argparse
 import gzip
 import sys
 from functools import lru_cache
-from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
@@ -24,17 +23,29 @@ import service_paths
 import raw_segments
 import cancel_control
 import progress_control
+import quarantine_health
+import normalize_publish
+import transcript_parser
+import turn_lifecycle
+import turn_resolution
 
-CODEX_HOME = pathlib.Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
-BASE_DIR = service_paths.service_root(CODEX_HOME)
+RUNTIME_PATHS = service_paths.resolve_runtime_paths()
+CODEX_DIR = RUNTIME_PATHS.codex_dir
+BASE_DIR = RUNTIME_PATHS.output_dir
 NORMALIZED_LOG = BASE_DIR / "normalized" / "prompt-usage.normalized.jsonl"
 BAD_LOG = BASE_DIR / "bad" / "prompt-usage.bad.jsonl"
 STATE_FILE = BASE_DIR / "normalized" / "normalize-state.json"
 USAGE_KEYS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens")
-NORMALIZE_LOGIC_VERSION = 5
+NORMALIZE_LOGIC_VERSION = 7
+TRANSCRIPT_LIFECYCLE_CACHE_MAXSIZE = 256
+QUARANTINE_RESULTS: list[dict[str, Any]] = []
 
 
 class PendingPublishRecoveryError(RuntimeError):
+    pass
+
+
+class TranscriptChangedDuringScan(RuntimeError):
     pass
 
 
@@ -78,179 +89,110 @@ def normalize_usage(value: Any) -> dict[str, Any]:
     return usage
 
 
-def usage_sum(items: list[dict[str, Any]]) -> dict[str, int]:
-    total = zero_usage()
-    for item in items:
-        usage = normalize_usage(item)
-        for key in USAGE_KEYS:
-            total[key] += safe_int(usage.get(key))
-    return total
+def transcript_file_version(stat_result: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+    )
 
 
-def unix_or_timestamp_to_iso(value: Any, fallback: Any = None) -> str | None:
-    raw_value = value if value is not None else fallback
-    if raw_value is None:
-        return None
-    if isinstance(raw_value, (int, float)):
-        return datetime.fromtimestamp(raw_value, timezone.utc).isoformat()
-    if isinstance(raw_value, str) and raw_value:
-        text = raw_value[:-1] + "+00:00" if raw_value.endswith("Z") else raw_value
-        try:
-            return datetime.fromisoformat(text).astimezone(timezone.utc).isoformat()
-        except ValueError:
-            return raw_value
-    return None
+def transcript_snapshot_matches(
+    stat_result: os.stat_result,
+    expected: tuple[int, int, int, int, int],
+) -> bool:
+    device, inode, size, mtime_ns, ctime_ns = expected
+    if stat_result.st_dev != device or stat_result.st_ino != inode or stat_result.st_size < size:
+        return False
+    if stat_result.st_size > size:
+        return True
+    return stat_result.st_mtime_ns == mtime_ns and stat_result.st_ctime_ns == ctime_ns
 
 
-def lifecycle_snapshot(
-    path: pathlib.Path,
-    turn_id: str,
-    started_at: str | None,
-    stopped_at: str | None,
-    status: str | None,
-    event_count: int,
-    usages: list[dict[str, Any]],
-    parse_error_seen: bool,
+@lru_cache(maxsize=TRANSCRIPT_LIFECYCLE_CACHE_MAXSIZE)
+def cached_transcript_lifecycle_index(
+    transcript_path: str,
+    version: tuple[int, int, int, int, int],
 ) -> dict[str, Any]:
-    if not started_at:
-        return {"found": False, "reason": "task_started_missing", "path": str(path), "parse_error_seen": parse_error_seen}
-    if not status:
-        return {
-            "found": False,
-            "reason": "task_terminal_missing",
-            "path": str(path),
-            "parse_error_seen": parse_error_seen,
-            "turn_started_at": started_at,
-        }
-    return {
-        "found": True,
-        "path": str(path),
-        "event_count": event_count,
-        "parse_error_seen": parse_error_seen,
-        "turn_status": status,
-        "turn_started_at": started_at,
-        "turn_stopped_at": stopped_at,
-        "total_token_usage": usage_sum(usages),
-        "token_source": "transcript_path task lifecycle token_count.info.last_token_usage aggregate",
-    }
+    path = pathlib.Path(transcript_path)
+    expected_size = version[2]
+    reducer = turn_lifecycle.LifecycleIndexReducer()
 
-
-@lru_cache(maxsize=None)
-def transcript_lifecycle_index(transcript_path: str) -> dict[str, Any]:
-    path = pathlib.Path(transcript_path).expanduser()
-    if not path.exists():
-        return {"_error": {"found": False, "reason": "transcript_missing", "path": str(path)}}
-
-    turns: dict[str, dict[str, Any]] = {}
-    current_turn_id: str | None = None
-    started_at: str | None = None
-    stopped_at: str | None = None
-    status: str | None = None
-    event_count = 0
-    usages: list[dict[str, Any]] = []
-    parse_error_seen = False
-
-    try:
-        size = file_size(path)
-        with path.open("r", encoding="utf-8") as handle:
-            line_no = 0
-            for line in handle:
-                line_no += 1
-                if line_no == 1 or line_no % 200 == 0:
-                    cancel_control.check_cancelled("normalize", f"lifecycle:{path.name}:{line_no}")
-                    source_progress = 0.0
-                    if size > 0:
-                        try:
-                            source_progress = handle.tell() / size
-                        except OSError:
-                            source_progress = 0.0
-                    progress_control.write_progress(
-                        phase="normalize",
-                        phase_index=0,
-                        checkpoint=f"lifecycle:{path.name}:{line_no}",
-                        phase_progress=progress_control.clamp(source_progress),
-                    )
-                try:
-                    item = json.loads(line)
-                except json.JSONDecodeError:
-                    parse_error_seen = True
-                    continue
-                if item.get("type") != "event_msg":
-                    continue
-                payload = item.get("payload") or {}
-                payload_type = payload.get("type")
-                if payload_type == "task_started":
-                    if current_turn_id:
-                        turns[current_turn_id] = lifecycle_snapshot(
-                            path,
-                            current_turn_id,
-                            started_at,
-                            stopped_at,
-                            status,
-                            event_count,
-                            usages,
-                            parse_error_seen,
-                        )
-                    current_turn_id = str(payload.get("turn_id") or "")
-                    started_at = unix_or_timestamp_to_iso(payload.get("started_at"), item.get("timestamp"))
-                    stopped_at = None
-                    status = None
-                    event_count = 0
-                    usages = []
-                    continue
-                if not current_turn_id:
-                    continue
-                if payload_type == "token_count":
-                    info = payload.get("info")
-                    if not isinstance(info, dict):
-                        continue
-                    event_count += 1
-                    usages.append(normalize_usage(info.get("last_token_usage")))
-                    continue
-                if payload.get("turn_id") != current_turn_id:
-                    continue
-                if payload_type == "task_complete":
-                    status = "completed"
-                    stopped_at = unix_or_timestamp_to_iso(payload.get("completed_at"), item.get("timestamp"))
-                elif payload_type in {"task_aborted", "turn_aborted"}:
-                    status = "aborted"
-                    stopped_at = unix_or_timestamp_to_iso(
-                        payload.get("aborted_at") or payload.get("completed_at"),
-                        item.get("timestamp"),
-                    )
-                else:
-                    continue
-                turns[current_turn_id] = lifecycle_snapshot(
-                    path,
-                    current_turn_id,
-                    started_at,
-                    stopped_at,
-                    status,
-                    event_count,
-                    usages,
-                    parse_error_seen,
+    with path.open("rb") as handle:
+        if not transcript_snapshot_matches(os.fstat(handle.fileno()), version):
+            raise TranscriptChangedDuringScan(str(path))
+        line_no = 0
+        while handle.tell() < expected_size:
+            line_start = handle.tell()
+            line = handle.readline(expected_size - line_start + 1)
+            if not line:
+                break
+            if handle.tell() > expected_size:
+                break
+            line_no += 1
+            if line_no == 1 or line_no % 200 == 0:
+                cancel_control.check_cancelled("normalize", f"lifecycle:{path.name}:{line_no}")
+                source_progress = handle.tell() / expected_size if expected_size > 0 else 0.0
+                progress_control.write_progress(
+                    phase="normalize",
+                    phase_index=0,
+                    checkpoint=f"lifecycle:{path.name}:{line_no}",
+                    phase_progress=progress_control.clamp(source_progress),
                 )
-                current_turn_id = None
-                started_at = None
-                stopped_at = None
-                status = None
-                event_count = 0
-                usages = []
-    except OSError as exc:
-        return {"_error": {"found": False, "reason": "read_error", "error": repr(exc), "path": str(path)}}
+            item, parse_error = transcript_parser.parse_transcript_object(line)
+            if parse_error:
+                reducer.mark_parse_error()
+                continue
+            if item.get("type") != "event_msg":
+                continue
+            payload = item.get("payload")
+            if not isinstance(payload, dict):
+                reducer.mark_parse_error()
+                continue
+            reducer.feed({"item": item, "line_start": line_start, "next_offset": handle.tell()})
+        if not transcript_snapshot_matches(os.fstat(handle.fileno()), version):
+            raise TranscriptChangedDuringScan(str(path))
 
-    if current_turn_id:
-        turns[current_turn_id] = lifecycle_snapshot(
-            path,
-            current_turn_id,
-            started_at,
-            stopped_at,
-            status,
-            event_count,
-            usages,
-            parse_error_seen,
+    accumulators = reducer.finish()
+    turns = {
+        turn_id: turn_lifecycle.full_lifecycle_snapshot(
+            accumulator,
+            path=str(path),
+            parse_error_seen=accumulator.parse_error_seen,
+            include_model_calls=False,
+            include_latest_fields=False,
         )
-    return {"_turns": turns, "_parse_error_seen": parse_error_seen}
+        for turn_id, accumulator in accumulators.items()
+    }
+    return {"_turns": turns, "_parse_error_seen": reducer.parse_error_seen}
+
+
+def transcript_lifecycle_index(transcript_path: str) -> dict[str, Any]:
+    path = pathlib.Path(transcript_path).expanduser().resolve(strict=False)
+    for _attempt in range(2):
+        try:
+            version = transcript_file_version(path.stat())
+        except FileNotFoundError:
+            return {"_error": {"found": False, "reason": "transcript_missing", "path": str(path)}}
+        except OSError as exc:
+            return {"_error": {"found": False, "reason": "read_error", "error": repr(exc), "path": str(path)}}
+        try:
+            return cached_transcript_lifecycle_index(str(path), version)
+        except TranscriptChangedDuringScan:
+            continue
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            return {"_error": {"found": False, "reason": "read_error", "error": repr(exc), "path": str(path)}}
+    return {
+        "_error": {
+            "found": False,
+            "reason": "transcript_changed_during_scan",
+            "path": str(path),
+        }
+    }
 
 
 def task_lifecycle_token_usage(transcript_path: str | None, turn_id: str) -> dict[str, Any]:
@@ -284,11 +226,15 @@ def recover_missing_start_state_lifecycle(row: dict[str, Any]) -> dict[str, Any]
     if not snapshot.get("found"):
         return row
     status = str(snapshot.get("turn_status") or "completed")
+    resolution_status = turn_resolution.RESOLVED if safe_int(snapshot.get("event_count")) > 0 else turn_resolution.UNAVAILABLE
+    resolution_reason = None if resolution_status == turn_resolution.RESOLVED else f"no_token_count_before_{'task_aborted' if status == 'aborted' else 'task_complete'}"
     recovered = dict(row)
     recovered.update(
         {
             "turn_status": status,
             "lifecycle_end_reason": f"goal_auto_{status}",
+            "token_resolution_status": resolution_status,
+            "token_resolution_reason": resolution_reason,
             "started_at": snapshot.get("turn_started_at"),
             "stopped_at": snapshot.get("turn_stopped_at") or row.get("stopped_at"),
             "usage": snapshot.get("total_token_usage"),
@@ -311,39 +257,112 @@ def recover_missing_start_state_lifecycle(row: dict[str, Any]) -> dict[str, Any]
     return recovered
 
 
+def recover_pending_token_resolution(row: dict[str, Any]) -> dict[str, Any]:
+    if turn_resolution.status_from_row(row) != turn_resolution.PENDING:
+        return row
+    turn_id = str(row.get("turn_id") or "")
+    if not turn_id:
+        return row
+    snapshot = task_lifecycle_token_usage(row.get("transcript_path"), turn_id)
+    if not snapshot.get("found"):
+        reason = str(snapshot.get("reason") or "token_resolution_pending")
+        if reason not in {"missing_transcript_path", "transcript_missing", "task_started_missing"}:
+            return row
+        unavailable = dict(row)
+        unavailable.update(
+            {
+                "token_resolution_status": turn_resolution.UNAVAILABLE,
+                "token_resolution_reason": reason,
+            }
+        )
+        return unavailable
+    status = str(snapshot.get("turn_status") or row.get("turn_status") or "completed")
+    event_count = safe_int(snapshot.get("event_count"))
+    resolution_status = turn_resolution.RESOLVED if event_count > 0 else turn_resolution.UNAVAILABLE
+    resolution_reason = None if resolution_status == turn_resolution.RESOLVED else f"no_token_count_before_{'task_aborted' if status == 'aborted' else 'task_complete'}"
+    recovered = dict(row)
+    recovered.update(
+        {
+            "turn_status": status,
+            "lifecycle_end_reason": f"goal_auto_{status}" if status != "completed" else None,
+            "token_resolution_status": resolution_status,
+            "token_resolution_reason": resolution_reason,
+            "started_at": snapshot.get("turn_started_at") or row.get("started_at"),
+            "stopped_at": snapshot.get("turn_stopped_at") or row.get("stopped_at"),
+            "usage": snapshot.get("total_token_usage"),
+            "end_token_usage": snapshot.get("total_token_usage"),
+            "end_token_snapshot": dict(snapshot),
+            "model_call_count": event_count,
+            "token_source": snapshot.get("token_source"),
+            "estimated": True,
+        }
+    )
+    return recovered
+
+
 def unresolved_zero_estimate(row: dict[str, Any]) -> bool:
-    if not row.get("estimated"):
-        return False
-    if row.get("lifecycle_end_reason") not in {
-        "pending_token_count",
-        "missing_start_state",
-        "unresolved_transcript_path",
-    }:
-        return False
-    if row.get("transcript_path"):
-        return False
-    usage = normalize_usage(row.get("usage"))
-    if usage["total_tokens"] != 0:
-        return False
-    snapshot = row.get("end_token_snapshot")
-    if isinstance(snapshot, dict) and snapshot.get("found"):
-        return False
-    return True
+    return turn_resolution.status_from_row(row) == turn_resolution.PENDING
+
+
+def record_unavailable_event(row: dict[str, Any]) -> None:
+    event, evidence_path, captured_at_ns = turn_resolution.write_unavailable_evidence(token_usage_root(), row)
+    row["token_resolution_event_id"] = event
+    QUARANTINE_RESULTS.append(
+        quarantine_health.record_event(
+            token_usage_root(),
+            event=event,
+            kind=turn_resolution.UNAVAILABLE_KIND,
+            source=str(row.get("transcript_path") or "unknown"),
+            error=str(row.get("token_resolution_reason") or "unknown"),
+            evidence_path=evidence_path,
+            captured_at_ns=captured_at_ns,
+        )
+    )
 
 
 def append_bad(source: str, line_no: int, line: str, error: str) -> None:
-    BAD_LOG.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(BAD_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    os.fchmod(fd, 0o600)
-    with os.fdopen(fd, "a", encoding="utf-8") as handle:
-        handle.write(
-            json.dumps(
-                {"captured_at_ns": time.time_ns(), "source": source, "line_no": line_no, "error": error, "line": line},
-                ensure_ascii=False,
-                separators=(",", ":"),
+    captured_at_ns = time.time_ns()
+    event = quarantine_health.event_id(kind="normalize_raw", source=source, content=line, error=error)
+    try:
+        if BAD_LOG.parent.is_symlink() or BAD_LOG.is_symlink():
+            raise OSError("quarantine evidence path must not be a symlink")
+        BAD_LOG.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(BAD_LOG, flags, 0o600)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "captured_at_ns": captured_at_ns,
+                        "event_id": event,
+                        "kind": "normalize_raw",
+                        "source": source,
+                        "line_no": line_no,
+                        "error": error,
+                        "line": line,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
             )
-            + "\n"
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        raise quarantine_health.QuarantineError(f"cannot write quarantine evidence: {BAD_LOG}: {type(exc).__name__}") from exc
+    QUARANTINE_RESULTS.append(
+        quarantine_health.record_event(
+            token_usage_root(),
+            event=event,
+            kind="normalize_raw",
+            source=source,
+            error=error,
+            evidence_path=BAD_LOG,
+            captured_at_ns=captured_at_ns,
+            line_no=line_no,
         )
+    )
 
 
 JSONL_OFFSET_SCAN_CHUNK_BYTES = 64 * 1024
@@ -529,6 +548,7 @@ def full_turn_sources() -> list[pathlib.Path]:
 
 def normalize_row(row: dict[str, Any]) -> dict[str, Any]:
     row = recover_missing_start_state_lifecycle(row)
+    row = recover_pending_token_resolution(row)
     status = row.get("turn_status") or "completed"
     normalized = dict(row)
     normalized["schema_version"] = 2
@@ -560,11 +580,13 @@ def normalize_row(row: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def rank(row: dict[str, Any]) -> tuple[int, int, int, int]:
+def rank(row: dict[str, Any]) -> tuple[int, int, int, int, int]:
     status = row.get("turn_status")
     estimated = bool(row.get("estimated"))
     status_rank = {"completed": 3, "aborted": 2, "incomplete": 1}.get(status, 0)
+    resolution_rank = {turn_resolution.RESOLVED: 2, turn_resolution.UNAVAILABLE: 1, turn_resolution.PENDING: 0}[turn_resolution.status_from_row(row)]
     return (
+        resolution_rank,
         status_rank,
         0 if estimated else 1,
         safe_int(row.get("schema_version")),
@@ -620,13 +642,21 @@ def write_state(state: dict[str, Any]) -> None:
     STATE_FILE.chmod(0o600)
 
 
+def normalize_identity(
+    sources: dict[str, int],
+    processed_segments: dict[str, dict[str, Any]] | None = None,
+) -> normalize_publish.NormalizeCommitIdentity:
+    return normalize_publish.NormalizeCommitIdentity.from_state(
+        {
+            "logic_version": NORMALIZE_LOGIC_VERSION,
+            "sources": sources,
+            "processed_segments": processed_segments or {},
+        }
+    )
+
+
 def normalize_state(sources: dict[str, int], processed_segments: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
-    return {
-        "logic_version": NORMALIZE_LOGIC_VERSION,
-        "sources": sources,
-        "processed_segments": processed_segments or {},
-        "normalized_log_size": file_size(NORMALIZED_LOG),
-    }
+    return normalize_identity(sources, processed_segments).to_state(normalized_log_size=file_size(NORMALIZED_LOG))
 
 
 def pending_publish_file() -> pathlib.Path:
@@ -646,19 +676,17 @@ def truncate_file(path: pathlib.Path, size: int) -> None:
 def write_pending_publish(turns_offset: int, state: dict[str, Any], *, full_publish: bool = False) -> None:
     path = pending_publish_file()
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "schema_version": 1,
-        "created_at_unix": time.time(),
-        "outputs": {
-            str(NORMALIZED_LOG): turns_offset,
-        },
-        "state": state,
-        "full_publish": bool(full_publish),
-    }
+    marker = normalize_publish.NormalizePendingPublish.create(
+        created_at_unix=time.time(),
+        output_path=NORMALIZED_LOG,
+        rollback_offset=turns_offset,
+        state=state,
+        full_publish=full_publish,
+    )
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+        handle.write(json.dumps(marker.to_payload(), ensure_ascii=False, separators=(",", ":")) + "\n")
     tmp.replace(path)
     path.chmod(0o600)
 
@@ -673,25 +701,25 @@ def recover_pending_publish() -> None:
         raise PendingPublishRecoveryError(f"failed to read pending normalize publish marker: {path}") from exc
     if not isinstance(payload, dict):
         raise PendingPublishRecoveryError(f"invalid pending normalize publish marker: {path}")
-    state = payload.get("state") if isinstance(payload.get("state"), dict) else {}
+    try:
+        marker = normalize_publish.NormalizePendingPublish.from_payload(
+            payload,
+            expected_output_path=NORMALIZED_LOG,
+        )
+    except normalize_publish.NormalizePublishValidationError as exc:
+        raise PendingPublishRecoveryError(f"invalid pending normalize publish marker: {path}: {exc}") from exc
     current_state = read_state()
-    if (
-        current_state.get("logic_version") == state.get("logic_version")
-        and current_state.get("sources") == state.get("sources")
-        and (current_state.get("processed_segments") or {}) == (state.get("processed_segments") or {})
-    ):
+    if marker.identity.matches_state(current_state):
         try:
             path.unlink(missing_ok=True)
         except OSError as exc:
             raise PendingPublishRecoveryError(f"failed to clear pending normalize publish marker: {path}") from exc
         return
-    outputs = payload.get("outputs") if isinstance(payload.get("outputs"), dict) else {}
-    for output_path, offset in outputs.items():
-        try:
-            truncate_file(pathlib.Path(output_path), safe_int(offset))
-        except OSError as exc:
-            raise PendingPublishRecoveryError(f"failed to recover normalized output: {output_path}") from exc
-    if payload.get("full_publish"):
+    try:
+        truncate_file(marker.output_path, marker.rollback_offset)
+    except OSError as exc:
+        raise PendingPublishRecoveryError(f"failed to recover normalized output: {marker.output_path}") from exc
+    if marker.full_publish:
         try:
             STATE_FILE.unlink(missing_ok=True)
         except OSError as exc:
@@ -700,6 +728,20 @@ def recover_pending_publish() -> None:
         path.unlink(missing_ok=True)
     except OSError as exc:
         raise PendingPublishRecoveryError(f"failed to clear pending normalize publish marker: {path}") from exc
+
+
+def commit_normalized_publish(
+    *,
+    rollback_offset: int,
+    identity: normalize_publish.NormalizeCommitIdentity,
+    full_publish: bool,
+    publish_output: Callable[[], None],
+) -> None:
+    pending_state = identity.to_state(normalized_log_size=file_size(NORMALIZED_LOG))
+    write_pending_publish(rollback_offset, pending_state, full_publish=full_publish)
+    publish_output()
+    write_state(identity.to_state(normalized_log_size=file_size(NORMALIZED_LOG)))
+    pending_publish_file().unlink(missing_ok=True)
 
 
 def source_offsets() -> dict[str, int]:
@@ -751,7 +793,6 @@ def incremental_source_plan(
     current_segments: dict[str, dict[str, Any]],
 ) -> list[tuple[pathlib.Path, int, int]] | None:
     plan: list[tuple[pathlib.Path, int, int]] = []
-    current_paths = set(current_sizes)
     previous_paths = set(previous_sources)
     closed_by_path = {str(item.get("path") or ""): (segment_id, item) for segment_id, item in current_segments.items()}
 
@@ -844,14 +885,18 @@ def full_normalize() -> dict[str, Any]:
     cancel_control.check_cancelled("normalize", "publish-full")
     progress_control.write_progress(phase="normalize", phase_index=0, checkpoint="publish-full", phase_progress=0.98)
     turns_offset = file_size(NORMALIZED_LOG)
-    pending_state = normalize_state(state_sources, state_segments)
+    identity = normalize_identity(state_sources, state_segments)
     rows = sorted(by_turn.values(), key=lambda item: (str(item.get("captured_at") or ""), str(item.get("turn_id") or "")))
     for row in rows:
+        if turn_resolution.status_from_row(row) == turn_resolution.UNAVAILABLE:
+            record_unavailable_event(row)
         row.pop("_source_priority", None)
-    write_pending_publish(0, pending_state, full_publish=True)
-    write_jsonl_private(NORMALIZED_LOG, rows)
-    write_state(normalize_state(state_sources, state_segments))
-    pending_publish_file().unlink(missing_ok=True)
+    commit_normalized_publish(
+        rollback_offset=0,
+        identity=identity,
+        full_publish=True,
+        publish_output=lambda: write_jsonl_private(NORMALIZED_LOG, rows),
+    )
     return {
         "mode": "full",
         "rows": len(rows),
@@ -908,14 +953,18 @@ def incremental_normalize() -> dict[str, Any]:
 
     rows = sorted(by_turn.values(), key=lambda item: (str(item.get("captured_at") or ""), str(item.get("turn_id") or "")))
     for row in rows:
+        if turn_resolution.status_from_row(row) == turn_resolution.UNAVAILABLE:
+            record_unavailable_event(row)
         row.pop("_source_priority", None)
     cancel_control.check_cancelled("normalize", "publish-incremental")
     progress_control.write_progress(phase="normalize", phase_index=0, checkpoint="publish-incremental", phase_progress=0.98)
-    pending_state = normalize_state(current_complete_sizes, current_segments)
-    write_pending_publish(turns_offset, pending_state)
-    append_jsonl_private(NORMALIZED_LOG, rows)
-    write_state(normalize_state(current_complete_sizes, current_segments))
-    pending_publish_file().unlink(missing_ok=True)
+    identity = normalize_identity(current_complete_sizes, current_segments)
+    commit_normalized_publish(
+        rollback_offset=turns_offset,
+        identity=identity,
+        full_publish=False,
+        publish_output=lambda: append_jsonl_private(NORMALIZED_LOG, rows),
+    )
     return {
         "mode": "incremental",
         "rows": len(rows),
@@ -927,17 +976,29 @@ def incremental_normalize() -> dict[str, Any]:
 
 def main() -> int:
     args = parse_args()
+    QUARANTINE_RESULTS.clear()
     try:
-        service_paths.assert_migrated(CODEX_HOME)
         with service_lock.acquire_service_lock(reason="normalize"):
             result = incremental_normalize() if args.incremental else full_normalize()
+        quarantine = quarantine_health.operation_summary(QUARANTINE_RESULTS)
+        result["quarantine"] = quarantine
+        result["status"] = "degraded" if quarantine["unacknowledged_events"] else "healthy"
         print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
-        return 0
+        return 1 if result["status"] == "degraded" else 0
     except cancel_control.Cancelled as exc:
         print(json.dumps(exc.payload(), ensure_ascii=False, separators=(",", ":")))
         return cancel_control.CANCEL_EXIT_CODE
     except PendingPublishRecoveryError as exc:
         print(json.dumps(pending_publish_recovery_error_payload(exc), ensure_ascii=False, separators=(",", ":")))
+        return 2
+    except quarantine_health.QuarantineError as exc:
+        print(
+            json.dumps(
+                {"status": "failed", "error": "quarantine_record_failed", "message": str(exc)},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
         return 2
 
 

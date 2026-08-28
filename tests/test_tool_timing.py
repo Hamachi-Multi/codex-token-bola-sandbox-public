@@ -88,6 +88,41 @@ class ToolTimingTests(unittest.TestCase):
         self.assertEqual(turn["usage"]["weighted_credits"], 2_700_000.0)
         self.assertEqual(stored, (2_700_000.0, 2_700_000.0))
 
+    def test_turn_rows_index_prompt_start_time_separately_from_capture_time(self) -> None:
+        build = load_module("build_analytics_prompt_time_test", ROOT / "scripts" / "build_analytics.py")
+        con = sqlite3.connect(":memory:")
+        try:
+            build.setup_db(con)
+            build.upsert_turn_row(
+                con,
+                {
+                    "session_id": "s1",
+                    "turn_id": "t1",
+                    "captured_at": "2026-08-23T07:57:02+00:00",
+                    "started_at": "2026-07-19T17:39:06+00:00",
+                    "usage": {},
+                },
+                {},
+            )
+            stored = con.execute("select captured_at_unix, started_at_unix from turns").fetchone()
+        finally:
+            con.close()
+
+        self.assertEqual(stored[0], datetime.fromisoformat("2026-08-23T07:57:02+00:00").timestamp())
+        self.assertEqual(stored[1], datetime.fromisoformat("2026-07-19T17:39:06+00:00").timestamp())
+
+    def test_raw_segment_time_prefers_prompt_start_over_recovery_capture(self) -> None:
+        raw_segments = load_module("raw_segments_prompt_time_test", ROOT / "scripts" / "raw_segments.py")
+        row = {
+            "started_at": "2026-07-19T17:39:06+00:00",
+            "captured_at": "2026-08-23T07:57:02+00:00",
+        }
+
+        self.assertEqual(
+            raw_segments.row_time(row, kind="prompt_usage"),
+            datetime.fromisoformat("2026-07-19T17:39:06+00:00").timestamp(),
+        )
+
     def test_raw_segment_manifest_round_trips_owner_only(self) -> None:
         raw_segments = load_module("raw_segments_manifest_test", ROOT / "scripts" / "raw_segments.py")
         with tempfile.TemporaryDirectory() as tmp:
@@ -174,7 +209,10 @@ class ToolTimingTests(unittest.TestCase):
                 self.assertNotEqual(current_pointer["current"]["prompt_usage"]["path"], str(old_path))
                 original_write_manifest(base_arg, manifest)
 
-            with mock.patch.object(raw_segments._rotation, "write_current_pointer", side_effect=spy_pointer), mock.patch.object(raw_segments._rotation, "write_manifest", side_effect=spy_manifest):
+            with (
+                mock.patch.object(raw_segments._rotation, "write_current_pointer", side_effect=spy_pointer),
+                mock.patch.object(raw_segments._rotation, "write_manifest", side_effect=spy_manifest),
+            ):
                 raw_segments.rotate_current_segment(base=base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
 
             first_pointer = observed.index("pointer")
@@ -257,7 +295,9 @@ class ToolTimingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             base = pathlib.Path(tmp)
             current = raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
-            pathlib.Path(current["path"]).write_text(json.dumps(_turn_raw("s1", "t1", total=100) | {"captured_at": "2026-05-20T00:00:00+00:00"}) + "\n", encoding="utf-8")
+            pathlib.Path(current["path"]).write_text(
+                json.dumps(_turn_raw("s1", "t1", total=100) | {"captured_at": "2026-05-20T00:00:00+00:00"}) + "\n", encoding="utf-8"
+            )
             raw_lock_released_before_scan = False
             original_scan = raw_segments._rotation.scan_segment_file
 
@@ -277,7 +317,19 @@ class ToolTimingTests(unittest.TestCase):
             outside = base / "raw" / "prompt-usage.raw.jsonl"
             outside.parent.mkdir(parents=True)
             outside.write_text("", encoding="utf-8")
-            raw_segments.write_current_pointer(base, {"current": {"prompt_usage": {"id": "prompt-usage.raw.jsonl.current.bad", "kind": "prompt_usage", "source_name": "prompt-usage.raw.jsonl", "path": str(outside)}}})
+            raw_segments.write_current_pointer(
+                base,
+                {
+                    "current": {
+                        "prompt_usage": {
+                            "id": "prompt-usage.raw.jsonl.current.bad",
+                            "kind": "prompt_usage",
+                            "source_name": "prompt-usage.raw.jsonl",
+                            "path": str(outside),
+                        }
+                    }
+                },
+            )
             with self.assertRaises(raw_segments.ManifestError):
                 raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
 
@@ -313,7 +365,18 @@ class ToolTimingTests(unittest.TestCase):
             segment = base / "raw" / "current" / "prompt-usage.raw.jsonl.current.1777593600000000000.jsonl"
             segment.parent.mkdir(parents=True)
             segment.write_text("", encoding="utf-8")
-            raw_segments.write_current_pointer(base, {"current": {"prompt_usage": {"id": "prompt-usage.raw.jsonl.current.1777593600000000000", "source_name": "prompt-usage.raw.jsonl", "path": str(segment)}}})
+            raw_segments.write_current_pointer(
+                base,
+                {
+                    "current": {
+                        "prompt_usage": {
+                            "id": "prompt-usage.raw.jsonl.current.1777593600000000000",
+                            "source_name": "prompt-usage.raw.jsonl",
+                            "path": str(segment),
+                        }
+                    }
+                },
+            )
 
             with self.assertRaises(raw_segments.ManifestError):
                 raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
@@ -338,27 +401,30 @@ class ToolTimingTests(unittest.TestCase):
                 raw_segments.validate_current_segment_entry(base, segment, kind="prompt_usage")
 
     def test_hook_append_uses_raw_segment_lock_without_service_lock(self) -> None:
-        hook = load_module("hook_current_segment_append_test", ROOT / "hooks" / "token-usage.py")
+        hook = load_module("hook_current_segment_append_test", ROOT / "scripts" / "hook.py")
         raw_segments = load_module("raw_segments_hook_append_test", ROOT / "scripts" / "raw_segments.py")
         service_lock = load_module("service_lock_hook_append_test", ROOT / "scripts" / "service_lock.py")
         with tempfile.TemporaryDirectory() as tmp:
-            codex_home = pathlib.Path(tmp) / ".codex"
-            base = codex_home / "codex-token-bola"
-            with service_lock.acquire_service_lock(reason="test", codex_home=str(codex_home)):
-                hook.append_prompt_usage({"session_id": "s1", "turn_id": "t1", "captured_at": "2026-05-20T00:00:00+00:00"}, codex_home=codex_home)
+            codex_dir = pathlib.Path(tmp) / ".codex"
+            base = codex_dir / "bola"
+            with service_lock.acquire_service_lock(reason="test", output_dir=base):
+                hook.append_prompt_usage(
+                    {"session_id": "s1", "turn_id": "t1", "captured_at": "2026-05-20T00:00:00+00:00"},
+                    base_dir=base,
+                )
             current = raw_segments.strict_read_current_pointer(base)["current"]["prompt_usage"]
             self.assertIn('"turn_id":"t1"', pathlib.Path(current["path"]).read_text(encoding="utf-8").replace(" ", ""))
 
     def test_hook_append_uses_raw_segment_lock_for_default_current_segment(self) -> None:
-        hook = load_module("hook_default_current_append_lock_test", ROOT / "hooks" / "token-usage.py")
+        hook = load_module("hook_default_current_append_lock_test", ROOT / "scripts" / "hook.py")
         raw_segments = load_module("raw_segments_default_current_append_lock_test", ROOT / "scripts" / "raw_segments.py")
         with tempfile.TemporaryDirectory() as tmp:
-            codex_home = pathlib.Path(tmp) / ".codex"
-            base = codex_home / "codex-token-bola"
+            codex_dir = pathlib.Path(tmp) / ".codex"
+            base = codex_dir / "bola"
             record = {"session_id": "s1", "turn_id": "t1", "captured_at": "2026-05-20T00:00:00+00:00"}
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                 with raw_segments.acquire_raw_segment_lock(base):
-                    future = executor.submit(hook.append_prompt_usage, record, codex_home=codex_home)
+                    future = executor.submit(hook.append_prompt_usage, record, base_dir=base)
                     time.sleep(0.1)
                     self.assertFalse(future.done())
                 self.assertTrue(future.result(timeout=5))
@@ -366,24 +432,59 @@ class ToolTimingTests(unittest.TestCase):
             self.assertIn('"turn_id":"t1"', pathlib.Path(current["path"]).read_text(encoding="utf-8").replace(" ", ""))
 
     def test_hook_append_survives_current_segment_rotation(self) -> None:
-        hook = load_module("hook_current_segment_rotation_survival_test", ROOT / "hooks" / "token-usage.py")
+        hook = load_module("hook_current_segment_rotation_survival_test", ROOT / "scripts" / "hook.py")
         raw_segments = load_module("raw_segments_hook_rotation_survival_test", ROOT / "scripts" / "raw_segments.py")
         with tempfile.TemporaryDirectory() as tmp:
-            codex_home = pathlib.Path(tmp) / ".codex"
-            base = codex_home / "codex-token-bola"
+            codex_dir = pathlib.Path(tmp) / ".codex"
+            base = codex_dir / "bola"
             record = {"session_id": "s1", "turn_id": "t1", "captured_at": "2026-05-20T00:00:00+00:00"}
 
-            self.assertTrue(hook.append_prompt_usage(record, codex_home=codex_home))
+            self.assertTrue(hook.append_prompt_usage(record, base_dir=base))
             result = raw_segments.rotate_current_segment(base=base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
 
             closed_text = pathlib.Path(result["closed_segment"]["path"]).read_text(encoding="utf-8")
             current_text = pathlib.Path(result["current_segment"]["path"]).read_text(encoding="utf-8")
             self.assertEqual((closed_text + current_text).count('"turn_id":"t1"'), 1)
 
+    def test_hook_append_result_classifies_lock_timeout(self) -> None:
+        hook = load_module("hook_append_lock_timeout_result_test", ROOT / "scripts" / "hook.py")
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(hook, "HOOK_APPEND_LOCK_TIMEOUT_MS", 0),
+            mock.patch.object(hook.turn_capture.fcntl, "flock", side_effect=BlockingIOError),
+        ):
+            result = hook.append_prompt_usage({"turn_id": "timeout"}, base_dir=pathlib.Path(tmp), detailed=True)
+
+        self.assertFalse(result)
+        self.assertEqual(result.failure_stage, "lock")
+        self.assertEqual(result.failure_reason, "lock_timeout")
+        self.assertIsNone(result.error_number)
+
+    def test_hook_logs_structured_raw_append_failure_without_exception_text(self) -> None:
+        hook = load_module("hook_structured_append_failure_test", ROOT / "scripts" / "hook.py")
+        warnings: list[dict[str, Any]] = []
+        append_result = hook.turn_capture.AppendResult(
+            False,
+            failure_stage="segment",
+            failure_reason="segment_manifest_error",
+        )
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(hook, "STATE_DIR", pathlib.Path(tmp) / "state"),
+            mock.patch.object(hook, "append_prompt_usage", return_value=append_result),
+            mock.patch.object(hook, "safe_append_jsonl", side_effect=lambda _path, record: warnings.append(record) or True),
+        ):
+            hook.handle_stop({"session_id": "s-failed", "turn_id": "t-failed", "transcript_path": "/tmp/missing.jsonl"})
+
+        failure = next(row for row in warnings if row.get("error") == "raw_append_failed")
+        self.assertEqual(failure["failure_stage"], "segment")
+        self.assertEqual(failure["failure_reason"], "segment_manifest_error")
+        self.assertNotIn("exception", failure)
+
     def test_goal_auto_stop_without_user_prompt_state_defers_lifecycle_scan(self) -> None:
         raw_segments = load_module("raw_segments_goal_auto_stop_test", ROOT / "scripts" / "raw_segments.py")
         with tempfile.TemporaryDirectory() as tmp:
-            codex_home = pathlib.Path(tmp) / ".codex"
+            codex_dir = pathlib.Path(tmp) / ".codex"
             transcript = pathlib.Path(tmp) / "rollout.jsonl"
             session_id = "s-goal"
             turn_id = "t-goal"
@@ -452,8 +553,8 @@ class ToolTimingTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
-                hook = load_module("hook_goal_auto_stop_test", ROOT / "hooks" / "token-usage.py")
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_dir), "BOLA_OUTPUT_DIR": str(codex_dir / "bola")}, clear=False):
+                hook = load_module("hook_goal_auto_stop_test", ROOT / "scripts" / "hook.py")
 
             with (
                 mock.patch.object(hook, "task_lifecycle_token_usage", side_effect=AssertionError("Stop hook must not scan full lifecycle")),
@@ -471,7 +572,7 @@ class ToolTimingTests(unittest.TestCase):
                     }
                 )
 
-            current = raw_segments.strict_read_current_pointer(codex_home / "codex-token-bola")["current"]["prompt_usage"]
+            current = raw_segments.strict_read_current_pointer(codex_dir / "bola")["current"]["prompt_usage"]
             rows = [json.loads(line) for line in pathlib.Path(current["path"]).read_text(encoding="utf-8").splitlines()]
 
         self.assertEqual(len(rows), 1)
@@ -486,7 +587,7 @@ class ToolTimingTests(unittest.TestCase):
         self.assertEqual(record["model_call_count"], 0)
 
     def test_stop_logs_raw_append_failure_for_missing_start_marker(self) -> None:
-        hook = load_module("hook_stop_append_failure_goal_auto_test", ROOT / "hooks" / "token-usage.py")
+        hook = load_module("hook_stop_append_failure_goal_auto_test", ROOT / "scripts" / "hook.py")
         warnings: list[dict[str, Any]] = []
 
         with (
@@ -506,7 +607,7 @@ class ToolTimingTests(unittest.TestCase):
         self.assertEqual(marker["record_type"], "turn_stop_missing_start")
 
     def test_stop_missing_start_writes_marker_when_raw_segment_manifest_is_corrupt(self) -> None:
-        hook = load_module("hook_stop_manifest_error_marker_test", ROOT / "hooks" / "token-usage.py")
+        hook = load_module("hook_stop_manifest_error_marker_test", ROOT / "scripts" / "hook.py")
         with tempfile.TemporaryDirectory() as tmp:
             state_dir = pathlib.Path(tmp) / "state"
             with (
@@ -522,7 +623,7 @@ class ToolTimingTests(unittest.TestCase):
         self.assertEqual(marker["record_type"], "turn_stop_missing_start")
 
     def test_stop_logs_raw_append_failure_for_missing_start_state_record(self) -> None:
-        hook = load_module("hook_stop_append_failure_missing_start_test", ROOT / "hooks" / "token-usage.py")
+        hook = load_module("hook_stop_append_failure_missing_start_test", ROOT / "scripts" / "hook.py")
         warnings: list[dict[str, Any]] = []
 
         with (
@@ -538,12 +639,13 @@ class ToolTimingTests(unittest.TestCase):
         self.assertTrue(any(row.get("error") == "raw_append_failed" for row in warnings))
 
     def test_start_hook_uses_tail_snapshot_without_forward_scan(self) -> None:
-        hook = load_module("hook_start_tail_snapshot_test", ROOT / "hooks" / "token-usage.py")
+        hook = load_module("hook_start_tail_snapshot_test", ROOT / "scripts" / "hook.py")
         with tempfile.TemporaryDirectory() as tmp:
             state_dir = pathlib.Path(tmp) / "state"
             transcript = pathlib.Path(tmp) / "rollout.jsonl"
             transcript.write_text(
-                json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 7, "total_tokens": 7}}}}) + "\n",
+                json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 7, "total_tokens": 7}}}})
+                + "\n",
                 encoding="utf-8",
             )
             transcript_size = transcript.stat().st_size
@@ -561,7 +663,7 @@ class ToolTimingTests(unittest.TestCase):
         self.assertEqual(state["start_usage_source"], "tail_token_count")
 
     def test_stop_with_invalid_start_offset_defers_without_full_scan(self) -> None:
-        hook = load_module("hook_invalid_start_offset_test", ROOT / "hooks" / "token-usage.py")
+        hook = load_module("hook_invalid_start_offset_test", ROOT / "scripts" / "hook.py")
         with tempfile.TemporaryDirectory() as tmp:
             state_dir = pathlib.Path(tmp) / "state"
             transcript = pathlib.Path(tmp) / "rollout.jsonl"
@@ -600,8 +702,8 @@ class ToolTimingTests(unittest.TestCase):
     def test_stop_hook_bounds_token_usage_to_current_turn_terminal_event(self) -> None:
         raw_segments = load_module("raw_segments_stop_bounds_turn_test", ROOT / "scripts" / "raw_segments.py")
         with tempfile.TemporaryDirectory() as tmp:
-            codex_home = pathlib.Path(tmp) / ".codex"
-            base = codex_home / "codex-token-bola"
+            codex_dir = pathlib.Path(tmp) / ".codex"
+            base = codex_dir / "bola"
             transcript = pathlib.Path(tmp) / "rollout.jsonl"
 
             def event(payload: dict[str, Any]) -> str:
@@ -619,8 +721,8 @@ class ToolTimingTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
-                hook = load_module("hook_stop_bounds_turn_test", ROOT / "hooks" / "token-usage.py")
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_dir), "BOLA_OUTPUT_DIR": str(codex_dir / "bola")}, clear=False):
+                hook = load_module("hook_stop_bounds_turn_test", ROOT / "scripts" / "hook.py")
             hook.handle_start({"session_id": "s1", "turn_id": "t1", "transcript_path": str(transcript), "cwd": "/tmp"})
             with transcript.open("a", encoding="utf-8") as handle:
                 handle.write(event({"type": "task_started", "turn_id": "t1"}))
@@ -660,16 +762,16 @@ class ToolTimingTests(unittest.TestCase):
 
     def test_stop_hook_defers_when_token_count_exists_without_turn_end_event(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            codex_home = pathlib.Path(tmp) / ".codex"
-            base = codex_home / "codex-token-bola"
+            codex_dir = pathlib.Path(tmp) / ".codex"
+            base = codex_dir / "bola"
             transcript = pathlib.Path(tmp) / "rollout.jsonl"
 
             def event(payload: dict[str, Any]) -> str:
                 return json.dumps({"timestamp": "2026-05-31T10:00:00.000Z", "type": "event_msg", "payload": payload}) + "\n"
 
             transcript.write_text(event({"type": "token_count", "info": {"total_token_usage": {"input_tokens": 0, "total_tokens": 0}}}), encoding="utf-8")
-            with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
-                hook = load_module("hook_stop_turn_end_missing_test", ROOT / "hooks" / "token-usage.py")
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_dir), "BOLA_OUTPUT_DIR": str(codex_dir / "bola")}, clear=False):
+                hook = load_module("hook_stop_turn_end_missing_test", ROOT / "scripts" / "hook.py")
             hook.handle_start({"session_id": "s-no-end", "turn_id": "t-no-end", "transcript_path": str(transcript), "cwd": "/tmp"})
             state_path = hook.state_path("s-no-end", "t-no-end")
             with transcript.open("a", encoding="utf-8") as handle:
@@ -699,22 +801,43 @@ class ToolTimingTests(unittest.TestCase):
     def test_stop_hook_captures_when_turn_end_precedes_forward_scan_limit(self) -> None:
         raw_segments = load_module("raw_segments_stop_terminal_limit_test", ROOT / "scripts" / "raw_segments.py")
         with tempfile.TemporaryDirectory() as tmp:
-            codex_home = pathlib.Path(tmp) / ".codex"
-            base = codex_home / "codex-token-bola"
+            codex_dir = pathlib.Path(tmp) / ".codex"
+            base = codex_dir / "bola"
             transcript = pathlib.Path(tmp) / "rollout.jsonl"
 
             def event(payload: dict[str, Any]) -> str:
                 return json.dumps({"timestamp": "2026-05-31T10:00:00.000Z", "type": "event_msg", "payload": payload}) + "\n"
 
             transcript.write_text(event({"type": "token_count", "info": {"total_token_usage": {"input_tokens": 0, "total_tokens": 0}}}), encoding="utf-8")
-            with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
-                hook = load_module("hook_stop_terminal_limit_test", ROOT / "hooks" / "token-usage.py")
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_dir), "BOLA_OUTPUT_DIR": str(codex_dir / "bola")}, clear=False):
+                hook = load_module("hook_stop_terminal_limit_test", ROOT / "scripts" / "hook.py")
             hook.handle_start({"session_id": "s-limit", "turn_id": "t-limit", "transcript_path": str(transcript), "cwd": "/tmp"})
             state_path = hook.state_path("s-limit", "t-limit")
             with transcript.open("a", encoding="utf-8") as handle:
-                handle.write(event({"type": "token_count", "info": {"total_token_usage": {"input_tokens": 42, "total_tokens": 42}, "last_token_usage": {"input_tokens": 42, "total_tokens": 42}}}))
+                handle.write(
+                    event(
+                        {
+                            "type": "token_count",
+                            "info": {
+                                "total_token_usage": {"input_tokens": 42, "total_tokens": 42},
+                                "last_token_usage": {"input_tokens": 42, "total_tokens": 42},
+                            },
+                        }
+                    )
+                )
                 handle.write(event({"type": "task_complete", "turn_id": "t-limit"}))
-                handle.write(event({"type": "token_count", "info": {"total_token_usage": {"input_tokens": 999, "total_tokens": 999}, "last_token_usage": {"input_tokens": 957, "total_tokens": 957}, "padding": "x" * 500}}))
+                handle.write(
+                    event(
+                        {
+                            "type": "token_count",
+                            "info": {
+                                "total_token_usage": {"input_tokens": 999, "total_tokens": 999},
+                                "last_token_usage": {"input_tokens": 957, "total_tokens": 957},
+                                "padding": "x" * 500,
+                            },
+                        }
+                    )
+                )
 
             with mock.patch.object(hook, "HOOK_FORWARD_SCAN_BYTES", 420):
                 hook.handle_stop({"session_id": "s-limit", "turn_id": "t-limit", "transcript_path": str(transcript), "cwd": "/tmp"})
@@ -728,11 +851,14 @@ class ToolTimingTests(unittest.TestCase):
     def test_stop_with_unavailable_start_usage_sums_post_start_model_calls(self) -> None:
         raw_segments = load_module("raw_segments_unavailable_start_usage_test", ROOT / "scripts" / "raw_segments.py")
         with tempfile.TemporaryDirectory() as tmp:
-            codex_home = pathlib.Path(tmp) / ".codex"
-            base = codex_home / "codex-token-bola"
+            codex_dir = pathlib.Path(tmp) / ".codex"
+            base = codex_dir / "bola"
             state_dir = base / "state"
             transcript = pathlib.Path(tmp) / "rollout.jsonl"
-            prefix = json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 900, "total_tokens": 900}}}}) + "\n"
+            prefix = (
+                json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 900, "total_tokens": 900}}}})
+                + "\n"
+            )
             transcript.write_text(prefix, encoding="utf-8")
             start_file_size = transcript.stat().st_size
             transcript.write_text(
@@ -745,8 +871,20 @@ class ToolTimingTests(unittest.TestCase):
                         "payload": {
                             "type": "token_count",
                             "info": {
-                                "last_token_usage": {"input_tokens": 11, "cached_input_tokens": 4, "output_tokens": 3, "reasoning_output_tokens": 1, "total_tokens": 14},
-                                "total_token_usage": {"input_tokens": 911, "cached_input_tokens": 4, "output_tokens": 3, "reasoning_output_tokens": 1, "total_tokens": 914},
+                                "last_token_usage": {
+                                    "input_tokens": 11,
+                                    "cached_input_tokens": 4,
+                                    "output_tokens": 3,
+                                    "reasoning_output_tokens": 1,
+                                    "total_tokens": 14,
+                                },
+                                "total_token_usage": {
+                                    "input_tokens": 911,
+                                    "cached_input_tokens": 4,
+                                    "output_tokens": 3,
+                                    "reasoning_output_tokens": 1,
+                                    "total_tokens": 914,
+                                },
                             },
                         },
                     }
@@ -760,8 +898,8 @@ class ToolTimingTests(unittest.TestCase):
             turn_id = "t-unavailable"
             state_dir.mkdir(parents=True)
 
-            with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
-                hook = load_module("hook_unavailable_start_usage_test", ROOT / "hooks" / "token-usage.py")
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_dir), "BOLA_OUTPUT_DIR": str(codex_dir / "bola")}, clear=False):
+                hook = load_module("hook_unavailable_start_usage_test", ROOT / "scripts" / "hook.py")
             hook.state_path(session_id, turn_id).write_text(
                 json.dumps(
                     {
@@ -793,11 +931,9 @@ class ToolTimingTests(unittest.TestCase):
             transcript = pathlib.Path(tmp) / "rollout.jsonl"
             first = json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {}}}) + "\n"
             bad = "{bad json\n"
+            non_object = "[]\n"
             transcript.write_text(
-                first
-                + bad
-                + json.dumps({"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "t1"}})
-                + "\n",
+                first + bad + non_object + json.dumps({"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "t1"}}) + "\n",
                 encoding="utf-8",
             )
 
@@ -807,11 +943,11 @@ class ToolTimingTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertTrue(stream.parse_error_seen)
         self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["line_start"], len(first) + len(bad))
+        self.assertEqual(events[0]["line_start"], len(first) + len(bad) + len(non_object))
         self.assertEqual(events[0]["item"]["payload"]["type"], "task_complete")
 
     def test_latest_token_usage_respects_max_bytes_as_hard_cap(self) -> None:
-        hook = load_module("hook_latest_token_hard_cap_test", ROOT / "hooks" / "token-usage.py")
+        hook = load_module("hook_latest_token_hard_cap_test", ROOT / "scripts" / "hook.py")
         with tempfile.TemporaryDirectory() as tmp:
             transcript = pathlib.Path(tmp) / "rollout.jsonl"
             transcript.write_text(
@@ -837,16 +973,16 @@ class ToolTimingTests(unittest.TestCase):
         self.assertFalse(result.get("found"))
         self.assertTrue(result.get("scan_limit_reached"))
 
-    def test_hook_removes_start_state_after_pending_token_count_record(self) -> None:
+    def test_hook_keeps_start_state_after_pending_token_count_record(self) -> None:
         raw_segments = load_module("raw_segments_pending_token_count_state_cleanup_test", ROOT / "scripts" / "raw_segments.py")
         with tempfile.TemporaryDirectory() as tmp:
-            codex_home = pathlib.Path(tmp) / ".codex"
+            codex_dir = pathlib.Path(tmp) / ".codex"
             transcript = pathlib.Path(tmp) / "rollout.jsonl"
             transcript.write_text("", encoding="utf-8")
             session_id = "s-pending"
             turn_id = "t-pending"
-            with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
-                hook = load_module("hook_pending_token_count_state_cleanup_test", ROOT / "hooks" / "token-usage.py")
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_dir), "BOLA_OUTPUT_DIR": str(codex_dir / "bola")}, clear=False):
+                hook = load_module("hook_pending_token_count_state_cleanup_test", ROOT / "scripts" / "hook.py")
             hook.handle_start(
                 {
                     "hook_event_name": "UserPromptSubmit",
@@ -872,21 +1008,24 @@ class ToolTimingTests(unittest.TestCase):
                 }
             )
 
-            current = raw_segments.strict_read_current_pointer(codex_home / "codex-token-bola")["current"]["prompt_usage"]
+            current = raw_segments.strict_read_current_pointer(codex_dir / "bola")["current"]["prompt_usage"]
             rows = [json.loads(line) for line in pathlib.Path(current["path"]).read_text(encoding="utf-8").splitlines()]
-            state_exists = state_path.exists()
+            pending_state = json.loads(state_path.read_text(encoding="utf-8"))
 
-        self.assertEqual(rows[0]["lifecycle_end_reason"], "pending_token_count")
-        self.assertFalse(state_exists)
+        self.assertIsNone(rows[0]["lifecycle_end_reason"])
+        self.assertEqual(rows[0]["token_resolution_status"], "pending")
+        self.assertEqual(rows[0]["token_resolution_reason"], "turn_end_not_found")
+        self.assertEqual(pending_state["token_resolution_status"], "pending")
+        self.assertEqual(pending_state["token_resolution_reason"], "turn_end_not_found")
 
     def test_hook_keeps_start_state_when_stop_has_no_transcript_path(self) -> None:
         raw_segments = load_module("raw_segments_missing_transcript_state_test", ROOT / "scripts" / "raw_segments.py")
         with tempfile.TemporaryDirectory() as tmp:
-            codex_home = pathlib.Path(tmp) / ".codex"
+            codex_dir = pathlib.Path(tmp) / ".codex"
             session_id = "s-missing-transcript"
             turn_id = "t-missing-transcript"
-            with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
-                hook = load_module("hook_missing_transcript_state_test", ROOT / "hooks" / "token-usage.py")
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_dir), "BOLA_OUTPUT_DIR": str(codex_dir / "bola")}, clear=False):
+                hook = load_module("hook_missing_transcript_state_test", ROOT / "scripts" / "hook.py")
             hook.handle_start(
                 {
                     "hook_event_name": "UserPromptSubmit",
@@ -921,7 +1060,7 @@ class ToolTimingTests(unittest.TestCase):
                     "model": "gpt-5.5",
                 }
             )
-            base = codex_home / "codex-token-bola"
+            base = codex_dir / "bola"
             current_paths = raw_segments.current_segment_paths(base, kind="prompt_usage")
             error_text = (base / "prompt-usage-errors.jsonl").read_text(encoding="utf-8")
             state_exists = state_path.exists()
@@ -931,41 +1070,28 @@ class ToolTimingTests(unittest.TestCase):
         self.assertEqual(error_text.count("deferred_stop_recovery"), 2)
         self.assertEqual(error_text.count("invalid_start_file_size"), 2)
 
-    def test_installed_hook_loads_scripts_from_codex_home_token_usage(self) -> None:
+    def test_package_hook_module_writes_to_configured_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            codex_home = pathlib.Path(tmp) / ".codex"
-            installed_hook = codex_home / "hooks" / "token-usage.py"
-            installed_scripts = codex_home / "codex-token-bola" / "scripts"
-            installed_hook.parent.mkdir(parents=True)
-            installed_scripts.mkdir(parents=True)
-            installed_hook.write_text((ROOT / "hooks" / "token-usage.py").read_text(encoding="utf-8"), encoding="utf-8")
-            (installed_scripts / "raw_segments.py").write_text(
-                (ROOT / "scripts" / "raw_segments.py").read_text(encoding="utf-8"),
-                encoding="utf-8",
+            root = pathlib.Path(tmp)
+            output_dir = root / "data"
+            env = {
+                **os.environ,
+                "XDG_CONFIG_HOME": str(root / "config"),
+                "BOLA_OUTPUT_DIR": str(output_dir),
+            }
+            result = subprocess.run(
+                [sys.executable, "-m", "codex_token_bola.hook", "--bola-hook"],
+                cwd=ROOT,
+                env=env,
+                input=json.dumps({"hook_event_name": "Unsupported"}),
+                capture_output=True,
+                text=True,
             )
-            old_path = list(sys.path)
-            sys.modules.pop("raw_segments", None)
-            try:
-                sys.path[:] = [
-                    item
-                    for item in sys.path
-                    if item not in {str(ROOT / "scripts"), str(codex_home / "scripts"), str(installed_scripts)}
-                ]
-                with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}):
-                    hook = load_module("installed_hook_import_path_test", installed_hook)
-                self.assertTrue(
-                    hook.append_prompt_usage(
-                        {"session_id": "s1", "turn_id": "t1", "captured_at": "2026-05-20T00:00:00+00:00"}
-                    )
-                )
-            finally:
-                sys.modules.pop("raw_segments", None)
-                sys.path[:] = old_path
 
-            pointer = json.loads((codex_home / "codex-token-bola" / "state" / "current-raw-segments.json").read_text(encoding="utf-8"))
-            current = pathlib.Path(pointer["current"]["prompt_usage"]["path"])
-            self.assertEqual(current.parent, codex_home / "codex-token-bola" / "raw" / "current")
-            self.assertIn('"turn_id":"t1"', current.read_text(encoding="utf-8").replace(" ", ""))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), {"continue": True, "suppressOutput": True})
+            error_rows = [json.loads(line) for line in (output_dir / "prompt-usage-errors.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(error_rows[-1]["error"], "unsupported event")
 
     def test_all_current_segment_handoff_writes_one_prompt_pointer(self) -> None:
         raw_segments = load_module("raw_segments_all_kind_atomic_pointer_test", ROOT / "scripts" / "raw_segments.py")
@@ -1044,8 +1170,8 @@ class ToolTimingTests(unittest.TestCase):
 
     def test_compact_rotate_current_cli_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            codex_home = pathlib.Path(tmp) / ".codex"
-            base = codex_home / "codex-token-bola"
+            codex_dir = pathlib.Path(tmp) / ".codex"
+            base = codex_dir / "bola"
             raw_dir = base / "raw"
             raw_dir.mkdir(parents=True)
             (raw_dir / "prompt-usage.raw.jsonl").write_text("flat prompt\n", encoding="utf-8")
@@ -1058,7 +1184,7 @@ class ToolTimingTests(unittest.TestCase):
                 check=True,
                 capture_output=True,
                 text=True,
-                env={**os.environ, "CODEX_HOME": str(codex_home)},
+                env={**os.environ, "CODEX_HOME": str(codex_dir)},
             )
             parsed = json.loads(result.stdout)
             self.assertIn("prompt_usage", parsed)
@@ -1081,7 +1207,12 @@ class ToolTimingTests(unittest.TestCase):
                         "schema_version": 1,
                         "base": str(base.resolve()),
                         "current": {
-                            "prompt_usage": {"id": "prompt-usage.raw.jsonl.current.1", "kind": "prompt_usage", "path": str(prompt_old), "source_name": "prompt-usage.raw.jsonl"},
+                            "prompt_usage": {
+                                "id": "prompt-usage.raw.jsonl.current.1",
+                                "kind": "prompt_usage",
+                                "path": str(prompt_old),
+                                "source_name": "prompt-usage.raw.jsonl",
+                            },
                         },
                     },
                     separators=(",", ":"),
@@ -1103,7 +1234,7 @@ class ToolTimingTests(unittest.TestCase):
             text=True,
         ).stdout
         cli_help = subprocess.run(
-            [sys.executable, str(ROOT / "scripts" / "codex_token_usage.py"), "--help"],
+            [sys.executable, str(ROOT / "scripts" / "bola.py"), "--help"],
             check=True,
             capture_output=True,
             text=True,
@@ -1242,8 +1373,24 @@ class ToolTimingTests(unittest.TestCase):
             normalize.ARCHIVE_DIR = base / "raw" / "archive"
             normalize.BAD_LOG = base / "bad" / "prompt-usage.bad.jsonl"
             normalize.STATE_FILE = base / "normalized" / "normalize-state.json"
-            first_turn = _turn_raw("s1", "t1", total=100) | {"model_calls": [{"index": 1, "timestamp": "2026-01-01T00:00:01Z", "usage": {"input_tokens": 90, "cached_input_tokens": 0, "output_tokens": 10, "reasoning_output_tokens": 0, "total_tokens": 100}}]}
-            second_turn = _turn_raw("s2", "t2", total=200) | {"model_calls": [{"index": 1, "timestamp": "2026-01-01T00:00:01Z", "usage": {"input_tokens": 190, "cached_input_tokens": 0, "output_tokens": 10, "reasoning_output_tokens": 0, "total_tokens": 200}}]}
+            first_turn = _turn_raw("s1", "t1", total=100) | {
+                "model_calls": [
+                    {
+                        "index": 1,
+                        "timestamp": "2026-01-01T00:00:01Z",
+                        "usage": {"input_tokens": 90, "cached_input_tokens": 0, "output_tokens": 10, "reasoning_output_tokens": 0, "total_tokens": 100},
+                    }
+                ]
+            }
+            second_turn = _turn_raw("s2", "t2", total=200) | {
+                "model_calls": [
+                    {
+                        "index": 1,
+                        "timestamp": "2026-01-01T00:00:01Z",
+                        "usage": {"input_tokens": 190, "cached_input_tokens": 0, "output_tokens": 10, "reasoning_output_tokens": 0, "total_tokens": 200},
+                    }
+                ]
+            }
             current = normalize.raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
             current_path = pathlib.Path(current["path"])
             current_path.write_text(json.dumps(first_turn) + "\n", encoding="utf-8")
@@ -1357,6 +1504,30 @@ class ToolTimingTests(unittest.TestCase):
             self.assertEqual(payload, old_row)
             self.assertFalse(normalize.pending_publish_file().exists())
 
+    def test_normalize_recovery_keeps_output_after_state_commit(self) -> None:
+        normalize = load_module("normalize_committed_publish_recovery_test", ROOT / "scripts" / "normalize.py")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = pathlib.Path(tmp_dir)
+            normalize.NORMALIZED_LOG = base / "normalized" / "prompt-usage.normalized.jsonl"
+            normalize.STATE_FILE = base / "normalized" / "normalize-state.json"
+            normalize.NORMALIZED_LOG.parent.mkdir(parents=True)
+            old_row = json.dumps(_turn_normalized("s-old", "t-old", total=10)) + "\n"
+            new_row = json.dumps(_turn_normalized("s-new", "t-new", total=20)) + "\n"
+            normalize.NORMALIZED_LOG.write_text(old_row, encoding="utf-8")
+            identity = normalize.normalize_identity({"/tmp/raw.jsonl": 128}, {})
+            normalize.write_pending_publish(
+                len(old_row.encode("utf-8")),
+                identity.to_state(normalized_log_size=len(old_row.encode("utf-8"))),
+            )
+            with normalize.NORMALIZED_LOG.open("a", encoding="utf-8") as handle:
+                handle.write(new_row)
+            normalize.write_state(identity.to_state(normalized_log_size=normalize.NORMALIZED_LOG.stat().st_size))
+
+            normalize.recover_pending_publish()
+
+            self.assertEqual(normalize.NORMALIZED_LOG.read_text(encoding="utf-8"), old_row + new_row)
+            self.assertFalse(normalize.pending_publish_file().exists())
+
     def test_normalize_main_reports_corrupt_pending_publish_marker_as_json(self) -> None:
         normalize = load_module("normalize_corrupt_pending_publish_main_test", ROOT / "scripts" / "normalize.py")
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1368,8 +1539,9 @@ class ToolTimingTests(unittest.TestCase):
             captured = io.StringIO()
 
             with (
-                mock.patch.object(normalize.service_paths, "assert_migrated", return_value=None),
-                mock.patch.object(normalize.service_lock, "acquire_service_lock", return_value=mock.MagicMock(__enter__=lambda _self: None, __exit__=lambda *_args: None)),
+                mock.patch.object(
+                    normalize.service_lock, "acquire_service_lock", return_value=mock.MagicMock(__enter__=lambda _self: None, __exit__=lambda *_args: None)
+                ),
                 mock.patch.object(normalize.sys, "argv", ["normalize.py", "--incremental"]),
                 mock.patch.object(normalize.sys, "stdout", captured),
             ):
@@ -1386,7 +1558,7 @@ class ToolTimingTests(unittest.TestCase):
             base = pathlib.Path(tmp_dir)
             cancel_file = base / "cancel.json"
             cancel_file.write_text("{}", encoding="utf-8")
-            with mock.patch.dict(os.environ, {"CODEX_TOKEN_USAGE_CANCEL_FILE": str(cancel_file)}, clear=False):
+            with mock.patch.dict(os.environ, {"BOLA_CANCEL_FILE": str(cancel_file)}, clear=False):
                 normalize = load_module("normalize_cancel_checkpoint_test", ROOT / "scripts" / "normalize.py")
             normalize.RAW_LOG = base / "raw" / "prompt-usage.raw.jsonl"
             normalize.NORMALIZED_LOG = base / "normalized" / "prompt-usage.normalized.jsonl"
@@ -1396,7 +1568,7 @@ class ToolTimingTests(unittest.TestCase):
             current = normalize.raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
             pathlib.Path(current["path"]).write_text(json.dumps(_turn_raw("s1", "t1", total=100)) + "\n", encoding="utf-8")
 
-            with mock.patch.dict(os.environ, {"CODEX_TOKEN_USAGE_CANCEL_FILE": str(cancel_file)}, clear=False):
+            with mock.patch.dict(os.environ, {"BOLA_CANCEL_FILE": str(cancel_file)}, clear=False):
                 with self.assertRaises(normalize.cancel_control.Cancelled):
                     normalize.full_normalize()
 
@@ -1461,7 +1633,9 @@ class ToolTimingTests(unittest.TestCase):
             with gzip.open(untracked_segment_path, "wt", encoding="utf-8") as handle:
                 handle.write(json.dumps(_turn_raw("untracked", "archive", total=50) | {"captured_at": "2026-05-19T00:00:00+00:00"}) + "\n")
             current = raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
-            pathlib.Path(current["path"]).write_text(json.dumps(_turn_raw("s2", "t2", total=200) | {"captured_at": "2026-05-21T00:00:00+00:00"}) + "\n", encoding="utf-8")
+            pathlib.Path(current["path"]).write_text(
+                json.dumps(_turn_raw("s2", "t2", total=200) | {"captured_at": "2026-05-21T00:00:00+00:00"}) + "\n", encoding="utf-8"
+            )
             raw_segments.write_manifest(
                 base,
                 raw_segments.empty_manifest(base)
@@ -1504,7 +1678,9 @@ class ToolTimingTests(unittest.TestCase):
             current_dir.mkdir(parents=True)
             segment_path = current_dir / "prompt-usage.raw.jsonl.current.1779235200000000000.jsonl"
             segment_path.write_text(json.dumps(_turn_raw("s1", "t1", total=100) | {"captured_at": "2026-05-20T00:00:00+00:00"}) + "\n", encoding="utf-8")
-            (base / "prompt-usage.jsonl").write_text(json.dumps(_turn_raw("old-root", "ignored", total=50) | {"captured_at": "2026-05-19T00:00:00+00:00"}) + "\n", encoding="utf-8")
+            (base / "prompt-usage.jsonl").write_text(
+                json.dumps(_turn_raw("old-root", "ignored", total=50) | {"captured_at": "2026-05-19T00:00:00+00:00"}) + "\n", encoding="utf-8"
+            )
             raw_segments.write_manifest(
                 base,
                 raw_segments.empty_manifest(base)
@@ -1534,21 +1710,27 @@ class ToolTimingTests(unittest.TestCase):
 
     def test_normalize_fails_before_archive_discovery_when_apply_marker_reconcile_fails(self) -> None:
         normalize = load_module("normalize_apply_marker_fail_test", ROOT / "scripts" / "normalize.py")
-        with mock.patch.object(
-            normalize.raw_segments,
-            "reconcile_apply_marker",
-            side_effect=normalize.raw_segments.ManifestError("bad marker"),
-        ), mock.patch.object(normalize, "archived_prompt_logs", side_effect=AssertionError("archive discovery must not run")):
+        with (
+            mock.patch.object(
+                normalize.raw_segments,
+                "reconcile_apply_marker",
+                side_effect=normalize.raw_segments.ManifestError("bad marker"),
+            ),
+            mock.patch.object(normalize, "archived_prompt_logs", side_effect=AssertionError("archive discovery must not run")),
+        ):
             with self.assertRaises(normalize.raw_segments.ManifestError):
                 normalize.full_normalize()
 
     def test_normalize_fails_before_archive_discovery_when_rotation_reconcile_fails(self) -> None:
         normalize = load_module("normalize_rotation_marker_fail_test", ROOT / "scripts" / "normalize.py")
-        with mock.patch.object(
-            normalize.raw_segments,
-            "reconcile_pending_rotation",
-            side_effect=normalize.raw_segments.ManifestError("bad rotation marker"),
-        ), mock.patch.object(normalize, "archived_prompt_logs", side_effect=AssertionError("archive discovery must not run")):
+        with (
+            mock.patch.object(
+                normalize.raw_segments,
+                "reconcile_pending_rotation",
+                side_effect=normalize.raw_segments.ManifestError("bad rotation marker"),
+            ),
+            mock.patch.object(normalize, "archived_prompt_logs", side_effect=AssertionError("archive discovery must not run")),
+        ):
             with self.assertRaises(normalize.raw_segments.ManifestError):
                 normalize.full_normalize()
 
@@ -1633,7 +1815,9 @@ class ToolTimingTests(unittest.TestCase):
             try:
                 self.assertEqual(con.execute("select count(*) from turns").fetchone()[0], 2)
                 self.assertEqual(json.loads(con.execute("select value from run_metadata where key='analysis_mode'").fetchone()[0]), "incremental")
-                self.assertEqual(json.loads(con.execute("select value from run_metadata where key='applied_normalized_turns_size'").fetchone()[0]), turns.stat().st_size)
+                self.assertEqual(
+                    json.loads(con.execute("select value from run_metadata where key='applied_normalized_turns_size'").fetchone()[0]), turns.stat().st_size
+                )
                 self.assertEqual(metadata["new_turn_rows"], 1)
             finally:
                 con.close()
@@ -1775,9 +1959,28 @@ class ToolTimingTests(unittest.TestCase):
                 build.upsert_turn_row(con, old_row, {})
                 build.replace_tool_call_rollups_from_batches(
                     con,
-                    [[{"session_id": "s1", "turn_id": "t1", "tool_name": "exec_command", "tool_provider": "exec", "call_id": "c1", "output_tokens": 5, "total_tokens": 10}]],
+                    [
+                        [
+                            {
+                                "session_id": "s1",
+                                "turn_id": "t1",
+                                "tool_name": "exec_command",
+                                "tool_provider": "exec",
+                                "call_id": "c1",
+                                "output_tokens": 5,
+                                "total_tokens": 10,
+                            }
+                        ]
+                    ],
                 )
                 build.write_metadata(con, {"applied_normalized_turns_size": turns_offset, "applied_input_fingerprint": "old"})
+                build.write_metadata(
+                    con,
+                    {
+                        "context_snapshot_version": build.build_analytics_context.CONTEXT_SNAPSHOT_VERSION,
+                        "analytics_schema_version": build.ANALYTICS_SCHEMA_VERSION,
+                    },
+                )
                 con.commit()
             finally:
                 con.close()
@@ -1801,8 +2004,7 @@ class ToolTimingTests(unittest.TestCase):
             db_path = base / "analytics.sqlite"
             state_db = base / "missing-state.sqlite"
             turns.write_text(
-                json.dumps(_turn_normalized("s1", "t1", total=10)) + "\n"
-                + json.dumps(_turn_normalized("s1", "t1", total=20)) + "\n",
+                json.dumps(_turn_normalized("s1", "t1", total=10)) + "\n" + json.dumps(_turn_normalized("s1", "t1", total=20)) + "\n",
                 encoding="utf-8",
             )
             subprocess.run(
@@ -1886,10 +2088,15 @@ class ToolTimingTests(unittest.TestCase):
             self.assertIn("model_call_summaries", tables)
             self.assertIn("tool_call_summaries", tables)
             self.assertIn("tool_call_samples", tables)
+            self.assertIn("source_context_threads", tables)
+            self.assertIn("source_context_edges", tables)
             columns = {row[1] for row in con.execute("pragma table_info(turns)")}
             indexes = {row[0] for row in con.execute("select name from sqlite_master where type='index' and tbl_name='turns'")}
             self.assertNotIn("thread_title", columns)
             self.assertIn("thread_name", columns)
+            self.assertIn("started_at_unix", columns)
+            self.assertIn("model_from_context", columns)
+            self.assertIn("idx_turns_started_at_unix", indexes)
             self.assertIn("idx_turns_latest_order", indexes)
             self.assertIn("idx_turns_project_latest_order", indexes)
             self.assertIn("idx_turns_weighted_order", indexes)
@@ -1903,7 +2110,7 @@ class ToolTimingTests(unittest.TestCase):
                     explain query plan
                     select session_id, turn_id
                     from turns
-                    order by captured_at_unix desc, session_id desc, turn_id desc
+                    order by started_at_unix desc, session_id desc, turn_id desc
                     limit 25
                     """
                 )
@@ -1917,7 +2124,7 @@ class ToolTimingTests(unittest.TestCase):
                     explain query plan
                     select session_id, turn_id
                     from turns
-                    order by weighted_credits desc, captured_at_unix desc, session_id desc, turn_id desc
+                    order by weighted_credits desc, started_at_unix desc, session_id desc, turn_id desc
                     limit 25
                     """
                 )
@@ -1931,7 +2138,7 @@ class ToolTimingTests(unittest.TestCase):
                     explain query plan
                     select session_id, turn_id
                     from turns
-                    order by weighted_credits asc, captured_at_unix desc, session_id desc, turn_id desc
+                    order by weighted_credits asc, started_at_unix desc, session_id desc, turn_id desc
                     limit 25
                     """
                 )
@@ -1944,7 +2151,7 @@ class ToolTimingTests(unittest.TestCase):
     def test_build_fails_before_archive_discovery_when_apply_marker_reconcile_fails(self) -> None:
         build = load_module("build_apply_marker_fail_test", ROOT / "scripts" / "build_analytics.py")
         with tempfile.TemporaryDirectory() as tmp:
-            output = pathlib.Path(tmp) / "token-usage.sqlite"
+            output = pathlib.Path(tmp) / "bola.sqlite"
             with mock.patch.object(
                 build.raw_segments,
                 "reconcile_apply_marker",
@@ -1956,7 +2163,7 @@ class ToolTimingTests(unittest.TestCase):
     def test_build_fails_before_archive_discovery_when_rotation_reconcile_fails(self) -> None:
         build = load_module("build_rotation_marker_fail_test", ROOT / "scripts" / "build_analytics.py")
         with tempfile.TemporaryDirectory() as tmp:
-            output = pathlib.Path(tmp) / "token-usage.sqlite"
+            output = pathlib.Path(tmp) / "bola.sqlite"
             with mock.patch.object(
                 build.raw_segments,
                 "reconcile_pending_rotation",
@@ -1965,17 +2172,78 @@ class ToolTimingTests(unittest.TestCase):
                 with self.assertRaises(build.raw_segments.ManifestError):
                     build.build(output)
 
+    def test_full_build_failure_preserves_database_and_removes_temporary_artifacts(self) -> None:
+        build = load_module("build_temp_cleanup_failure_test", ROOT / "scripts" / "build_analytics.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "bola.sqlite"
+            output.write_bytes(b"previous database")
+
+            with (
+                mock.patch.object(build.raw_segments, "reconcile_apply_marker", return_value=None),
+                mock.patch.object(build.raw_segments, "reconcile_pending_rotation", return_value=None),
+                mock.patch.object(build, "scan_normalized_build_inputs", return_value=(1, set())),
+                mock.patch.object(build, "read_threads", return_value={}),
+                mock.patch.object(build, "read_edges", return_value=[]),
+                mock.patch.object(build, "spawn_turn_contexts", return_value={}),
+                mock.patch.object(build, "iter_jsonl", side_effect=RuntimeError("turn scan failed")),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "turn scan failed"):
+                    build.build(output)
+
+            leftovers = list(output.parent.glob(f".{output.name}.*.tmp*"))
+            preserved = output.read_bytes()
+
+        self.assertEqual(preserved, b"previous database")
+        self.assertEqual(leftovers, [])
+
+    def test_full_build_sweeps_stale_temp_database_and_sidecars(self) -> None:
+        build = load_module("build_stale_temp_sweep_test", ROOT / "scripts" / "build_analytics.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "bola.sqlite"
+            stale = output.with_name(f".{output.name}.123.tmp")
+            stale.write_bytes(b"stale")
+            pathlib.Path(str(stale) + "-journal").write_bytes(b"journal")
+
+            with build.full_build_connection(output) as con:
+                con.execute("create table ready (id integer primary key)")
+
+            leftovers = list(output.parent.glob(f".{output.name}.*.tmp*"))
+            output_exists = output.exists()
+
+        self.assertTrue(output_exists)
+        self.assertEqual(leftovers, [])
+
+    def test_full_build_rejects_symlinked_stale_temp_artifact(self) -> None:
+        build = load_module("build_stale_temp_symlink_test", ROOT / "scripts" / "build_analytics.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "bola.sqlite"
+            external = pathlib.Path(tmp) / "external.sqlite"
+            external.write_bytes(b"external")
+            stale = output.with_name(f".{output.name}.123.tmp")
+            stale.symlink_to(external)
+
+            with self.assertRaises(build.BuildInputError) as raised:
+                with build.full_build_connection(output):
+                    pass
+
+            self.assertEqual(raised.exception.payload["error"], "analytics_temp_artifact_unsafe")
+            self.assertEqual(external.read_bytes(), b"external")
+
     def test_build_reconciles_raw_segments_from_configured_normalized_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            default_home = pathlib.Path(tmp) / "default-home"
-            target_home = pathlib.Path(tmp) / "target-home"
-            with mock.patch.dict(os.environ, {"CODEX_HOME": str(default_home)}, clear=False):
+            default_dir = pathlib.Path(tmp) / "default-dir"
+            target_dir = pathlib.Path(tmp) / "target-dir"
+            with mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(default_dir), "BOLA_OUTPUT_DIR": str(default_dir / "bola")},
+                clear=False,
+            ):
                 build = load_module("build_configured_raw_root_test", ROOT / "scripts" / "build_analytics.py")
-            normalized = target_home / "codex-token-bola" / "normalized" / "prompt-usage.normalized.jsonl"
-            output = target_home / "codex-token-bola" / "analytics" / "token-usage.sqlite"
+            normalized = target_dir / "bola" / "normalized" / "prompt-usage.normalized.jsonl"
+            output = target_dir / "bola" / "analytics" / "bola.sqlite"
             args = argparse.Namespace(
                 normalized_log=str(normalized),
-                state_db=str(target_home / "state_5.sqlite"),
+                state_db=str(target_dir / "state_5.sqlite"),
                 output=str(output),
                 project_root=[],
             )
@@ -1997,15 +2265,16 @@ class ToolTimingTests(unittest.TestCase):
             ):
                 build.build()
 
-        self.assertEqual(observed, [target_home / "codex-token-bola", target_home / "codex-token-bola"])
+        self.assertEqual(observed, [target_dir / "bola", target_dir / "bola"])
 
     def test_incremental_pipeline_builds_when_normalized_is_ahead_of_db(self) -> None:
+        normalize = load_module("normalize_pipeline_version_test", ROOT / "scripts" / "normalize.py")
         with tempfile.TemporaryDirectory() as tmp_dir:
-            codex_home = pathlib.Path(tmp_dir) / ".codex"
-            base = codex_home / "codex-token-bola"
+            codex_dir = pathlib.Path(tmp_dir) / ".codex"
+            base = codex_dir / "bola"
             normalized = base / "normalized" / "prompt-usage.normalized.jsonl"
             state_file = base / "normalized" / "normalize-state.json"
-            db_path = base / "analytics" / "token-usage.sqlite"
+            db_path = base / "analytics" / "bola.sqlite"
             current_dir = base / "raw" / "current"
             state_dir = base / "state"
             current_dir.mkdir(parents=True)
@@ -2036,7 +2305,7 @@ class ToolTimingTests(unittest.TestCase):
                     "--normalized-log",
                     str(normalized),
                     "--state-db",
-                    str(codex_home / "missing-state.sqlite"),
+                    str(codex_dir / "missing-state.sqlite"),
                     "--output",
                     str(db_path),
                 ],
@@ -2049,7 +2318,7 @@ class ToolTimingTests(unittest.TestCase):
             state_file.write_text(
                 json.dumps(
                     {
-                        "logic_version": 5,
+                        "logic_version": normalize.NORMALIZE_LOGIC_VERSION,
                         "sources": {
                             str(current_path): current_path.stat().st_size,
                         },
@@ -2063,14 +2332,16 @@ class ToolTimingTests(unittest.TestCase):
             result = subprocess.run(
                 [
                     sys.executable,
-                    str(ROOT / "scripts" / "codex_token_usage.py"),
+                    str(ROOT / "scripts" / "bola.py"),
                     "pipeline",
-                    "--codex-home",
-                    str(codex_home),
+                    "--codex-dir",
+                    str(codex_dir),
+                    "--output-dir",
+                    str(base),
                     "--output",
                     str(db_path),
                     "--state-db",
-                    str(codex_home / "missing-state.sqlite"),
+                    str(codex_dir / "missing-state.sqlite"),
                     "--incremental",
                 ],
                 cwd=ROOT,
@@ -2087,7 +2358,7 @@ class ToolTimingTests(unittest.TestCase):
                 con.close()
 
     def test_pipeline_recovery_is_explicit(self) -> None:
-        cli = load_module("codex_token_usage_recovery_test", ROOT / "scripts" / "codex_token_usage.py")
+        cli = load_module("bola_recovery_test", ROOT / "scripts" / "bola.py")
         calls: list[tuple[str, tuple[str, ...]]] = []
 
         def fake_run_script(name, extra_args, env=None):
@@ -2100,14 +2371,22 @@ class ToolTimingTests(unittest.TestCase):
                 return 0, {"mode": "incremental", "normalized_turns_size": 0}, "{}", ""
             return 0, {}, "{}", ""
 
-        args = types.SimpleNamespace(codex_home=None, state_db=None, output=None, project_root=None, incremental=True, recover=False)
-        with mock.patch.object(cli, "run_script", fake_run_script), mock.patch.object(cli, "run_script_json", fake_run_script_json), mock.patch.object(cli, "current_analytics_metadata", return_value={"turn_rows": 0}), mock.patch.object(cli, "read_analytics_metadata", return_value={}):
+        args = types.SimpleNamespace(codex_dir=None, state_db=None, output=None, project_root=None, incremental=True, recover=False)
+        with (
+            mock.patch.object(cli, "run_script", fake_run_script),
+            mock.patch.object(cli, "run_script_json", fake_run_script_json),
+            mock.patch.object(cli, "read_analytics_metadata", return_value={}),
+        ):
             self.assertEqual(cli.pipeline(args), 0)
         self.assertNotIn(("reconcile.py", ()), calls)
 
         calls.clear()
         args.recover = True
-        with mock.patch.object(cli, "run_script", fake_run_script), mock.patch.object(cli, "run_script_json", fake_run_script_json), mock.patch.object(cli, "current_analytics_metadata", return_value={"turn_rows": 0}), mock.patch.object(cli, "read_analytics_metadata", return_value={}):
+        with (
+            mock.patch.object(cli, "run_script", fake_run_script),
+            mock.patch.object(cli, "run_script_json", fake_run_script_json),
+            mock.patch.object(cli, "read_analytics_metadata", return_value={}),
+        ):
             self.assertEqual(cli.pipeline(args), 0)
         self.assertEqual(calls[0], ("reconcile.py", ()))
 
@@ -2128,8 +2407,8 @@ class ToolTimingTests(unittest.TestCase):
             with mock.patch.dict(
                 os.environ,
                 {
-                    "CODEX_TOKEN_USAGE_LOCK_HELD": "1",
-                    "CODEX_TOKEN_USAGE_LOCK_PATH": str(lock_path),
+                    "BOLA_LOCK_HELD": "1",
+                    "BOLA_LOCK_PATH": str(lock_path),
                 },
                 clear=False,
             ):
@@ -2149,7 +2428,7 @@ class ToolTimingTests(unittest.TestCase):
                         self.assertNotEqual(os.fstat(lock.fd).st_ino, os.fstat(outer.fd).st_ino)
 
     def test_pipeline_passes_held_service_lock_to_children(self) -> None:
-        cli = load_module("codex_token_usage_lock_env_test", ROOT / "scripts" / "codex_token_usage.py")
+        cli = load_module("bola_lock_env_test", ROOT / "scripts" / "bola.py")
         child_envs: list[dict[str, str]] = []
 
         def fake_run_script_json(name, extra_args, env=None):
@@ -2158,19 +2437,23 @@ class ToolTimingTests(unittest.TestCase):
                 return 0, {"mode": "incremental", "normalized_turns_size": 1}, "{}", ""
             return 0, {}, "{}", ""
 
-        args = types.SimpleNamespace(codex_home=None, state_db=None, output=None, project_root=None, incremental=True, recover=False)
+        args = types.SimpleNamespace(codex_dir=None, state_db=None, output=None, project_root=None, incremental=True, recover=False)
         with tempfile.TemporaryDirectory() as tmp_dir:
             lock_path = pathlib.Path(tmp_dir) / "token-usage.lock"
-            with mock.patch.object(cli.service_lock, "default_lock_path", return_value=lock_path), mock.patch.object(cli, "run_script_json", fake_run_script_json), mock.patch.object(cli, "read_analytics_metadata", return_value={}):
+            with (
+                mock.patch.object(cli.service_lock, "default_lock_path", return_value=lock_path),
+                mock.patch.object(cli, "run_script_json", fake_run_script_json),
+                mock.patch.object(cli, "read_analytics_metadata", return_value={}),
+            ):
                 self.assertEqual(cli.pipeline(args), 0)
 
         self.assertTrue(child_envs)
-        self.assertTrue(all(env.get("CODEX_TOKEN_USAGE_LOCK_HELD") == "1" for env in child_envs))
-        self.assertTrue(all(env.get("CODEX_TOKEN_USAGE_LOCK_PATH") for env in child_envs))
-        self.assertTrue(all(env.get("CODEX_TOKEN_USAGE_LOCK_FD") for env in child_envs))
+        self.assertTrue(all(env.get("BOLA_LOCK_HELD") == "1" for env in child_envs))
+        self.assertTrue(all(env.get("BOLA_LOCK_PATH") for env in child_envs))
+        self.assertTrue(all(env.get("BOLA_LOCK_FD") for env in child_envs))
 
     def test_reconcile_cli_runs_under_service_lock(self) -> None:
-        cli = load_module("codex_token_usage_reconcile_lock_test", ROOT / "scripts" / "codex_token_usage.py")
+        cli = load_module("bola_reconcile_lock_test", ROOT / "scripts" / "bola.py")
         calls: list[tuple[str, list[str], dict[str, str]]] = []
 
         def fake_run_script(name, extra_args, env=None):
@@ -2180,18 +2463,18 @@ class ToolTimingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             lock_path = pathlib.Path(tmp_dir) / "token-usage.lock"
             with mock.patch.object(cli.service_lock, "default_lock_path", return_value=lock_path), mock.patch.object(cli, "run_script", fake_run_script):
-                with mock.patch.object(cli.sys, "argv", ["codex_token_usage.py", "reconcile", "--flag"]):
+                with mock.patch.object(cli.sys, "argv", ["bola.py", "reconcile", "--flag"]):
                     self.assertEqual(cli.main(), 0)
 
         self.assertEqual(calls[0][0:2], ("reconcile.py", ["--flag"]))
-        self.assertEqual(calls[0][2].get("CODEX_TOKEN_USAGE_LOCK_HELD"), "1")
+        self.assertEqual(calls[0][2].get("BOLA_LOCK_HELD"), "1")
 
     def test_incremental_analyze_rotates_current_segment_before_build(self) -> None:
-        cli = load_module("cli_analyze_rotate_test", ROOT / "scripts" / "codex_token_usage.py")
+        cli = load_module("cli_analyze_rotate_test", ROOT / "scripts" / "bola.py")
         calls: list[tuple[str, list[str]]] = []
         lock_path = pathlib.Path(tempfile.gettempdir()) / f"token-usage-{time.time_ns()}.lock"
-        codex_home = pathlib.Path(tempfile.gettempdir()) / f"codex-home-{time.time_ns()}"
-        output_path = codex_home / "codex-token-bola" / "analytics" / f"out-{time.time_ns()}.sqlite"
+        codex_dir = pathlib.Path(tempfile.gettempdir()) / f"codex-dir-{time.time_ns()}"
+        output_path = codex_dir / "bola" / "analytics" / f"out-{time.time_ns()}.sqlite"
 
         def fake_run_script_json(name, extra_args, env=None):
             calls.append((name, list(extra_args)))
@@ -2208,21 +2491,26 @@ class ToolTimingTests(unittest.TestCase):
             recover=False,
             skip_rotate=False,
             output=str(output_path),
-            codex_home=str(codex_home),
+            codex_dir=str(codex_dir),
+            output_dir=str(output_path.parents[1]),
             state_db=None,
             project_root=None,
         )
-        with mock.patch.object(cli, "run_script_json", fake_run_script_json), mock.patch.object(cli, "read_analytics_metadata", return_value={"applied_normalized_turns_size": 0}), mock.patch.object(cli.service_lock, "default_lock_path", return_value=lock_path):
+        with (
+            mock.patch.object(cli, "run_script_json", fake_run_script_json),
+            mock.patch.object(cli, "read_analytics_metadata", return_value={"applied_normalized_turns_size": 0}),
+            mock.patch.object(cli.service_lock, "default_lock_path", return_value=lock_path),
+        ):
             result = cli.pipeline(args)
         self.assertEqual(result, 0)
         self.assertLess(calls.index(("compact_raw.py", ["--rotate-current"])), calls.index(("normalize.py", ["--incremental"])))
 
     def test_incremental_analyze_keeps_incremental_build_after_non_empty_rotation(self) -> None:
-        cli = load_module("cli_analyze_non_empty_rotate_incremental_test", ROOT / "scripts" / "codex_token_usage.py")
+        cli = load_module("cli_analyze_non_empty_rotate_incremental_test", ROOT / "scripts" / "bola.py")
         calls: list[tuple[str, list[str]]] = []
         lock_path = pathlib.Path(tempfile.gettempdir()) / f"token-usage-{time.time_ns()}.lock"
-        codex_home = pathlib.Path(tempfile.gettempdir()) / f"codex-home-{time.time_ns()}"
-        output_path = codex_home / "codex-token-bola" / "analytics" / f"out-{time.time_ns()}.sqlite"
+        codex_dir = pathlib.Path(tempfile.gettempdir()) / f"codex-dir-{time.time_ns()}"
+        output_path = codex_dir / "bola" / "analytics" / f"out-{time.time_ns()}.sqlite"
 
         def fake_run_script_json(name, extra_args, env=None):
             calls.append((name, list(extra_args)))
@@ -2239,11 +2527,17 @@ class ToolTimingTests(unittest.TestCase):
             recover=False,
             skip_rotate=False,
             output=str(output_path),
-            codex_home=str(codex_home),
+            codex_dir=str(codex_dir),
+            output_dir=str(output_path.parents[1]),
             state_db=None,
             project_root=None,
         )
-        with mock.patch.object(cli, "run_script_json", fake_run_script_json), mock.patch.object(cli, "read_analytics_metadata", return_value={"applied_normalized_turns_size": 10, "applied_input_fingerprint": "same"}), mock.patch.object(cli, "analysis_input_fingerprint", return_value="same"), mock.patch.object(cli.service_lock, "default_lock_path", return_value=lock_path):
+        with (
+            mock.patch.object(cli, "run_script_json", fake_run_script_json),
+            mock.patch.object(cli, "read_analytics_metadata", return_value={"applied_normalized_turns_size": 10, "applied_input_fingerprint": "same"}),
+            mock.patch.object(cli, "analysis_input_fingerprint", return_value="same"),
+            mock.patch.object(cli.service_lock, "default_lock_path", return_value=lock_path),
+        ):
             result = cli.pipeline(args)
 
         self.assertEqual(result, 0)
@@ -2251,11 +2545,11 @@ class ToolTimingTests(unittest.TestCase):
         self.assertIn(("build_analytics.py", ["--output", str(output_path), "--incremental", "--turns-offset", "10"]), calls)
 
     def test_noop_incremental_analyze_rotates_current_segment_before_noop_check(self) -> None:
-        cli = load_module("cli_noop_analyze_rotate_test", ROOT / "scripts" / "codex_token_usage.py")
+        cli = load_module("cli_noop_analyze_rotate_test", ROOT / "scripts" / "bola.py")
         calls: list[tuple[str, list[str]]] = []
         lock_path = pathlib.Path(tempfile.gettempdir()) / f"token-usage-{time.time_ns()}.lock"
-        codex_home = pathlib.Path(tempfile.gettempdir()) / f"codex-home-{time.time_ns()}"
-        output_path = codex_home / "codex-token-bola" / "analytics" / f"out-{time.time_ns()}.sqlite"
+        codex_dir = pathlib.Path(tempfile.gettempdir()) / f"codex-dir-{time.time_ns()}"
+        output_path = codex_dir / "bola" / "analytics" / f"out-{time.time_ns()}.sqlite"
 
         def fake_run_script_json(name, extra_args, env=None):
             calls.append((name, list(extra_args)))
@@ -2263,6 +2557,8 @@ class ToolTimingTests(unittest.TestCase):
                 return 0, {"mode": "incremental", "normalized_turns_size": 10}, "{}", ""
             if name == "compact_raw.py":
                 return 0, {"prompt_usage": {"closed_segment": {"id": "p1"}, "current_segment": {"id": "p2"}}}, "{}", ""
+            if name == "build_analytics.py":
+                return 0, {"turn_rows": 1, "analysis_mode": "incremental"}, "{}", ""
             raise AssertionError(name)
 
         args = argparse.Namespace(
@@ -2270,21 +2566,28 @@ class ToolTimingTests(unittest.TestCase):
             recover=False,
             skip_rotate=False,
             output=str(output_path),
-            codex_home=str(codex_home),
+            codex_dir=str(codex_dir),
+            output_dir=str(output_path.parents[1]),
             state_db=None,
             project_root=None,
         )
-        with mock.patch.object(cli, "run_script_json", fake_run_script_json), mock.patch.object(cli, "read_analytics_metadata", return_value={"applied_normalized_turns_size": 10, "applied_input_fingerprint": "same"}), mock.patch.object(cli, "analysis_input_fingerprint", return_value="same"), mock.patch.object(cli, "current_analytics_metadata", return_value={"turn_rows": 1, "analysis_mode": "incremental"}), mock.patch.object(cli.service_lock, "default_lock_path", return_value=lock_path):
+        with (
+            mock.patch.object(cli, "run_script_json", fake_run_script_json),
+            mock.patch.object(cli, "read_analytics_metadata", return_value={"applied_normalized_turns_size": 10, "applied_input_fingerprint": "same"}),
+            mock.patch.object(cli, "analysis_input_fingerprint", return_value="same"),
+            mock.patch.object(cli.service_lock, "default_lock_path", return_value=lock_path),
+        ):
             result = cli.pipeline(args)
         self.assertEqual(result, 0)
         self.assertEqual(calls[0], ("compact_raw.py", ["--rotate-current"]))
+        self.assertIn(("build_analytics.py", ["--output", str(output_path), "--incremental", "--turns-offset", "10"]), calls)
 
-    def test_noop_incremental_analyze_rebuilds_when_context_fingerprint_changes(self) -> None:
-        cli = load_module("cli_noop_context_fingerprint_test", ROOT / "scripts" / "codex_token_usage.py")
+    def test_noop_incremental_analyze_uses_context_snapshot_when_fingerprint_changes(self) -> None:
+        cli = load_module("cli_noop_context_fingerprint_test", ROOT / "scripts" / "bola.py")
         calls: list[tuple[str, list[str]]] = []
         lock_path = pathlib.Path(tempfile.gettempdir()) / f"token-usage-{time.time_ns()}.lock"
-        codex_home = pathlib.Path(tempfile.gettempdir()) / f"codex-home-{time.time_ns()}"
-        output_path = codex_home / "codex-token-bola" / "analytics" / f"out-{time.time_ns()}.sqlite"
+        codex_dir = pathlib.Path(tempfile.gettempdir()) / f"codex-dir-{time.time_ns()}"
+        output_path = codex_dir / "bola" / "analytics" / f"out-{time.time_ns()}.sqlite"
 
         def fake_run_script_json(name, extra_args, env=None):
             calls.append((name, list(extra_args)))
@@ -2301,22 +2604,28 @@ class ToolTimingTests(unittest.TestCase):
             recover=False,
             skip_rotate=False,
             output=str(output_path),
-            codex_home=str(codex_home),
+            codex_dir=str(codex_dir),
+            output_dir=str(output_path.parents[1]),
             state_db=None,
             project_root=None,
         )
-        with mock.patch.object(cli, "run_script_json", fake_run_script_json), mock.patch.object(cli, "read_analytics_metadata", return_value={"applied_normalized_turns_size": 10, "applied_input_fingerprint": "old"}), mock.patch.object(cli, "analysis_input_fingerprint", return_value="new"), mock.patch.object(cli.service_lock, "default_lock_path", return_value=lock_path):
+        with (
+            mock.patch.object(cli, "run_script_json", fake_run_script_json),
+            mock.patch.object(cli, "read_analytics_metadata", return_value={"applied_normalized_turns_size": 10, "applied_input_fingerprint": "old"}),
+            mock.patch.object(cli, "analysis_input_fingerprint", return_value="new"),
+            mock.patch.object(cli.service_lock, "default_lock_path", return_value=lock_path),
+        ):
             result = cli.pipeline(args)
 
         self.assertEqual(result, 0)
-        self.assertIn(("build_analytics.py", ["--output", str(output_path)]), calls)
+        self.assertIn(("build_analytics.py", ["--output", str(output_path), "--incremental", "--turns-offset", "10"]), calls)
 
     def test_incremental_analyze_rebuilds_full_when_applied_offset_exceeds_normalized_size(self) -> None:
-        cli = load_module("cli_oversized_applied_offset_test", ROOT / "scripts" / "codex_token_usage.py")
+        cli = load_module("cli_oversized_applied_offset_test", ROOT / "scripts" / "bola.py")
         calls: list[tuple[str, list[str]]] = []
         lock_path = pathlib.Path(tempfile.gettempdir()) / f"token-usage-{time.time_ns()}.lock"
-        codex_home = pathlib.Path(tempfile.gettempdir()) / f"codex-home-{time.time_ns()}"
-        output_path = codex_home / "codex-token-bola" / "analytics" / f"out-{time.time_ns()}.sqlite"
+        codex_dir = pathlib.Path(tempfile.gettempdir()) / f"codex-dir-{time.time_ns()}"
+        output_path = codex_dir / "bola" / "analytics" / f"out-{time.time_ns()}.sqlite"
 
         def fake_run_script_json(name, extra_args, env=None):
             calls.append((name, list(extra_args)))
@@ -2333,11 +2642,17 @@ class ToolTimingTests(unittest.TestCase):
             recover=False,
             skip_rotate=False,
             output=str(output_path),
-            codex_home=str(codex_home),
+            codex_dir=str(codex_dir),
+            output_dir=str(output_path.parents[1]),
             state_db=None,
             project_root=None,
         )
-        with mock.patch.object(cli, "run_script_json", fake_run_script_json), mock.patch.object(cli, "read_analytics_metadata", return_value={"applied_normalized_turns_size": 20, "applied_input_fingerprint": "same"}), mock.patch.object(cli, "analysis_input_fingerprint", return_value="same"), mock.patch.object(cli.service_lock, "default_lock_path", return_value=lock_path):
+        with (
+            mock.patch.object(cli, "run_script_json", fake_run_script_json),
+            mock.patch.object(cli, "read_analytics_metadata", return_value={"applied_normalized_turns_size": 20, "applied_input_fingerprint": "same"}),
+            mock.patch.object(cli, "analysis_input_fingerprint", return_value="same"),
+            mock.patch.object(cli.service_lock, "default_lock_path", return_value=lock_path),
+        ):
             result = cli.pipeline(args)
 
         self.assertEqual(result, 0)
@@ -2345,34 +2660,41 @@ class ToolTimingTests(unittest.TestCase):
 
     def test_analysis_input_fingerprint_uses_shared_path_digest(self) -> None:
         helper = load_module("analysis_inputs_shared_digest_test", ROOT / "scripts" / "analysis_inputs.py")
-        cli = load_module("cli_shared_digest_test", ROOT / "scripts" / "codex_token_usage.py")
+        cli = load_module("cli_shared_digest_test", ROOT / "scripts" / "bola.py")
         with tempfile.TemporaryDirectory() as tmp_dir:
-            home = pathlib.Path(tmp_dir) / "codex-home"
-            state_db = home / "state_5.sqlite"
-            session_index = home / "session_index.jsonl"
-            pruned = home / "codex-token-bola" / "state" / "retention-pruned-turns.json"
+            codex_dir = pathlib.Path(tmp_dir) / "codex-dir"
+            state_db = codex_dir / "state_5.sqlite"
+            session_index = codex_dir / "session_index.jsonl"
+            pruned = codex_dir / "bola" / "state" / "retention-pruned-turns.json"
             pruned.parent.mkdir(parents=True)
             state_db.parent.mkdir(parents=True, exist_ok=True)
             state_db.write_text("state\n", encoding="utf-8")
             session_index.write_text("session\n", encoding="utf-8")
             pruned.write_text("{}\n", encoding="utf-8")
 
-            with mock.patch.dict(os.environ, {"CODEX_HOME": str(home), "CODEX_TOKEN_USAGE_STATE_DB": str(state_db)}):
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CODEX_HOME": str(codex_dir),
+                    "BOLA_OUTPUT_DIR": str(codex_dir / "bola"),
+                    "BOLA_STATE_DB": str(state_db),
+                },
+            ):
                 build = load_module("build_shared_digest_test", ROOT / "scripts" / "build_analytics.py")
 
-            expected = helper.analysis_input_fingerprint(home, state_db)
+            expected = helper.analysis_input_fingerprint(codex_dir, state_db, codex_dir / "bola")
 
-            self.assertEqual(cli.analysis_input_fingerprint(str(home), str(state_db)), expected)
+            self.assertEqual(cli.analysis_input_fingerprint(str(codex_dir), str(state_db), str(codex_dir / "bola")), expected)
             self.assertEqual(build.analysis_input_fingerprint(), expected)
 
-    def test_incremental_pipeline_codex_home_defaults_output_to_that_home(self) -> None:
-        cli = load_module("cli_codex_home_default_output_test", ROOT / "scripts" / "codex_token_usage.py")
+    def test_incremental_pipeline_data_root_controls_default_output(self) -> None:
+        cli = load_module("cli_codex_dir_default_output_test", ROOT / "scripts" / "bola.py")
         calls: list[tuple[str, list[str]]] = []
         observed_metadata_outputs: list[str | None] = []
-        observed_current_outputs: list[str | None] = []
         lock_path = pathlib.Path(tempfile.gettempdir()) / f"token-usage-{time.time_ns()}.lock"
-        codex_home = pathlib.Path(tempfile.gettempdir()) / f"codex-home-{time.time_ns()}"
-        expected_output = str(codex_home / "codex-token-bola" / "analytics" / "token-usage.sqlite")
+        codex_dir = pathlib.Path(tempfile.gettempdir()) / f"codex-dir-{time.time_ns()}"
+        output_dir = pathlib.Path(tempfile.gettempdir()) / f"token-data-{time.time_ns()}"
+        expected_output = str(output_dir / "analytics" / "bola.sqlite")
 
         def fake_run_script_json(name, extra_args, env=None):
             calls.append((name, list(extra_args)))
@@ -2380,55 +2702,64 @@ class ToolTimingTests(unittest.TestCase):
                 return 0, {}, "{}", ""
             if name == "normalize.py":
                 return 0, {"mode": "incremental", "normalized_turns_size": 0}, "{}", ""
+            if name == "build_analytics.py":
+                return 0, {"turn_rows": 0, "analysis_mode": "incremental"}, "{}", ""
             raise AssertionError(name)
 
         def fake_read_metadata(output):
             observed_metadata_outputs.append(output)
             return {"applied_normalized_turns_size": 0, "applied_input_fingerprint": "same"}
 
-        def fake_current_metadata(output):
-            observed_current_outputs.append(output)
-            return {"turn_rows": 0, "analysis_mode": "incremental"}
-
         args = argparse.Namespace(
             incremental=True,
             recover=False,
             skip_rotate=False,
             output=None,
-            codex_home=str(codex_home),
+            codex_dir=str(codex_dir),
+            output_dir=str(output_dir),
             state_db=None,
             project_root=None,
         )
-        with mock.patch.object(cli, "run_script_json", fake_run_script_json), mock.patch.object(cli, "read_analytics_metadata", fake_read_metadata), mock.patch.object(cli, "analysis_input_fingerprint", return_value="same"), mock.patch.object(cli, "current_analytics_metadata", fake_current_metadata), mock.patch.object(cli.service_lock, "default_lock_path", return_value=lock_path):
+        with (
+            mock.patch.object(cli, "run_script_json", fake_run_script_json),
+            mock.patch.object(cli, "read_analytics_metadata", fake_read_metadata),
+            mock.patch.object(cli, "analysis_input_fingerprint", return_value="same"),
+            mock.patch.object(cli.service_lock, "default_lock_path", return_value=lock_path),
+        ):
             result = cli.pipeline(args)
 
         self.assertEqual(result, 0)
         self.assertEqual(observed_metadata_outputs, [expected_output])
-        self.assertEqual(observed_current_outputs, [expected_output])
-        self.assertNotIn(("build_analytics.py", []), calls)
+        self.assertIn(
+            ("build_analytics.py", ["--output", expected_output, "--incremental", "--turns-offset", "0"]),
+            calls,
+        )
 
-    def test_retention_prune_codex_home_defaults_match_pipeline(self) -> None:
-        cli = load_module("cli_retention_codex_home_default_test", ROOT / "scripts" / "codex_token_usage.py")
-        codex_home = pathlib.Path(tempfile.gettempdir()) / f"codex-home-{time.time_ns()}"
-        expected_output = codex_home / "codex-token-bola" / "analytics" / "token-usage.sqlite"
+    def test_retention_prune_data_root_defaults_match_pipeline(self) -> None:
+        cli = load_module("cli_retention_codex_dir_default_test", ROOT / "scripts" / "bola.py")
+        codex_dir = pathlib.Path(tempfile.gettempdir()) / f"codex-dir-{time.time_ns()}"
+        output_dir = pathlib.Path(tempfile.gettempdir()) / f"token-data-{time.time_ns()}"
+        expected_output = output_dir / "analytics" / "bola.sqlite"
 
-        with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_dir), "BOLA_OUTPUT_DIR": str(output_dir)}, clear=False):
             retention_args = cli.parse_args(["retention-prune", "--cutoff", "0"])
 
-            self.assertIsNone(retention_args.codex_home)
+            self.assertIsNone(retention_args.codex_dir)
             self.assertEqual(cli.pipeline_output_path(None, None), expected_output)
-            self.assertEqual(cli.retention_db_path(retention_args.codex_home, None), expected_output)
+            self.assertEqual(cli.retention_db_path(retention_args.codex_dir, None), expected_output)
 
     def test_full_normalize_reads_current_prompt_segment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            codex_home = pathlib.Path(tmp) / ".codex"
-            base = codex_home / "codex-token-bola"
+            codex_dir = pathlib.Path(tmp) / ".codex"
+            base = codex_dir / "bola"
             current_dir = base / "raw" / "current"
             state_dir = base / "state"
             current_dir.mkdir(parents=True)
             state_dir.mkdir(parents=True)
             current_path = current_dir / "prompt-usage.raw.jsonl.current.1779235200000000000.jsonl"
-            current_path.write_text(json.dumps(_turn_raw("s-current", "t-current", total=123) | {"captured_at": "2026-05-20T00:00:00+00:00"}) + "\n", encoding="utf-8")
+            current_path.write_text(
+                json.dumps(_turn_raw("s-current", "t-current", total=123) | {"captured_at": "2026-05-20T00:00:00+00:00"}) + "\n", encoding="utf-8"
+            )
             pointer = {
                 "schema_version": 1,
                 "base": str(base.resolve()),
@@ -2444,7 +2775,13 @@ class ToolTimingTests(unittest.TestCase):
             }
             (state_dir / "current-raw-segments.json").write_text(json.dumps(pointer) + "\n", encoding="utf-8")
 
-            result = subprocess.run([sys.executable, str(ROOT / "scripts" / "normalize.py")], env={**os.environ, "CODEX_HOME": str(codex_home)}, check=True, capture_output=True, text=True)
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "normalize.py")],
+                env={**os.environ, "CODEX_HOME": str(codex_dir), "BOLA_OUTPUT_DIR": str(base)},
+                check=True,
+                capture_output=True,
+                text=True,
+            )
             normalized = base / "normalized" / "prompt-usage.normalized.jsonl"
             normalized_text = normalized.read_text(encoding="utf-8").replace(" ", "")
 
@@ -2453,15 +2790,17 @@ class ToolTimingTests(unittest.TestCase):
 
     def test_skip_rotate_incremental_pipeline_reads_current_segments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            codex_home = pathlib.Path(tmp) / ".codex"
-            base = codex_home / "codex-token-bola"
+            codex_dir = pathlib.Path(tmp) / ".codex"
+            base = codex_dir / "bola"
             raw_dir = base / "raw"
             current_dir = raw_dir / "current"
             state_dir = base / "state"
             current_dir.mkdir(parents=True)
             state_dir.mkdir(parents=True)
             prompt_path = current_dir / "prompt-usage.raw.jsonl.current.1779235200000000000.jsonl"
-            prompt_path.write_text(json.dumps(_turn_raw("s-current", "t-current", total=123) | {"captured_at": "2026-05-20T00:00:00+00:00"}) + "\n", encoding="utf-8")
+            prompt_path.write_text(
+                json.dumps(_turn_raw("s-current", "t-current", total=123) | {"captured_at": "2026-05-20T00:00:00+00:00"}) + "\n", encoding="utf-8"
+            )
             pointer = {
                 "schema_version": 1,
                 "base": str(base.resolve()),
@@ -2476,9 +2815,26 @@ class ToolTimingTests(unittest.TestCase):
                 },
             }
             (state_dir / "current-raw-segments.json").write_text(json.dumps(pointer) + "\n", encoding="utf-8")
-            db_path = base / "analytics" / "token-usage.sqlite"
+            db_path = base / "analytics" / "bola.sqlite"
 
-            result = subprocess.run([sys.executable, str(ROOT / "scripts" / "codex_token_usage.py"), "pipeline", "--incremental", "--skip-rotate", "--codex-home", str(codex_home), "--output", str(db_path)], check=True, capture_output=True, text=True)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "bola.py"),
+                    "pipeline",
+                    "--incremental",
+                    "--skip-rotate",
+                    "--codex-dir",
+                    str(codex_dir),
+                    "--output-dir",
+                    str(base),
+                    "--output",
+                    str(db_path),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
             con = sqlite3.connect(db_path)
             try:
                 total = con.execute("select total_tokens from turns where session_id='s-current' and turn_id='t-current'").fetchone()[0]
@@ -2489,11 +2845,11 @@ class ToolTimingTests(unittest.TestCase):
         self.assertEqual(total, 123)
 
     def test_full_analyze_rotates_current_segment_before_normalize(self) -> None:
-        cli = load_module("cli_full_analyze_rotate_test", ROOT / "scripts" / "codex_token_usage.py")
+        cli = load_module("cli_full_analyze_rotate_test", ROOT / "scripts" / "bola.py")
         calls: list[tuple[str, list[str]]] = []
         lock_path = pathlib.Path(tempfile.gettempdir()) / f"token-usage-{time.time_ns()}.lock"
-        codex_home = pathlib.Path(tempfile.gettempdir()) / f"codex-home-{time.time_ns()}"
-        output_path = codex_home / "codex-token-bola" / "analytics" / f"out-{time.time_ns()}.sqlite"
+        codex_dir = pathlib.Path(tempfile.gettempdir()) / f"codex-dir-{time.time_ns()}"
+        output_path = codex_dir / "bola" / "analytics" / f"out-{time.time_ns()}.sqlite"
 
         def fake_run_script_json(name, extra_args, env=None):
             calls.append((name, list(extra_args)))
@@ -2514,12 +2870,18 @@ class ToolTimingTests(unittest.TestCase):
             recover=False,
             skip_rotate=False,
             output=str(output_path),
-            codex_home=str(codex_home),
+            codex_dir=str(codex_dir),
+            output_dir=str(output_path.parents[1]),
             state_db=None,
             project_root=None,
         )
         stdout = io.StringIO()
-        with mock.patch.object(cli, "run_script_json", fake_run_script_json), mock.patch.object(cli, "run_script", fake_run_script), mock.patch.object(cli.service_lock, "default_lock_path", return_value=lock_path), mock.patch("sys.stdout", stdout):
+        with (
+            mock.patch.object(cli, "run_script_json", fake_run_script_json),
+            mock.patch.object(cli, "run_script", fake_run_script),
+            mock.patch.object(cli.service_lock, "default_lock_path", return_value=lock_path),
+            mock.patch("sys.stdout", stdout),
+        ):
             result = cli.pipeline(args)
         self.assertEqual(result, 0)
         self.assertLess(calls.index(("compact_raw.py", ["--rotate-current"])), calls.index(("normalize.py", [])))
@@ -2533,17 +2895,47 @@ class ToolTimingTests(unittest.TestCase):
 
     def test_current_segment_row_is_visible_after_one_analyze(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            codex_home = pathlib.Path(tmp) / ".codex"
-            base = codex_home / "codex-token-bola"
+            codex_dir = pathlib.Path(tmp) / ".codex"
+            base = codex_dir / "bola"
             current_dir = base / "raw" / "current"
             current_dir.mkdir(parents=True)
             current_path = current_dir / "prompt-usage.raw.jsonl.current.1779235200000000000.jsonl"
-            current_path.write_text(json.dumps(_turn_raw("s-current", "t-current", total=123) | {"captured_at": "2026-05-20T00:00:00+00:00"}) + "\n", encoding="utf-8")
-            pointer = {"current": {"prompt_usage": {"id": "prompt-usage.raw.jsonl.current.1779235200000000000", "kind": "prompt_usage", "path": str(current_path), "source_name": "prompt-usage.raw.jsonl", "created_at_unix": 1779235200.0}}}
+            current_path.write_text(
+                json.dumps(_turn_raw("s-current", "t-current", total=123) | {"captured_at": "2026-05-20T00:00:00+00:00"}) + "\n", encoding="utf-8"
+            )
+            pointer = {
+                "current": {
+                    "prompt_usage": {
+                        "id": "prompt-usage.raw.jsonl.current.1779235200000000000",
+                        "kind": "prompt_usage",
+                        "path": str(current_path),
+                        "source_name": "prompt-usage.raw.jsonl",
+                        "created_at_unix": 1779235200.0,
+                    }
+                }
+            }
             (base / "state").mkdir(parents=True)
-            (base / "state" / "current-raw-segments.json").write_text(json.dumps({"schema_version": 1, "base": str(base.resolve()), **pointer}) + "\n", encoding="utf-8")
-            db_path = base / "analytics" / "token-usage.sqlite"
-            result = subprocess.run([sys.executable, str(ROOT / "scripts" / "codex_token_usage.py"), "pipeline", "--incremental", "--codex-home", str(codex_home), "--output", str(db_path)], check=True, capture_output=True, text=True)
+            (base / "state" / "current-raw-segments.json").write_text(
+                json.dumps({"schema_version": 1, "base": str(base.resolve()), **pointer}) + "\n", encoding="utf-8"
+            )
+            db_path = base / "analytics" / "bola.sqlite"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "bola.py"),
+                    "pipeline",
+                    "--incremental",
+                    "--codex-dir",
+                    str(codex_dir),
+                    "--output-dir",
+                    str(base),
+                    "--output",
+                    str(db_path),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
             self.assertIn('"turn_rows":1', result.stdout)
             con = sqlite3.connect(db_path)
             try:
@@ -2553,8 +2945,8 @@ class ToolTimingTests(unittest.TestCase):
 
     def test_current_segment_row_is_visible_after_existing_incremental_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            codex_home = pathlib.Path(tmp) / ".codex"
-            base = codex_home / "codex-token-bola"
+            codex_dir = pathlib.Path(tmp) / ".codex"
+            base = codex_dir / "bola"
             raw_dir = base / "raw"
             normalized_dir = base / "normalized"
             analytics_dir = base / "analytics"
@@ -2564,7 +2956,9 @@ class ToolTimingTests(unittest.TestCase):
             normalized_dir.mkdir(parents=True)
             analytics_dir.mkdir(parents=True)
             (raw_dir / "prompt-usage.raw.jsonl").write_text("", encoding="utf-8")
-            (normalized_dir / "prompt-usage.normalized.jsonl").write_text(json.dumps(_turn_normalized("s-existing", "t-existing", total=111)) + "\n", encoding="utf-8")
+            (normalized_dir / "prompt-usage.normalized.jsonl").write_text(
+                json.dumps(_turn_normalized("s-existing", "t-existing", total=111)) + "\n", encoding="utf-8"
+            )
             normalize = load_module("normalize_existing_incremental_state_test", ROOT / "scripts" / "normalize.py")
             (normalized_dir / "normalize-state.json").write_text(
                 json.dumps(
@@ -2578,23 +2972,55 @@ class ToolTimingTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            db_path = analytics_dir / "token-usage.sqlite"
-            test_env = {**os.environ, "CODEX_HOME": str(codex_home)}
+            db_path = analytics_dir / "bola.sqlite"
+            test_env = {**os.environ, "CODEX_HOME": str(codex_dir)}
             subprocess.run(
-                [sys.executable, str(ROOT / "scripts" / "build_analytics.py"), "--normalized-log", str(normalized_dir / "prompt-usage.normalized.jsonl"), "--output", str(db_path)],
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "build_analytics.py"),
+                    "--normalized-log",
+                    str(normalized_dir / "prompt-usage.normalized.jsonl"),
+                    "--output",
+                    str(db_path),
+                ],
                 check=True,
                 capture_output=True,
                 text=True,
                 env=test_env,
             )
             current_path = current_dir / "prompt-usage.raw.jsonl.current.1779235200000000000.jsonl"
-            current_path.write_text(json.dumps(_turn_raw("s-current", "t-current", total=123) | {"captured_at": "2026-05-20T00:00:00+00:00"}) + "\n", encoding="utf-8")
-            pointer = {"current": {"prompt_usage": {"id": "prompt-usage.raw.jsonl.current.1779235200000000000", "kind": "prompt_usage", "path": str(current_path), "source_name": "prompt-usage.raw.jsonl", "created_at_unix": 1779235200.0}}}
+            current_path.write_text(
+                json.dumps(_turn_raw("s-current", "t-current", total=123) | {"captured_at": "2026-05-20T00:00:00+00:00"}) + "\n", encoding="utf-8"
+            )
+            pointer = {
+                "current": {
+                    "prompt_usage": {
+                        "id": "prompt-usage.raw.jsonl.current.1779235200000000000",
+                        "kind": "prompt_usage",
+                        "path": str(current_path),
+                        "source_name": "prompt-usage.raw.jsonl",
+                        "created_at_unix": 1779235200.0,
+                    }
+                }
+            }
             (base / "state").mkdir(parents=True, exist_ok=True)
-            (base / "state" / "current-raw-segments.json").write_text(json.dumps({"schema_version": 1, "base": str(base.resolve()), **pointer}) + "\n", encoding="utf-8")
+            (base / "state" / "current-raw-segments.json").write_text(
+                json.dumps({"schema_version": 1, "base": str(base.resolve()), **pointer}) + "\n", encoding="utf-8"
+            )
 
             result = subprocess.run(
-                [sys.executable, str(ROOT / "scripts" / "codex_token_usage.py"), "pipeline", "--incremental", "--codex-home", str(codex_home), "--output", str(db_path)],
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "bola.py"),
+                    "pipeline",
+                    "--incremental",
+                    "--codex-dir",
+                    str(codex_dir),
+                    "--output-dir",
+                    str(base),
+                    "--output",
+                    str(db_path),
+                ],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -2840,9 +3266,12 @@ class ToolTimingTests(unittest.TestCase):
         cleanup = load_module("dashboard_cleanup_state_first_test", ROOT / "scripts" / "dashboard_cleanup.py")
         with tempfile.TemporaryDirectory() as tmp_dir:
             base = pathlib.Path(tmp_dir) / "token-usage"
-            raw_dir = base / "raw"
-            raw_dir.mkdir(parents=True)
-            raw_prompt = raw_dir / "prompt-usage.raw.jsonl"
+            current = cleanup._retention.raw_segments.ensure_current_segment(
+                base,
+                kind="prompt_usage",
+                source_name="prompt-usage.raw.jsonl",
+            )
+            raw_prompt = pathlib.Path(current["path"])
             raw_prompt.write_text(
                 json.dumps(_turn_raw("parent", "old-parent", 100) | {"captured_at": "2026-01-01T00:00:00Z"}) + "\n",
                 encoding="utf-8",
@@ -3025,7 +3454,7 @@ class ToolTimingTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            reconcile.CODEX_HOME = pathlib.Path(tmp)
+            reconcile.CODEX_DIR = pathlib.Path(tmp)
             reconcile.BASE_DIR = base
             reconcile.STATE_DIR = state_dir
             reconcile.RAW_LOG = base / "raw" / "prompt-usage.raw.jsonl"
@@ -3077,7 +3506,11 @@ class ToolTimingTests(unittest.TestCase):
                     ),
                 ),
                 mock.patch.object(reconcile, "completed_turn_index", side_effect=AssertionError("reconcile_one must not rebuild the full completed index")),
-                mock.patch.object(reconcile.hook, "append_prompt_usage", side_effect=AssertionError("duplicate turn must not append")),
+                mock.patch.object(
+                    reconcile.turn_capture,
+                    "append_prompt_usage",
+                    side_effect=AssertionError("duplicate turn must not append"),
+                ),
             ):
                 completed = set()
                 result = reconcile.reconcile_one(pending, completed)
@@ -3103,7 +3536,13 @@ class ToolTimingTests(unittest.TestCase):
                             "payload": {
                                 "type": "token_count",
                                 "info": {
-                                    "last_token_usage": {"input_tokens": 10, "cached_input_tokens": 3, "output_tokens": 2, "reasoning_output_tokens": 1, "total_tokens": 12}
+                                    "last_token_usage": {
+                                        "input_tokens": 10,
+                                        "cached_input_tokens": 3,
+                                        "output_tokens": 2,
+                                        "reasoning_output_tokens": 1,
+                                        "total_tokens": 12,
+                                    }
                                 },
                             },
                         },
@@ -3130,7 +3569,7 @@ class ToolTimingTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            reconcile.CODEX_HOME = pathlib.Path(tmp)
+            reconcile.CODEX_DIR = pathlib.Path(tmp)
             reconcile.BASE_DIR = base
             reconcile.STATE_DIR = state_dir
             reconcile.RAW_LOG = base / "raw" / "prompt-usage.raw.jsonl"
@@ -3171,7 +3610,11 @@ class ToolTimingTests(unittest.TestCase):
                             },
                         },
                         {"timestamp": "2026-05-31T10:00:00.000Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": "t-new"}},
-                        {"timestamp": "2026-05-31T10:00:02.000Z", "type": "event_msg", "payload": {"type": "task_aborted", "turn_id": "t-new", "reason": "cancelled"}},
+                        {
+                            "timestamp": "2026-05-31T10:00:02.000Z",
+                            "type": "event_msg",
+                            "payload": {"type": "task_aborted", "turn_id": "t-new", "reason": "cancelled"},
+                        },
                     ]
                 )
                 + "\n",
@@ -3192,7 +3635,7 @@ class ToolTimingTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            reconcile.CODEX_HOME = pathlib.Path(tmp)
+            reconcile.CODEX_DIR = pathlib.Path(tmp)
             reconcile.BASE_DIR = base
             reconcile.STATE_DIR = state_dir
             reconcile.RAW_LOG = base / "raw" / "prompt-usage.raw.jsonl"
@@ -3202,9 +3645,10 @@ class ToolTimingTests(unittest.TestCase):
             current_paths = reconcile.raw_segments.current_segment_paths(base, kind="prompt_usage")
             records = [json.loads(line) for line in current_paths[0].read_text(encoding="utf-8").splitlines()]
 
-        self.assertEqual(result, "aborted")
+        self.assertEqual(result, "unavailable")
         self.assertEqual(records[0]["usage"]["total_tokens"], 0)
         self.assertEqual(records[0]["end_token_snapshot"]["reason"], "no_token_count_before_task_aborted")
+        self.assertEqual(records[0]["token_resolution_status"], "unavailable")
 
     def test_reconcile_recovers_task_aborted_turns(self) -> None:
         reconcile = load_module("reconcile_task_aborted_test", ROOT / "scripts" / "reconcile.py")
@@ -3218,8 +3662,16 @@ class ToolTimingTests(unittest.TestCase):
                     json.dumps(row)
                     for row in [
                         {"timestamp": "2026-05-31T10:00:00.000Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": "t-abort"}},
-                        {"timestamp": "2026-05-31T10:00:01.000Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 10, "total_tokens": 10}}}},
-                        {"timestamp": "2026-05-31T10:00:02.000Z", "type": "event_msg", "payload": {"type": "task_aborted", "turn_id": "t-abort", "reason": "cancelled"}},
+                        {
+                            "timestamp": "2026-05-31T10:00:01.000Z",
+                            "type": "event_msg",
+                            "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 10, "total_tokens": 10}}},
+                        },
+                        {
+                            "timestamp": "2026-05-31T10:00:02.000Z",
+                            "type": "event_msg",
+                            "payload": {"type": "task_aborted", "turn_id": "t-abort", "reason": "cancelled"},
+                        },
                     ]
                 )
                 + "\n",
@@ -3242,7 +3694,7 @@ class ToolTimingTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            reconcile.CODEX_HOME = pathlib.Path(tmp)
+            reconcile.CODEX_DIR = pathlib.Path(tmp)
             reconcile.BASE_DIR = base
             reconcile.STATE_DIR = state_dir
             reconcile.RAW_LOG = base / "raw" / "prompt-usage.raw.jsonl"
@@ -3255,6 +3707,7 @@ class ToolTimingTests(unittest.TestCase):
         self.assertEqual(result, "aborted")
         self.assertFalse(pending.exists())
         self.assertEqual(records[0]["turn_status"], "aborted")
+        self.assertEqual(records[0]["token_resolution_status"], "resolved")
         self.assertEqual(records[0]["lifecycle_end_reason"], "cancelled")
 
     def test_reconcile_excludes_missing_transcript_state(self) -> None:
@@ -3280,7 +3733,7 @@ class ToolTimingTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            reconcile.CODEX_HOME = pathlib.Path(tmp)
+            reconcile.CODEX_DIR = pathlib.Path(tmp)
             reconcile.BASE_DIR = base
             reconcile.STATE_DIR = state_dir
             reconcile.RAW_LOG = base / "raw" / "prompt-usage.raw.jsonl"
@@ -3304,7 +3757,7 @@ class ToolTimingTests(unittest.TestCase):
                 json.dumps({"schema_version": 1, "current": {"prompt_usage": {"id": "p1"}}}),
                 encoding="utf-8",
             )
-            reconcile.CODEX_HOME = pathlib.Path(tmp)
+            reconcile.CODEX_DIR = pathlib.Path(tmp)
             reconcile.BASE_DIR = base
             reconcile.STATE_DIR = state_dir
 

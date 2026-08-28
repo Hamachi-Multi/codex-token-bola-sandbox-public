@@ -10,7 +10,7 @@ from dashboard_cleanup_contract import (
     CLEANUP_REQUIRED_DISPLAY_FIELDS,
     CLEANUP_RETIRED_LABELS,
 )
-from playwright_dashboard_helpers import assert_true, fetch_json
+from playwright_dashboard_helpers import assert_true, fetch_json, open_dashboard
 
 LEGACY_CLEANUP_ROW_FIELDS = {
     "retention_role",
@@ -19,6 +19,8 @@ LEGACY_CLEANUP_ROW_FIELDS = {
     "retention_summary",
     "delete_all_summary",
 }
+CLEANUP_TIMEZONE = "Asia/Seoul"
+CLEANUP_TIMEZONE_QUERY = urllib.parse.urlencode({"timezone": CLEANUP_TIMEZONE})
 
 
 def assert_cleanup_row_contract(row: dict, *, context: str) -> None:
@@ -68,9 +70,30 @@ def cleanup_detail_display_has_files(display: dict) -> bool:
 
 
 def check_cleanup_short_desktop(page, base_url: str) -> None:
-    page.set_viewport_size({"width": 1280, "height": 720})
-    page.goto(f"{base_url}/#cleanup", wait_until="networkidle")
+    open_dashboard(page, base_url, path="/#cleanup")
     page.wait_for_selector("#cleanup-files tr[data-cleanup-file]", timeout=10_000)
+    local_calendar = page.evaluate(
+        """
+        async () => {
+          const retention = await import('/assets/dashboard/cleanup-retention.js');
+          return {
+            timezone: retention.cleanupRetentionTimezone(),
+            beforeNine: retention.localDateDaysAgo(1, new Date('2026-08-25T08:00:00+09:00')),
+            afterNine: retention.localDateDaysAgo(1, new Date('2026-08-25T10:00:00+09:00')),
+            sevenDays: retention.localDateDaysAgo(7, new Date('2026-08-25T09:00:00+09:00')),
+          };
+        }
+        """
+    )
+    assert_true(
+        local_calendar == {
+            "timezone": CLEANUP_TIMEZONE,
+            "beforeNine": "2026-08-24",
+            "afterNine": "2026-08-24",
+            "sevenDays": "2026-08-18",
+        },
+        f"cleanup presets should use stable browser-local calendar dates: {local_calendar}",
+    )
     compact_state = page.evaluate(
         """
         () => {
@@ -109,7 +132,7 @@ def check_cleanup_short_desktop(page, base_url: str) -> None:
         }
         """
     )
-    assert_true(compact_state["appbarHeight"] <= 74, f"short desktop toolbar should remain on one row: {compact_state}")
+    assert_true(compact_state["appbarHeight"] <= 130, f"short desktop toolbar should remain compact across two rows: {compact_state}")
     assert_true(compact_state["presetWhiteSpace"] == "nowrap", f"short desktop preset labels should not wrap: {compact_state}")
     assert_true(compact_state["presetHeight"] <= 34, f"short desktop preset buttons should stay compact: {compact_state}")
     assert_true(compact_state["presetActionGap"] >= 8, f"short desktop cleanup presets should not overlap actions: {compact_state}")
@@ -126,8 +149,46 @@ def check_cleanup_short_desktop(page, base_url: str) -> None:
         compact_state["lastRowBottom"] <= compact_state["viewportHeight"],
         f"short desktop should keep every managed file row visible: {compact_state}",
     )
+    for viewport in ({"width": 1024, "height": 768}, {"width": 1100, "height": 768}):
+        page.set_viewport_size(viewport)
+        open_dashboard(page, base_url, path="/#cleanup")
+        page.wait_for_selector("#cleanup-files tr[data-cleanup-file]", timeout=10_000)
+        protected_summary = page.evaluate(
+            """
+            () => {
+              const summary = document.querySelector('.cleanup-selection-summary').getBoundingClientRect();
+              const form = document.querySelector('.cleanup-retention-form').getBoundingClientRect();
+              const scroller = document.querySelector('#cleanup-files .table-scroll');
+              const values = [
+                document.querySelector('#cleanup-selected-bytes'),
+                document.querySelector('#cleanup-selected-count'),
+                document.querySelector('#cleanup-retention-files'),
+              ].map(element => element.getBoundingClientRect());
+              return {
+                summaryHeight: Math.round(summary.height * 1000) / 1000,
+                valuesVisible: values.every(value => (
+                  value.width > 0 && value.height > 0
+                  && value.top >= summary.top - 1
+                  && value.bottom <= summary.bottom + 1
+                )),
+                formSeparated: summary.bottom <= form.top + 1,
+                filesOverflowY: getComputedStyle(scroller).overflowY,
+              };
+            }
+            """
+        )
+        assert_true(
+            protected_summary["summaryHeight"] >= 90
+            and protected_summary["valuesVisible"]
+            and protected_summary["formSeparated"],
+            f"{viewport['width']}x{viewport['height']} cleanup summary should remain readable above controls: {protected_summary}",
+        )
+        assert_true(
+            protected_summary["filesOverflowY"] == "auto",
+            f"{viewport['width']}x{viewport['height']} Retention Impact should own any vertical overflow: {protected_summary}",
+        )
     page.set_viewport_size({"width": 900, "height": 650})
-    page.goto(f"{base_url}/#cleanup", wait_until="networkidle")
+    open_dashboard(page, base_url, path="/#cleanup")
     page.wait_for_selector("#cleanup-files tr[data-cleanup-file]", timeout=10_000)
     minimum_desktop = page.evaluate(
         """
@@ -138,24 +199,55 @@ def check_cleanup_short_desktop(page, base_url: str) -> None:
           const lastRow = rows[rows.length - 1].getBoundingClientRect();
           const view = document.querySelector('.view.active').getBoundingClientRect();
           const layout = document.querySelector('.cleanup-layout').getBoundingClientRect();
+          const custom = document.querySelector('.cleanup-retention-custom').getBoundingClientRect();
+          const presets = document.querySelector('.cleanup-option').getBoundingClientRect();
+          const actions = document.querySelector('.cleanup-action-row').getBoundingClientRect();
+          const summary = document.querySelector('.cleanup-selection-summary').getBoundingClientRect();
+          const presetScroller = document.querySelector('.cleanup-retention-presets');
+          const summaryValues = [
+            document.querySelector('#cleanup-selected-bytes'),
+            document.querySelector('#cleanup-selected-count'),
+            document.querySelector('#cleanup-retention-files'),
+          ].map(element => element.getBoundingClientRect());
           return {
             viewportHeight: window.innerHeight,
             lastRowBottom: Math.round(lastRow.bottom * 1000) / 1000,
             layoutBottomDelta: Math.round(Math.abs(layout.bottom - view.bottom) * 1000) / 1000,
-            filesCanScrollY: files.scrollHeight - files.clientHeight > 1,
+            filesCanScrollY: scroller.scrollHeight - scroller.clientHeight > 1,
             tableCanScrollX: scroller.scrollWidth - scroller.clientWidth > 1,
             tableOverflowX: getComputedStyle(scroller).overflowX,
+            controlsSeparated: custom.bottom <= presets.top + 1 && presets.bottom <= actions.top + 1,
+            summaryHeight: Math.round(summary.height * 1000) / 1000,
+            summaryValuesVisible: summaryValues.every(value => (
+              value.width > 0 && value.height > 0
+              && value.top >= summary.top - 1
+              && value.bottom <= summary.bottom + 1
+            )),
+            summaryFormSeparated: summary.bottom <= custom.top + 1,
+            presetsOverflowX: getComputedStyle(presetScroller).overflowX,
+            filesOverflowY: getComputedStyle(scroller).overflowY,
           };
         }
         """
     )
     assert_true(minimum_desktop["layoutBottomDelta"] <= 1, f"900x650 cleanup layout should fill the active view: {minimum_desktop}")
-    assert_true(not minimum_desktop["filesCanScrollY"], f"900x650 cleanup files should not need vertical scrolling: {minimum_desktop}")
+    assert_true(
+        minimum_desktop["summaryHeight"] >= 90
+        and minimum_desktop["summaryValuesVisible"]
+        and minimum_desktop["summaryFormSeparated"],
+        f"900x650 cleanup summary should remain readable above controls: {minimum_desktop}",
+    )
+    assert_true(
+        minimum_desktop["filesOverflowY"] == "auto",
+        f"900x650 Retention Impact should own any vertical overflow: {minimum_desktop}",
+    )
     assert_true(minimum_desktop["tableOverflowX"] == "auto", f"900x650 cleanup table should expose horizontal scrolling: {minimum_desktop}")
     assert_true(minimum_desktop["tableCanScrollX"], f"900x650 cleanup table should scroll horizontally instead of clipping columns: {minimum_desktop}")
+    assert_true(minimum_desktop["controlsSeparated"], f"900x650 cleanup controls should occupy independent rows: {minimum_desktop}")
+    assert_true(minimum_desktop["presetsOverflowX"] == "auto", f"900x650 cleanup presets should retain horizontal scrolling: {minimum_desktop}")
     assert_true(
-        minimum_desktop["lastRowBottom"] <= minimum_desktop["viewportHeight"],
-        f"900x650 cleanup should keep every managed file row vertically visible: {minimum_desktop}",
+        minimum_desktop["lastRowBottom"] <= minimum_desktop["viewportHeight"] or minimum_desktop["filesCanScrollY"],
+        f"900x650 cleanup should keep rows visible or reachable inside Retention Impact: {minimum_desktop}",
     )
 
 def check_cleanup_desktop(page, base_url: str) -> None:
@@ -163,6 +255,7 @@ def check_cleanup_desktop(page, base_url: str) -> None:
     page.wait_for_selector("#cleanup-files tr[data-cleanup-file]", timeout=10_000)
     cleanup, delete_button = check_cleanup_table_contract(page, base_url)
     check_cleanup_selection_state(page)
+    check_cleanup_confirm_focus_lifecycle(page)
     check_cleanup_all_preset(page, cleanup)
     check_cleanup_retention_preset(page, base_url)
     check_cleanup_preview_race(page, base_url)
@@ -170,6 +263,51 @@ def check_cleanup_desktop(page, base_url: str) -> None:
     check_cleanup_detail_modal(page, base_url)
     check_cleanup_retired_rows_and_controls(page)
     check_cleanup_refresh_stability(page, delete_button)
+
+
+def check_cleanup_confirm_focus_lifecycle(page) -> None:
+    trigger = page.locator("#cleanup-delete")
+    if trigger.is_disabled():
+        return
+    trigger.focus()
+    trigger.click()
+    page.wait_for_selector("#cleanup-confirm-modal.open", timeout=5_000)
+    open_state = page.evaluate(
+        """
+        () => ({
+          activeId: document.activeElement?.id || '',
+          headerInert: document.querySelector('header').hasAttribute('inert'),
+          mainInert: document.querySelector('main').hasAttribute('inert'),
+          detailInert: document.querySelector('#cleanup-detail-modal').hasAttribute('inert'),
+          dialogTabIndex: document.querySelector('#cleanup-confirm-modal [role="dialog"]').tabIndex,
+        })
+        """
+    )
+    assert_true(
+        open_state == {
+            "activeId": "cleanup-confirm-cancel",
+            "headerInert": True,
+            "mainInert": True,
+            "detailInert": True,
+            "dialogTabIndex": -1,
+        },
+        f"cleanup confirmation should isolate the active modal and focus its first action: {open_state}",
+    )
+    page.keyboard.press("Escape")
+    page.wait_for_selector("#cleanup-confirm-modal.open", state="detached", timeout=5_000)
+    closed_state = page.evaluate(
+        """
+        () => ({
+          activeId: document.activeElement?.id || '',
+          headerInert: document.querySelector('header').hasAttribute('inert'),
+          mainInert: document.querySelector('main').hasAttribute('inert'),
+        })
+        """
+    )
+    assert_true(
+        closed_state == {"activeId": "cleanup-delete", "headerInert": False, "mainInert": False},
+        f"closing cleanup confirmation should restore its exact trigger and page interaction: {closed_state}",
+    )
 
 
 def cleanup_row_summaries(page) -> dict:
@@ -239,7 +377,7 @@ def assert_cleanup_rows_match(summary: dict, expected_by_group: dict, *, groups:
 
 def check_cleanup_table_contract(page, base_url: str) -> tuple[dict, object]:
     cleanup_focus_index = page.locator("#cleanup-files").evaluate(
-        "() => Array.from(document.querySelectorAll('#cleanup-files tr[data-cleanup-file]')).indexOf(document.activeElement)"
+        "() => Array.from(document.querySelectorAll('#cleanup-files tr[data-cleanup-file] .row-select-button')).indexOf(document.activeElement)"
     )
     assert_true(cleanup_focus_index >= 0, f"cleanup view should focus a cleanup row on entry: {cleanup_focus_index}")
     cleanup_text = page.locator('[data-view="cleanup"]').inner_text()
@@ -250,7 +388,7 @@ def check_cleanup_table_contract(page, base_url: str) -> tuple[dict, object]:
     assert_true("Actions" not in cleanup_text, "cleanup impact table should not expose the old actions column")
     assert_true("Affected Rows" not in cleanup_text, "cleanup should not expose mixed-semantics affected rows")
     assert_true("Delete Logs" in cleanup_text, "retention cleanup action label missing")
-    cleanup = fetch_json(f"{base_url}/api/log-cleanup")
+    cleanup = fetch_json(f"{base_url}/api/log-cleanup?{CLEANUP_TIMEZONE_QUERY}")
     assert_cleanup_payload_contract(cleanup, context="initial cleanup")
     cleanup_headers = [
         text for text in page.locator("#cleanup-files th").all_text_contents()
@@ -291,18 +429,24 @@ def check_cleanup_table_contract(page, base_url: str) -> tuple[dict, object]:
     )
     cleanup_row_accessibility = page.locator("#cleanup-files tr[data-cleanup-file]").first.evaluate(
         """
-        (row) => ({
-          hasButtonRole: row.getAttribute('role') === 'button',
-          hasDialogPopup: row.getAttribute('aria-haspopup') === 'dialog',
-          label: row.getAttribute('aria-label') || '',
-        })
+        (row) => {
+          const button = row.querySelector('.row-select-button');
+          return {
+            rowRole: row.getAttribute('role') || '',
+            buttonTag: button?.tagName || '',
+            hasDialogPopup: button?.getAttribute('aria-haspopup') === 'dialog',
+            label: button?.getAttribute('aria-label') || '',
+          };
+        }
         """
     )
     assert_true(
-        not cleanup_row_accessibility["hasButtonRole"]
+        cleanup_row_accessibility["rowRole"] == ""
+        and cleanup_row_accessibility["buttonTag"] == "BUTTON"
         and cleanup_row_accessibility["hasDialogPopup"]
-        and cleanup_row_accessibility["label"].endswith(". Press Enter or Space to open file detail."),
-        f"cleanup impact rows should expose detail-dialog keyboard semantics without button role: {cleanup_row_accessibility}",
+        and cleanup_row_accessibility["label"].startswith("Open ")
+        and cleanup_row_accessibility["label"].endswith(" file detail"),
+        f"cleanup impact rows should preserve row semantics and expose a real detail button: {cleanup_row_accessibility}",
     )
     expected_action_counts = {
         str(row.get("group_id") or ""): ((row.get("display") or {}).get("action_file_counts") or {})
@@ -471,7 +615,7 @@ def check_cleanup_table_contract(page, base_url: str) -> tuple[dict, object]:
     )
     assert_true(delete_style["background"] != "rgba(0, 0, 0, 0)", f"delete action has no danger background: {delete_style}")
     cleanup_row_cursor = page.locator("#cleanup-files tbody tr").first.evaluate("(el) => getComputedStyle(el).cursor")
-    assert_true(cleanup_row_cursor == "default", f"cleanup impact rows should use the default cursor: {cleanup_row_cursor}")
+    assert_true(cleanup_row_cursor == "pointer", f"cleanup impact rows should expose their pointer interaction: {cleanup_row_cursor}")
     assert_true(cleanup["summary"]["service_bytes"] >= cleanup["summary"]["active_raw_bytes"], f"invalid cleanup summary: {cleanup}")
     assert_true("deletable_bytes" in cleanup["summary"], f"cleanup summary missing deletable bytes: {cleanup}")
     assert_true("retention" in cleanup and "selected" in cleanup["retention"], f"cleanup retention preview missing: {cleanup}")
@@ -484,11 +628,12 @@ def check_cleanup_selection_state(page) -> None:
         () => {
           const rows = Array.from(document.querySelectorAll('#cleanup-files tbody tr'));
           const active = document.activeElement;
-          const activeCell = active && active.matches('#cleanup-files tbody tr') ? active.querySelector('td') : null;
+          const activeRow = active?.closest?.('#cleanup-files tbody tr');
+          const activeCell = activeRow ? activeRow.querySelector('td') : null;
           return {
             selectedRows: document.querySelectorAll('#cleanup-files tbody tr.selected').length,
-            ariaSelectedRows: document.querySelectorAll('#cleanup-files tbody tr[aria-selected="true"]').length,
-            activeIndex: rows.indexOf(active),
+            pressedButtons: document.querySelectorAll('#cleanup-files .row-select-button[aria-pressed="true"]').length,
+            activeIndex: rows.indexOf(activeRow),
             activeStripe: activeCell ? getComputedStyle(activeCell).boxShadow : '',
             rowIds: rows.map(row => row.dataset.cleanupFile || ''),
             selectedBackgrounds: Array.from(document.querySelectorAll('#cleanup-files tbody tr.selected td')).map(cell => getComputedStyle(cell).backgroundColor),
@@ -498,7 +643,7 @@ def check_cleanup_selection_state(page) -> None:
         """
     )
     assert_true(cleanup_selection_state["selectedRows"] == 1, f"cleanup impact list should keep exactly one selected class: {cleanup_selection_state}")
-    assert_true(cleanup_selection_state["ariaSelectedRows"] == 1, f"cleanup impact list should expose exactly one selected row: {cleanup_selection_state}")
+    assert_true(cleanup_selection_state["pressedButtons"] == 1, f"cleanup impact list should expose exactly one pressed selector: {cleanup_selection_state}")
     assert_true(cleanup_selection_state["activeIndex"] >= 0, f"cleanup impact list should still focus a row on entry: {cleanup_selection_state}")
     assert_true(cleanup_selection_state["activeStripe"] == "none", f"cleanup impact focus should not draw a left color stripe: {cleanup_selection_state}")
     row_ids = cleanup_selection_state["rowIds"]
@@ -636,7 +781,9 @@ def check_cleanup_retention_preset(page, base_url: str) -> None:
     )
     retention_cleanup_summary = cleanup_row_summaries(page)
     retention_cutoff_date = page.locator("#cleanup-retention-date").input_value()
-    retention_cleanup = fetch_json(f"{base_url}/api/log-cleanup?cutoff_date={retention_cutoff_date}")
+    retention_cleanup = fetch_json(
+        f"{base_url}/api/log-cleanup?{urllib.parse.urlencode({'cutoff_date': retention_cutoff_date, 'timezone': CLEANUP_TIMEZONE})}"
+    )
     assert_cleanup_payload_contract(retention_cleanup, context="retention cleanup")
     retention_expected = expected_cleanup_rows(page, retention_cleanup["rows"], all_mode=False)
     retention_derived_delete_rows = [
@@ -675,13 +822,17 @@ def check_cleanup_preview_race(page, base_url: str) -> None:
         wait_for_pending_routes(2)
         assert_true(delete_button.is_disabled(), "delete action should remain disabled while replacement cleanup preview is loading")
 
-        stale_payload = fetch_json(f"{base_url}/api/log-cleanup?cutoff_date=2000-01-01")
+        stale_payload = fetch_json(
+            f"{base_url}/api/log-cleanup?{urllib.parse.urlencode({'cutoff_date': '2000-01-01', 'timezone': CLEANUP_TIMEZONE})}"
+        )
         pending_routes[0].fulfill(status=200, content_type="application/json", body=json.dumps(stale_payload))
         page.wait_for_timeout(100)
         assert_true(delete_button.is_disabled(), "stale cleanup preview response should not re-enable delete action")
 
         current_cutoff = page.locator("#cleanup-retention-date").input_value()
-        current_payload = fetch_json(f"{base_url}/api/log-cleanup?cutoff_date={urllib.parse.quote(current_cutoff)}")
+        current_payload = fetch_json(
+            f"{base_url}/api/log-cleanup?{urllib.parse.urlencode({'cutoff_date': current_cutoff, 'timezone': CLEANUP_TIMEZONE})}"
+        )
         pending_routes[1].fulfill(status=200, content_type="application/json", body=json.dumps(current_payload))
         page.wait_for_function("() => !document.querySelector('#cleanup-delete').disabled", timeout=10_000)
         selected_count = page.locator("#cleanup-selected-count").text_content() or ""
@@ -764,7 +915,7 @@ def check_cleanup_layout(page) -> None:
 
 
 def check_cleanup_detail_modal(page, base_url: str) -> None:
-    cleanup_payload = fetch_json(f"{base_url}/api/log-cleanup")
+    cleanup_payload = fetch_json(f"{base_url}/api/log-cleanup?{CLEANUP_TIMEZONE_QUERY}")
     preview_signature = str(((cleanup_payload.get("retention") or {}).get("selected") or {}).get("preview_signature") or "")
     assert_true(preview_signature, f"cleanup detail check requires preview signature: {cleanup_payload}")
     detail_by_group = {}
@@ -774,7 +925,9 @@ def check_cleanup_detail_modal(page, base_url: str) -> None:
         group_id = str(row.get("group_id") or "")
         if not group_id:
             continue
-        detail_query = urllib.parse.urlencode({"group_id": group_id, "preview_signature": preview_signature})
+        detail_query = urllib.parse.urlencode(
+            {"group_id": group_id, "preview_signature": preview_signature, "timezone": CLEANUP_TIMEZONE}
+        )
         detail = fetch_json(f"{base_url}/api/log-cleanup/detail?{detail_query}")
         assert_cleanup_detail_payload_contract(detail, group_id=group_id, context=f"cleanup detail API {group_id}")
         detail_by_group[group_id] = detail
@@ -845,13 +998,13 @@ def check_cleanup_detail_modal(page, base_url: str) -> None:
         cleanup_detail_style["summaryIconCenters"] == cleanup_detail_style["summaryValueCenters"],
         f"cleanup detail summary icons should align to value centers: {cleanup_detail_style}",
     )
-    assert_true(cleanup_detail_meta["label"] == "Delete before", f"cleanup detail cutoff should sit in the identity meta line: {cleanup_detail_meta!r}")
+    assert_true(cleanup_detail_meta["label"] == "Delete through", f"cleanup detail cutoff should sit in the identity meta line: {cleanup_detail_meta!r}")
     delete_before_value = cleanup_detail_meta["value"]
     assert_true(
         delete_before_value == "all logs"
         or delete_before_value == "cutoff unavailable"
         or (len(delete_before_value) == 10 and delete_before_value.count("-") == 2),
-        f"cleanup detail Delete Before should show date only: {cleanup_detail_style}",
+        f"cleanup detail Delete Through should show date only: {cleanup_detail_style}",
     )
     assert_true(cleanup_detail_style["hasLedger"] and cleanup_detail_style["hasHeader"], f"cleanup detail should render a deletion target ledger: {cleanup_detail_style}")
     assert_true(cleanup_detail_style["hasPager"] and not cleanup_detail_style["pagerHidden"], f"cleanup detail should always show footer pagination: {cleanup_detail_style}")
@@ -910,8 +1063,12 @@ def check_cleanup_detail_modal(page, base_url: str) -> None:
     assert_true(not cleanup_detail_style["hasImpact"], f"cleanup file detail should not repeat the table deletion impact: {cleanup_detail_style}")
     page.locator("#cleanup-detail-modal-close").click()
     page.wait_for_selector("#cleanup-detail-modal.open", state="detached", timeout=5_000)
+    detail_focus_restored = page.evaluate(
+        "() => document.activeElement === document.querySelector('#cleanup-files tr.selected .row-select-button')"
+    )
+    assert_true(detail_focus_restored, "closing cleanup detail should restore its row action button")
     keyboard_row = page.locator(f'#cleanup-files tr[data-cleanup-file="{cleanup_detail_group_id}"]').first
-    keyboard_row.focus()
+    keyboard_row.locator(".row-select-button").focus()
     page.keyboard.press("Space")
     page.wait_for_selector("#cleanup-detail-modal.open", timeout=5_000)
     page.wait_for_selector("#cleanup-detail-modal-body .cleanup-affected-file-pager", timeout=10_000)

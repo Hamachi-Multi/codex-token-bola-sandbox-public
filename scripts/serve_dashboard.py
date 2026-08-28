@@ -9,13 +9,11 @@ import json
 import logging
 import os
 import pathlib
+import signal
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import threading
-import time
-from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
@@ -26,38 +24,31 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import dashboard_cleanup
+import dashboard_cleanup_api
 import dashboard_freshness
+import dashboard_operation_state
 import dashboard_queries
+import dashboard_rebuild_api
+import dashboard_server_runtime
 import cancel_control
-import progress_control
-import service_lock
+import raw_segments
 import service_paths
 
 
-CODEX_HOME = pathlib.Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
-TOKEN_USAGE_ROOT = service_paths.service_root(CODEX_HOME)
-DB_PATH = pathlib.Path(
-    os.environ.get("CODEX_TOKEN_USAGE_ANALYTICS_DB", str(TOKEN_USAGE_ROOT / "analytics" / "token-usage.sqlite"))
-).expanduser()
-REPO_STATIC_ROOT = SCRIPT_DIR.parent / "assets"
-STATIC_ROOT = pathlib.Path(
-    os.environ.get("CODEX_TOKEN_USAGE_STATIC_ROOT", str(REPO_STATIC_ROOT if REPO_STATIC_ROOT.exists() else TOKEN_USAGE_ROOT / "assets"))
-).expanduser()
-REBUILD_LOCK = threading.Lock()
-REBUILD_CANCEL_EVENT = threading.Event()
-REBUILD_PROCESS_LOCK = threading.Lock()
-REBUILD_PROCESS: subprocess.Popen[str] | None = None
-REBUILD_CANCEL_FILE: pathlib.Path | None = None
-REBUILD_PROGRESS_FILE: pathlib.Path | None = None
-CLEANUP_PROGRESS_LOCK = threading.Lock()
-CLEANUP_PROGRESS_FILE: pathlib.Path | None = None
-CLEANUP_RUNNING = False
-AUTO_COMPACT_MIN_BYTES = 64 * 1024 * 1024
-TRANSIENT_PROGRESS_PATTERNS = (
-    "cleanup-progress.*.json",
-    "rebuild-progress.*.json",
-    "rebuild-cancel.*.json",
-)
+begin_exclusive_operation = dashboard_operation_state.begin_exclusive_operation
+end_exclusive_operation = dashboard_operation_state.end_exclusive_operation
+service_busy_payload = dashboard_operation_state.service_busy_payload
+sweep_transient_progress_files = dashboard_operation_state.sweep_transient_progress_files
+terminate_rebuild_process = dashboard_rebuild_api.terminate_rebuild_process
+
+
+RUNTIME_PATHS = service_paths.resolve_runtime_paths()
+CODEX_DIR = RUNTIME_PATHS.codex_dir
+OUTPUT_DIR = RUNTIME_PATHS.output_dir
+DB_PATH = pathlib.Path(os.environ.get("BOLA_ANALYTICS_DB", str(OUTPUT_DIR / "analytics" / "bola.sqlite"))).expanduser()
+REPO_STATIC_ROOT = SCRIPT_DIR / "assets"
+STATIC_ROOT = pathlib.Path(os.environ.get("BOLA_STATIC_ROOT", str(REPO_STATIC_ROOT))).expanduser()
+MAX_JSON_BODY_BYTES = 64 * 1024
 
 DASHBOARD_HTML_PATH = STATIC_ROOT / "dashboard.html"
 DASHBOARD_CSS_PATH = STATIC_ROOT / "dashboard.css"
@@ -65,24 +56,47 @@ DASHBOARD_JS_PATH = STATIC_ROOT / "dashboard.js"
 
 
 def is_loopback_host(host: str) -> bool:
-    if host == "localhost":
+    if host.lower() == "localhost":
         return True
     try:
-        return ipaddress.ip_address(host).is_loopback
+        address = ipaddress.ip_address(host)
+        return address.version == 4 and address.is_loopback
     except ValueError:
         return False
 
 
-def terminate_rebuild_process(process: subprocess.Popen[str], grace_seconds: float = 2.0) -> str:
-    if process.poll() is not None:
-        return "completed"
-    process.terminate()
+def dashboard_authority(host: str, port: int) -> str:
+    normalized_host = host.lower()
     try:
-        process.wait(timeout=grace_seconds)
-        return "terminated"
-    except subprocess.TimeoutExpired:
-        process.kill()
-        return "killed"
+        address = ipaddress.ip_address(normalized_host)
+    except ValueError:
+        authority_host = normalized_host
+    else:
+        authority_host = f"[{address.compressed}]" if address.version == 6 else address.compressed
+    return f"{authority_host}:{port}"
+
+
+def shutdown_dashboard_operations(manager: dashboard_operation_state.DashboardOperationManager) -> None:
+    manager.begin_shutdown()
+    while True:
+        active = manager.active_record()
+        if active is None:
+            return
+        if active.kind == "analysis" and active.cancel_file is not None:
+            try:
+                cancel_control.request_cancel(active.cancel_file, reason="server_shutdown")
+            except OSError:
+                pass
+        if active.process is None:
+            manager.wait_until_idle(timeout=0.05)
+            continue
+        active.process.request_shutdown()
+        timeout = 6.0 if active.kind == "analysis" else 14.0
+        try:
+            active.process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            active.process.kill_group()
+        return
 
 
 def read_dashboard_asset(path: pathlib.Path) -> str:
@@ -108,25 +122,72 @@ class BadJsonBody(ValueError):
     pass
 
 
-def sweep_transient_progress_files(token_usage_root: pathlib.Path | str) -> list[dict[str, Any]]:
-    state_dir = pathlib.Path(token_usage_root).expanduser() / "state"
-    removed: list[dict[str, Any]] = []
-    for pattern in TRANSIENT_PROGRESS_PATTERNS:
-        for path in sorted(state_dir.glob(pattern), key=lambda item: item.name):
-            try:
-                size = path.stat().st_size
-                path.unlink()
-            except FileNotFoundError:
-                continue
-            except OSError:
-                continue
-            removed.append({"name": path.name, "path": str(path), "deleted_bytes": size})
-    return removed
+class Handler(
+    dashboard_rebuild_api.DashboardRebuildApiMixin,
+    dashboard_cleanup_api.DashboardCleanupApiMixin,
+    BaseHTTPRequestHandler,
+):
+    def dashboard_operation_manager(self) -> dashboard_operation_state.DashboardOperationManager:
+        server = getattr(self, "server", None)
+        return getattr(server, "operation_manager", dashboard_operation_state.DEFAULT_MANAGER)
 
+    def dashboard_lifetime_lock_fd(self) -> int | None:
+        server = getattr(self, "server", None)
+        runtime_manager = getattr(server, "runtime_manager", None)
+        return runtime_manager.lifetime_lock_fd() if runtime_manager is not None else None
 
-class Handler(BaseHTTPRequestHandler):
+    def dashboard_runtime_paths(self) -> service_paths.RuntimePaths:
+        cached = getattr(self, "_runtime_paths_snapshot", None)
+        if isinstance(cached, service_paths.RuntimePaths):
+            return cached
+        server = getattr(self, "server", None)
+        if server is None:
+            cached = service_paths.RuntimePaths(
+                project_root=RUNTIME_PATHS.project_root,
+                config_path=RUNTIME_PATHS.config_path,
+                codex_dir=CODEX_DIR,
+                output_dir=OUTPUT_DIR,
+            )
+        elif hasattr(server, "runtime_manager"):
+            cached = server.runtime_manager.snapshot()
+        elif getattr(server, "dynamic_runtime_paths", False):
+            with service_paths.acquire_path_lock():
+                cached = service_paths.resolve_runtime_paths()
+        else:
+            cached = getattr(
+                server,
+                "runtime_paths",
+                service_paths.RuntimePaths(
+                    project_root=RUNTIME_PATHS.project_root,
+                    config_path=RUNTIME_PATHS.config_path,
+                    codex_dir=CODEX_DIR,
+                    output_dir=OUTPUT_DIR,
+                ),
+            )
+        self._runtime_paths_snapshot = cached
+        return cached
+
+    def dashboard_output_dir(self) -> pathlib.Path:
+        return self.dashboard_runtime_paths().output_dir
+
+    def dashboard_codex_dir(self) -> pathlib.Path:
+        return self.dashboard_runtime_paths().codex_dir
+
+    def dashboard_db_path(self) -> pathlib.Path:
+        server = getattr(self, "server", None)
+        override = getattr(server, "db_override", None)
+        if override is not None:
+            return pathlib.Path(override)
+        legacy = getattr(server, "db_path", None)
+        if legacy is not None and not getattr(server, "dynamic_runtime_paths", False):
+            return pathlib.Path(legacy)
+        return self.dashboard_output_dir() / "analytics" / "bola.sqlite"
+
+    def dashboard_script_dir(self) -> pathlib.Path:
+        return SCRIPT_DIR
+
     def db(self) -> sqlite3.Connection:
-        con = sqlite3.connect(f"file:{self.server.db_path}?mode=ro", uri=True)
+        con = sqlite3.connect(f"file:{self.dashboard_db_path()}?mode=ro", uri=True)
         con.row_factory = sqlite3.Row
         return con
 
@@ -146,6 +207,8 @@ class Handler(BaseHTTPRequestHandler):
             "turn_id",
             "captured_at",
             "captured_at_unix",
+            "started_at",
+            "started_at_unix",
             "cwd",
             "project",
             "thread_name",
@@ -165,6 +228,8 @@ class Handler(BaseHTTPRequestHandler):
             "turn_id",
             "captured_at",
             "captured_at_unix",
+            "started_at",
+            "started_at_unix",
             "cwd",
             "project",
             "thread_name",
@@ -241,20 +306,77 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def header_values(self, name: str) -> list[str]:
+        headers = getattr(self, "headers", {})
+        get_all = getattr(headers, "get_all", None)
+        if callable(get_all):
+            return [str(value) for value in (get_all(name) or [])]
+        value = headers.get(name)
+        return [] if value is None else [str(value)]
+
+    def single_header(self, name: str) -> str | None:
+        values = self.header_values(name)
+        if len(values) != 1:
+            return None
+        value = values[0]
+        if value != value.strip():
+            return None
+        return value
+
+    def validate_request_host(self) -> bool:
+        host = self.single_header("Host")
+        allowed_authority = str(self.server.allowed_authority)
+        if host is None or host.lower() != allowed_authority:
+            self.send_json({"error": "request_host_forbidden"}, 403)
+            return False
+        return True
+
+    def validate_post_request(self) -> bool:
+        origin = self.single_header("Origin")
+        allowed_origin = str(self.server.allowed_origin)
+        if origin is None or origin.lower() != allowed_origin:
+            self.send_json({"error": "request_origin_forbidden"}, 403)
+            return False
+
+        fetch_site_values = self.header_values("Sec-Fetch-Site")
+        if len(fetch_site_values) > 1 or (fetch_site_values and fetch_site_values[0].lower() != "same-origin"):
+            self.send_json({"error": "cross_site_request_forbidden"}, 403)
+            return False
+
+        content_type = self.single_header("Content-Type")
+        media_type = content_type.split(";", 1)[0].strip().lower() if content_type is not None else ""
+        if media_type != "application/json":
+            self.send_json({"error": "application_json_required"}, 415)
+            return False
+
+        length_values = self.header_values("Content-Length")
+        if not length_values:
+            self.send_json({"error": "content_length_required"}, 411)
+            return False
+        if len(length_values) != 1:
+            self.send_json({"error": "invalid_content_length"}, 400)
+            return False
+        try:
+            length = int(length_values[0], 10)
+        except (TypeError, ValueError):
+            self.send_json({"error": "invalid_content_length"}, 400)
+            return False
+        if length < 0:
+            self.send_json({"error": "invalid_content_length"}, 400)
+            return False
+        if length > MAX_JSON_BODY_BYTES:
+            self.send_json({"error": "request_body_too_large"}, 413)
+            return False
+        self._json_body_length = length
+        return True
+
     def read_json_body(self):
         if hasattr(self, "_json_body_cache"):
             return self._json_body_cache
-        headers = getattr(self, "headers", {})
-        try:
-            length = int(headers.get("Content-Length") or 0)
-        except (TypeError, ValueError):
-            length = 0
-        if length <= 0:
-            self._json_body_cache = {}
-            return self._json_body_cache
+        length = self._json_body_length
         try:
             payload = self.rfile.read(length).decode("utf-8")
-            data = json.loads(payload or "{}")
+            data = json.loads(payload)
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             raise BadJsonBody("invalid json body")
         if not isinstance(data, dict):
@@ -266,7 +388,10 @@ class Handler(BaseHTTPRequestHandler):
         if path != "/api/dashboard":
             return payload
         enriched = dict(payload)
-        enriched["freshness"] = dashboard_freshness.freshness_payload(TOKEN_USAGE_ROOT, pathlib.Path(self.server.db_path).expanduser())
+        enriched["freshness"] = dashboard_freshness.freshness_payload(
+            self.dashboard_output_dir(),
+            self.dashboard_db_path().expanduser(),
+        )
         return enriched
 
     def send_static(self, parsed):
@@ -299,6 +424,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_GET(self):
+        self._runtime_paths_snapshot = None
+        if not self.validate_request_host():
+            return
         parsed = urlparse(self.path)
         if parsed.path == "/":
             payload = HTML.encode("utf-8")
@@ -317,11 +445,18 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             self.handle_api(parsed.path, parse_qs(parsed.query))
-        except Exception as exc:
+        except dashboard_server_runtime.DashboardPathTransitionBusy:
+            self.send_json({"error": "dashboard_path_transition_busy"}, 409)
+        except dashboard_server_runtime.DashboardOutputConflict as exc:
+            self.send_json({"error": "dashboard_output_conflict", "lock_path": str(exc.path)}, 409)
+        except Exception:
             logging.exception("dashboard api error path=%s query=%s", parsed.path, parsed.query)
             self.send_json({"error": "internal_error"}, 500)
 
     def do_POST(self):
+        self._runtime_paths_snapshot = None
+        if not self.validate_request_host() or not self.validate_post_request():
+            return
         parsed = urlparse(self.path)
         try:
             self.read_json_body()
@@ -343,7 +478,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "not_found"}, 404)
         except BadJsonBody:
             self.send_json({"error": "invalid_json"}, 400)
-        except Exception as exc:
+        except dashboard_server_runtime.DashboardPathTransitionBusy:
+            self.send_json({"error": "dashboard_path_transition_busy"}, 409)
+        except dashboard_server_runtime.DashboardOutputConflict as exc:
+            self.send_json({"error": "dashboard_output_conflict", "lock_path": str(exc.path)}, 409)
+        except Exception:
             logging.exception("dashboard post api error path=%s", parsed.path)
             self.send_json({"error": "internal_error"}, 500)
 
@@ -369,572 +508,6 @@ class Handler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             return default
 
-    def run_compact_command(self, output: pathlib.Path, min_bytes: int):
-        script = pathlib.Path(__file__).resolve().parent / "codex_token_usage.py"
-        cmd = [
-            sys.executable,
-            str(script),
-            "compact",
-        ]
-        result = subprocess.run(cmd, cwd=str(script.parent), text=True, capture_output=True, env=service_lock.scrub_lock_env(os.environ.copy()))
-        stdout = result.stdout.strip()
-        stderr = result.stderr.strip()
-        return {
-            "returncode": result.returncode,
-            "stdout": stdout,
-            "stderr": stderr,
-            "metadata": self.parse_last_json(stdout),
-        }
-
-    def handle_rebuild(self):
-        if not REBUILD_LOCK.acquire(blocking=False):
-            self.send_json({"error": "rebuild_already_running"}, 409)
-            return
-        global REBUILD_PROCESS, REBUILD_CANCEL_FILE, REBUILD_PROGRESS_FILE
-        started = time.monotonic()
-        cancel_file = TOKEN_USAGE_ROOT / "state" / f"rebuild-cancel.{os.getpid()}.{time.time_ns()}.json"
-        progress_file = TOKEN_USAGE_ROOT / "state" / f"rebuild-progress.{os.getpid()}.{time.time_ns()}.json"
-        try:
-            REBUILD_CANCEL_EVENT.clear()
-            sweep_transient_progress_files(TOKEN_USAGE_ROOT)
-            previous_progress_file = REBUILD_PROGRESS_FILE
-            cancel_file.unlink(missing_ok=True)
-            progress_file.unlink(missing_ok=True)
-            if (
-                previous_progress_file is not None
-                and previous_progress_file != progress_file
-                and previous_progress_file.name.startswith("rebuild-progress.")
-            ):
-                previous_progress_file.unlink(missing_ok=True)
-            progress_control.write_progress_to_path(progress_file, status="running", phase="normalize", phase_index=0, checkpoint="queued", phase_progress=0.0)
-            script = pathlib.Path(__file__).resolve().parent / "codex_token_usage.py"
-            output = pathlib.Path(self.server.db_path).expanduser().resolve()
-            cmd = [
-                sys.executable,
-                str(script),
-                "pipeline",
-                "--codex-home",
-                str(CODEX_HOME),
-                "--output",
-                str(output),
-                "--incremental",
-                "--recover",
-            ]
-            env = service_lock.scrub_lock_env(os.environ.copy())
-            env["CODEX_TOKEN_USAGE_CANCEL_FILE"] = str(cancel_file)
-            env["CODEX_TOKEN_USAGE_PROGRESS_FILE"] = str(progress_file)
-            with REBUILD_PROCESS_LOCK:
-                REBUILD_PROCESS = None
-                REBUILD_CANCEL_FILE = cancel_file
-                REBUILD_PROGRESS_FILE = progress_file
-            with tempfile.TemporaryFile("w+", encoding="utf-8") as stdout_file, tempfile.TemporaryFile("w+", encoding="utf-8") as stderr_file:
-                process = subprocess.Popen(
-                    cmd,
-                    cwd=str(script.parent),
-                    text=True,
-                    stdout=stdout_file,
-                    stderr=stderr_file,
-                    env=env,
-                )
-                with REBUILD_PROCESS_LOCK:
-                    REBUILD_PROCESS = process
-                    REBUILD_CANCEL_FILE = cancel_file
-                    REBUILD_PROGRESS_FILE = progress_file
-                if REBUILD_CANCEL_EVENT.is_set():
-                    cancel_control.request_cancel(cancel_file, reason="user")
-                try:
-                    cancel_requested_at: float | None = None
-                    while process.poll() is None:
-                        if REBUILD_CANCEL_EVENT.is_set():
-                            cancel_control.request_cancel(cancel_file, reason="user")
-                            if cancel_requested_at is None:
-                                cancel_requested_at = time.monotonic()
-                                progress_control.write_progress_to_path(progress_file, status="running", phase="cancel", phase_index=1, checkpoint="cancel_requested", phase_progress=0.0)
-                            elif time.monotonic() - cancel_requested_at >= 2.0:
-                                status = terminate_rebuild_process(process)
-                                progress_control.write_progress_to_path(progress_file, status="cancelled", phase="cancel", phase_index=1, checkpoint=status, phase_progress=1.0)
-                                break
-                        time.sleep(0.1)
-                    process.wait(timeout=2)
-                    stdout_file.seek(0)
-                    stderr_file.seek(0)
-                    stdout = stdout_file.read()
-                    stderr = stderr_file.read()
-                finally:
-                    with REBUILD_PROCESS_LOCK:
-                        if REBUILD_PROCESS is process:
-                            REBUILD_PROCESS = None
-                            REBUILD_CANCEL_FILE = None
-                            REBUILD_PROGRESS_FILE = progress_file
-            stdout = (stdout or "").strip()
-            stderr = (stderr or "").strip()
-            metadata = self.parse_last_json(stdout)
-            if (
-                process.returncode == cancel_control.CANCEL_EXIT_CODE
-                or bool(metadata.get("cancelled"))
-            ):
-                progress_control.write_progress_to_path(
-                    progress_file,
-                    status="cancelled",
-                    phase=str(metadata.get("phase") or "cancelled"),
-                    phase_index=self.int_metadata(metadata, "phase_index"),
-                    checkpoint=str(metadata.get("checkpoint") or ""),
-                    phase_progress=self.numeric_metadata(metadata, "phase_progress"),
-                )
-                self.send_json(
-                    {
-                        "ok": False,
-                        "cancelled": True,
-                        **metadata,
-                        "returncode": process.returncode,
-                        "elapsed_ms": round((time.monotonic() - started) * 1000),
-                    }
-                )
-                return
-            if process.returncode != 0:
-                progress_control.write_progress_to_path(progress_file, status="failed", phase="failed", phase_index=0, checkpoint="failed")
-                if metadata.get("error") == "analysis_or_cleanup_running":
-                    self.send_json(
-                        {
-                            "error": "analysis_or_cleanup_running",
-                            "returncode": process.returncode,
-                            "lock_path": metadata.get("lock_path"),
-                        },
-                        409,
-                    )
-                    return
-                if metadata.get("error") == "normalize_pending_publish_recovery_failed":
-                    self.send_json(
-                        {
-                            "error": "normalize_pending_publish_recovery_failed",
-                            "returncode": process.returncode,
-                            "message": metadata.get("message"),
-                            "marker_path": metadata.get("marker_path"),
-                            "recovery_required": bool(metadata.get("recovery_required")),
-                        },
-                        409,
-                    )
-                    return
-                self.send_json(
-                    {
-                        "error": "rebuild_failed",
-                        "returncode": process.returncode,
-                        "stderr": stderr[-4000:],
-                        "stdout": stdout[-4000:],
-                    },
-                    500,
-                )
-                return
-            if "elapsed_ms" in metadata:
-                metadata["analysis_elapsed_ms"] = metadata.pop("elapsed_ms")
-            metadata["pre_analysis_rotate"] = metadata.get("pre_analysis_rotate", {"skipped": True})
-            try:
-                progress_control.write_progress_to_path(progress_file, status="running", phase="refresh", phase_index=2, checkpoint="cleanup-retention-index", phase_progress=0.65)
-                retention_index = dashboard_cleanup.refresh_retention_index_for_current_sources(TOKEN_USAGE_ROOT)
-                metadata["cleanup_retention_index"] = {
-                    "sources": len(retention_index.get("sources", [])),
-                    "scanned_rows": sum(int(source.get("scanned_rows") or 0) for source in retention_index.get("sources", [])),
-                }
-            except Exception as exc:
-                metadata["cleanup_retention_index"] = {"error": repr(exc)}
-            progress_control.write_progress_to_path(progress_file, status="completed", phase="refresh", phase_index=2, checkpoint="completed", phase_progress=1.0)
-            self.send_json({"ok": True, **metadata, "elapsed_ms": round((time.monotonic() - started) * 1000)})
-        finally:
-            with REBUILD_PROCESS_LOCK:
-                if REBUILD_PROGRESS_FILE == progress_file:
-                    REBUILD_PROGRESS_FILE = None
-                if REBUILD_CANCEL_FILE == cancel_file:
-                    REBUILD_CANCEL_FILE = None
-            REBUILD_CANCEL_EVENT.clear()
-            cancel_file.unlink(missing_ok=True)
-            progress_file.unlink(missing_ok=True)
-            REBUILD_LOCK.release()
-
-    def handle_rebuild_cancel(self):
-        REBUILD_CANCEL_EVENT.set()
-        graceful = False
-        with REBUILD_PROCESS_LOCK:
-            process = REBUILD_PROCESS
-            cancel_file = REBUILD_CANCEL_FILE
-        if cancel_file is not None:
-            try:
-                cancel_control.request_cancel(cancel_file, reason="user")
-                graceful = True
-            except OSError:
-                graceful = False
-        self.send_json(
-            {
-                "ok": True,
-                "cancel_requested": True,
-                "graceful": graceful,
-                "process_running": process is not None and process.poll() is None,
-            }
-        )
-
-    def handle_rebuild_progress(self):
-        with REBUILD_PROCESS_LOCK:
-            process = REBUILD_PROCESS
-            progress_file = REBUILD_PROGRESS_FILE
-        payload = progress_control.read_progress(progress_file)
-        payload["process_running"] = process is not None and process.poll() is None
-        self.send_json(payload)
-
-    def begin_cleanup_progress(self, *, phase: str, phase_index: int, checkpoint: str, phase_progress: float = 0.0) -> pathlib.Path:
-        global CLEANUP_PROGRESS_FILE, CLEANUP_RUNNING
-        progress_file = TOKEN_USAGE_ROOT / "state" / f"cleanup-progress.{os.getpid()}.{time.time_ns()}.json"
-        previous_progress_file: pathlib.Path | None
-        sweep_transient_progress_files(TOKEN_USAGE_ROOT)
-        with CLEANUP_PROGRESS_LOCK:
-            previous_progress_file = CLEANUP_PROGRESS_FILE
-            CLEANUP_PROGRESS_FILE = progress_file
-            CLEANUP_RUNNING = True
-        progress_file.unlink(missing_ok=True)
-        if (
-            previous_progress_file is not None
-            and previous_progress_file != progress_file
-            and previous_progress_file.name.startswith("cleanup-progress.")
-        ):
-            previous_progress_file.unlink(missing_ok=True)
-        progress_control.write_progress_to_path(
-            progress_file,
-            status="running",
-            phase=phase,
-            phase_index=phase_index,
-            phase_count=4,
-            checkpoint=checkpoint,
-            phase_progress=phase_progress,
-        )
-        return progress_file
-
-    def write_cleanup_progress(self, progress_file: pathlib.Path | None, **kwargs: Any) -> None:
-        if progress_file is None:
-            return
-        progress_control.write_progress_to_path(progress_file, phase_count=4, **kwargs)
-
-    def close_cleanup_progress(self, progress_file: pathlib.Path | None) -> None:
-        global CLEANUP_PROGRESS_FILE, CLEANUP_RUNNING
-        if progress_file is None:
-            return
-        with CLEANUP_PROGRESS_LOCK:
-            if CLEANUP_PROGRESS_FILE == progress_file:
-                CLEANUP_PROGRESS_FILE = None
-                CLEANUP_RUNNING = False
-        progress_file.unlink(missing_ok=True)
-
-    def handle_cleanup_progress(self):
-        with CLEANUP_PROGRESS_LOCK:
-            progress_file = CLEANUP_PROGRESS_FILE
-            cleanup_running = CLEANUP_RUNNING
-        payload = progress_control.read_progress(progress_file)
-        payload["cleanup_running"] = cleanup_running
-        self.send_json(payload)
-
-    def run_pipeline_command(self, output: pathlib.Path, *, incremental: bool) -> dict[str, Any]:
-        script = pathlib.Path(__file__).resolve().parent / "codex_token_usage.py"
-        cmd = [
-            sys.executable,
-            str(script),
-            "pipeline",
-            "--codex-home",
-            str(CODEX_HOME),
-            "--output",
-            str(output),
-        ]
-        if incremental:
-            cmd.append("--incremental")
-        result = subprocess.run(cmd, cwd=str(script.parent), text=True, capture_output=True, env=service_lock.scrub_lock_env(os.environ.copy()))
-        stdout = result.stdout.strip()
-        stderr = result.stderr.strip()
-        return {
-            "returncode": result.returncode,
-            "stdout": stdout,
-            "stderr": stderr,
-            "metadata": self.parse_last_json(stdout),
-        }
-
-    def run_retention_prune_command(self, output: pathlib.Path, cutoff_unix: float, preview_signature: str) -> dict[str, Any]:
-        script = pathlib.Path(__file__).resolve().parent / "codex_token_usage.py"
-        cmd = [
-            sys.executable,
-            str(script),
-            "retention-prune",
-            "--codex-home",
-            str(CODEX_HOME),
-            "--output",
-            str(output),
-            "--cutoff",
-            str(float(cutoff_unix)),
-            "--preview-signature",
-            preview_signature,
-        ]
-        env = service_lock.scrub_lock_env(os.environ.copy())
-        with CLEANUP_PROGRESS_LOCK:
-            progress_file = CLEANUP_PROGRESS_FILE
-        if progress_file is not None:
-            env[progress_control.PROGRESS_ENV] = str(progress_file)
-        result = subprocess.run(cmd, cwd=str(script.parent), text=True, capture_output=True, env=env)
-        stdout = result.stdout.strip()
-        stderr = result.stderr.strip()
-        return {
-            "returncode": result.returncode,
-            "stdout": stdout,
-            "stderr": stderr,
-            "metadata": self.parse_last_json(stdout),
-        }
-
-    def cleanup_cutoff_unix(self, value: Any = None) -> float:
-        raw = value[0] if isinstance(value, list) and value else value
-        if isinstance(raw, str) and raw:
-            try:
-                return datetime.fromisoformat(raw + "T00:00:00+00:00").timestamp()
-            except ValueError:
-                pass
-        return dashboard_cleanup.default_retention_cutoff_unix()
-
-    def required_cleanup_cutoff_unix(self, value: Any = None) -> float:
-        raw = value[0] if isinstance(value, list) and value else value
-        if not isinstance(raw, str) or not raw:
-            raise ValueError("cutoff_date_required")
-        try:
-            return datetime.fromisoformat(raw + "T00:00:00+00:00").timestamp()
-        except ValueError as exc:
-            raise ValueError("cutoff_date_invalid") from exc
-
-    def cleanup_preview_cutoff_unix(self, value: Any = None) -> float:
-        raw = value[0] if isinstance(value, list) and value else value
-        if isinstance(raw, str) and raw:
-            return self.required_cleanup_cutoff_unix(raw)
-        return self.cleanup_cutoff_unix(value)
-
-    def handle_cleanup_compact(self):
-        if not REBUILD_LOCK.acquire(blocking=False):
-            self.send_json({"error": "analysis_or_cleanup_running"}, 409)
-            return
-        started = time.monotonic()
-        try:
-            options = self.read_json_body()
-            try:
-                min_bytes = int(options.get("min_bytes", 1))
-            except (TypeError, ValueError):
-                min_bytes = 1
-            min_bytes = max(1, min(min_bytes, 1024 * 1024 * 1024))
-            output = pathlib.Path(self.server.db_path).expanduser().resolve()
-            result = self.run_compact_command(output, min_bytes)
-            if result["returncode"] != 0:
-                self.send_json(
-                    {
-                        "error": "cleanup_failed",
-                        "returncode": result["returncode"],
-                        "stderr": str(result["stderr"])[-4000:],
-                        "stdout": str(result["stdout"])[-4000:],
-                    },
-                    500,
-                )
-                return
-            dashboard_cleanup.refresh_retention_index_for_current_sources(TOKEN_USAGE_ROOT)
-            self.send_json(
-                {
-                    "ok": True,
-                    "compact": result["metadata"],
-                    "cleanup": self.cleanup_payload(db_path=output),
-                    "elapsed_ms": round((time.monotonic() - started) * 1000),
-                }
-            )
-        finally:
-            REBUILD_LOCK.release()
-
-    def handle_cleanup_delete_all(self):
-        if not REBUILD_LOCK.acquire(blocking=False):
-            self.send_json({"error": "analysis_or_cleanup_running"}, 409)
-            return
-        started = time.monotonic()
-        progress_file: pathlib.Path | None = None
-        try:
-            options = self.read_json_body()
-            if options.get("confirm_all_logs") is not True:
-                self.send_json({"error": "delete_all_confirmation_required"}, 400)
-                return
-            output = pathlib.Path(self.server.db_path).expanduser().resolve()
-            progress_file = self.begin_cleanup_progress(
-                phase="cleanup-delete",
-                phase_index=1,
-                checkpoint="delete-all",
-                phase_progress=0.0,
-            )
-            try:
-                result = self.delete_all_logs(TOKEN_USAGE_ROOT, output)
-            except service_lock.ServiceLockBusy:
-                self.write_cleanup_progress(progress_file, status="failed", phase="cleanup-delete", phase_index=1, checkpoint="busy", phase_progress=0.0)
-                self.send_json({"error": "analysis_or_cleanup_running"}, 409)
-                return
-            failed = bool(result.get("delete_failed") or result.get("failed"))
-            if failed:
-                self.write_cleanup_progress(progress_file, status="failed", phase="cleanup-delete", phase_index=1, checkpoint="partial-failure", phase_progress=1.0)
-            else:
-                self.write_cleanup_progress(progress_file, status="running", phase="cleanup-refresh", phase_index=3, checkpoint="refresh-preview", phase_progress=0.2)
-            cleanup_payload = self.cleanup_payload(db_path=output)
-            if not failed:
-                self.write_cleanup_progress(progress_file, status="completed", phase="cleanup-refresh", phase_index=3, checkpoint="completed", phase_progress=1.0)
-            self.send_json(
-                {
-                    "ok": not failed,
-                    **({"error": "cleanup_delete_failed"} if failed else {}),
-                    **result,
-                    "cleanup": cleanup_payload,
-                    "elapsed_ms": round((time.monotonic() - started) * 1000),
-                },
-                500 if failed else 200,
-            )
-        finally:
-            self.close_cleanup_progress(progress_file)
-            REBUILD_LOCK.release()
-
-    def handle_cleanup_retention(self):
-        if not REBUILD_LOCK.acquire(blocking=False):
-            self.send_json({"error": "analysis_or_cleanup_running"}, 409)
-            return
-        started = time.monotonic()
-        progress_file: pathlib.Path | None = None
-        try:
-            options = self.read_json_body()
-            cutoff_date = str(options.get("cutoff_date") or "")
-            try:
-                cutoff_unix = self.required_cleanup_cutoff_unix(cutoff_date)
-            except ValueError as exc:
-                self.send_json({"error": str(exc)}, 400)
-                return
-            output = pathlib.Path(self.server.db_path).expanduser().resolve()
-            preview_signature = options.get("preview_signature")
-            if not isinstance(preview_signature, str) or not preview_signature:
-                self.send_json({"error": "cleanup_preview_signature_required"}, 400)
-                return
-            try:
-                current_cleanup = self.cleanup_payload(db_path=output, retention_cutoff_unix=cutoff_unix)
-            except dashboard_cleanup.raw_segments.ManifestError as exc:
-                self.send_json({"error": "cleanup_preview_failed", "message": str(exc)}, 409)
-                return
-            current_signature = str((((current_cleanup.get("retention") or {}).get("selected") or {}).get("preview_signature")) or "")
-            if preview_signature != current_signature:
-                self.send_json({"error": "cleanup_preview_stale"}, 409)
-                return
-            selected_retention = ((current_cleanup.get("retention") or {}).get("selected") or {})
-            selected_rows = int(selected_retention.get("deletable_rows") or 0)
-            selected_pending_state_files = int(selected_retention.get("pending_turn_state_deletable_files") or 0)
-            if selected_rows <= 0 and selected_pending_state_files <= 0:
-                scanned_rows = int(selected_retention.get("scanned_rows") or 0)
-                self.send_json(
-                    {
-                        "ok": True,
-                        "noop": True,
-                        "cutoff_date": cutoff_date,
-                        "retention": {
-                            "cutoff_unix": cutoff_unix,
-                            "scanned_rows": scanned_rows,
-                            "deleted_rows": 0,
-                            "kept_rows": scanned_rows,
-                            "deleted_bytes": 0,
-                            "deleted_state_files": 0,
-                        },
-                        "cleanup": current_cleanup,
-                        "elapsed_ms": round((time.monotonic() - started) * 1000),
-                    }
-                )
-                return
-            progress_file = self.begin_cleanup_progress(
-                phase="cleanup-prepare",
-                phase_index=0,
-                checkpoint="start-retention-prune",
-                phase_progress=0.0,
-            )
-            prune_result = self.run_retention_prune_command(output, cutoff_unix, preview_signature)
-            if prune_result["returncode"] != 0:
-                metadata = prune_result.get("metadata") if isinstance(prune_result.get("metadata"), dict) else {}
-                if metadata.get("error") == "cleanup_preview_stale":
-                    self.write_cleanup_progress(progress_file, status="failed", phase="cleanup-prepare", phase_index=0, checkpoint="stale-preview", phase_progress=0.0)
-                    self.send_json({"error": "cleanup_preview_stale"}, 409)
-                    return
-                if metadata.get("error") == "analysis_or_cleanup_running":
-                    self.write_cleanup_progress(progress_file, status="failed", phase="cleanup-prepare", phase_index=0, checkpoint="busy", phase_progress=0.0)
-                    self.send_json(
-                        {
-                            "error": "analysis_or_cleanup_running",
-                            "returncode": prune_result["returncode"],
-                            "lock_path": metadata.get("lock_path"),
-                        },
-                        409,
-                    )
-                    return
-                self.write_cleanup_progress(
-                    progress_file,
-                    status="failed",
-                    phase="cleanup-rebuild" if metadata.get("stage") in {"normalize", "build"} else "cleanup-delete",
-                    phase_index=2 if metadata.get("stage") in {"normalize", "build"} else 1,
-                    checkpoint=str(metadata.get("stage") or "failed"),
-                    phase_progress=0.0,
-                )
-                self.send_json(
-                    {
-                        "error": "retention_prune_failed",
-                        "returncode": prune_result["returncode"],
-                        "partial_mutation": bool(metadata.get("partial_mutation")),
-                        "recovery_required": bool(metadata.get("recovery_required")),
-                        "derived_rebuild_required": bool(metadata.get("derived_rebuild_required")),
-                        "physical_delete_pending": bool(metadata.get("physical_delete_pending")),
-                        "pending_files": int(metadata.get("pending_files") or 0),
-                        "stage": metadata.get("stage"),
-                        "deleted_rows": metadata.get("deleted_rows", 0),
-                        "stderr": str(prune_result["stderr"])[-4000:],
-                        "stdout": str(prune_result["stdout"])[-4000:],
-                    },
-                    500,
-                )
-                return
-            metadata = prune_result["metadata"]
-            retention_result = metadata.get("delete") if isinstance(metadata.get("delete"), dict) else {"deleted_rows": metadata.get("deleted_rows", 0)}
-            self.write_cleanup_progress(progress_file, status="running", phase="cleanup-refresh", phase_index=3, checkpoint="retention-index", phase_progress=0.2)
-            dashboard_cleanup.refresh_retention_index_for_current_sources(TOKEN_USAGE_ROOT)
-            self.write_cleanup_progress(progress_file, status="running", phase="cleanup-refresh", phase_index=3, checkpoint="preview-payload", phase_progress=0.75)
-            cleanup_payload = self.cleanup_payload(db_path=output, retention_cutoff_unix=cutoff_unix)
-            self.write_cleanup_progress(progress_file, status="completed", phase="cleanup-refresh", phase_index=3, checkpoint="completed", phase_progress=1.0)
-            self.send_json(
-                {
-                    "ok": True,
-                    "cutoff_date": cutoff_date,
-                    "retention": retention_result,
-                    "cleanup": cleanup_payload,
-                    "elapsed_ms": round((time.monotonic() - started) * 1000),
-                }
-            )
-        finally:
-            self.close_cleanup_progress(progress_file)
-            REBUILD_LOCK.release()
-
-    def cleanup_payload(
-        self,
-        db_path: pathlib.Path | str | None = None,
-        base_dir: pathlib.Path | str | None = None,
-        retention_cutoff_unix: float | None = None,
-        *,
-        refresh_retention_index: bool = True,
-    ):
-        db = pathlib.Path(db_path).expanduser() if db_path is not None else pathlib.Path(self.server.db_path).expanduser()
-        return dashboard_cleanup.cleanup_payload(TOKEN_USAGE_ROOT, db, base_dir, retention_cutoff_unix, refresh_retention_index=refresh_retention_index)
-
-    def cleanup_detail_payload(
-        self,
-        group_id: str,
-        db_path: pathlib.Path | str | None = None,
-        base_dir: pathlib.Path | str | None = None,
-        retention_cutoff_unix: float | None = None,
-        preview_signature: str | None = None,
-    ):
-        db = pathlib.Path(db_path).expanduser() if db_path is not None else pathlib.Path(self.server.db_path).expanduser()
-        return dashboard_cleanup.cleanup_detail_payload(TOKEN_USAGE_ROOT, db, group_id, base_dir, retention_cutoff_unix, preview_signature)
-
-    def delete_all_logs(self, base_dir: pathlib.Path | str | None = None, db_path: pathlib.Path | str | None = None):
-        base = pathlib.Path(base_dir).expanduser() if base_dir is not None else TOKEN_USAGE_ROOT
-        return dashboard_cleanup.delete_all_logs(base, db_path)
-
     def handle_api(self, path, query):
         if path == "/api/rebuild/progress":
             self.handle_rebuild_progress()
@@ -944,15 +517,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/log-cleanup":
             try:
-                self.send_json(
-                    self.cleanup_payload(
-                        retention_cutoff_unix=self.cleanup_preview_cutoff_unix(query.get("cutoff_date")),
-                        refresh_retention_index=False,
-                    )
+                selection = self.cleanup_preview_selection(query.get("cutoff_date"), query.get("timezone"))
+                payload = self.cleanup_payload(
+                    retention_cutoff_unix=float(selection["cutoff_unix"]),
+                    refresh_retention_index=False,
                 )
+                self.send_json(self.attach_cleanup_selection(payload, selection))
             except ValueError as exc:
                 self.send_json({"error": str(exc)}, 400)
-            except dashboard_cleanup.raw_segments.ManifestError as exc:
+            except raw_segments.ManifestError as exc:
                 self.send_json({"error": "cleanup_preview_failed", "message": str(exc)}, 409)
             return
         if path == "/api/log-cleanup/detail":
@@ -965,24 +538,35 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"error": "cleanup_preview_signature_required"}, 400)
                 return
             try:
-                detail = self.cleanup_detail_payload(
-                    group_id,
-                    retention_cutoff_unix=self.cleanup_preview_cutoff_unix(query.get("cutoff_date")),
-                    preview_signature=preview_signature,
-                )
-            except ValueError as exc:
-                self.send_json({"error": str(exc)}, 400)
+                page = int((query.get("page") or ["1"])[0])
+                page_size = int((query.get("page_size") or ["25"])[0])
+                if page < 1 or page_size < 1 or page_size > 100:
+                    raise ValueError("cleanup_detail_pagination_invalid")
+                selection = self.cleanup_preview_selection(query.get("cutoff_date"), query.get("timezone"))
+                detail_kwargs = {
+                    "retention_cutoff_unix": float(selection["cutoff_unix"]),
+                    "preview_signature": preview_signature,
+                }
+                if "page" in query or "page_size" in query:
+                    detail_kwargs.update({"page": page, "page_size": page_size})
+                detail = self.cleanup_detail_payload(group_id, **detail_kwargs)
+            except (TypeError, ValueError) as exc:
+                error = str(exc)
+                if not error or "invalid literal" in error:
+                    error = "cleanup_detail_pagination_invalid"
+                self.send_json({"error": error}, 400)
                 return
-            except dashboard_cleanup.raw_segments.ManifestError as exc:
+            except raw_segments.ManifestError as exc:
                 self.send_json({"error": "cleanup_preview_failed", "message": str(exc)}, 409)
                 return
             if detail.get("error"):
                 status = 409 if detail.get("error") == "cleanup_preview_stale" else 404
                 self.send_json(detail, status)
                 return
+            detail.update(selection)
             self.send_json(detail)
             return
-        db_path = pathlib.Path(self.server.db_path).expanduser()
+        db_path = self.dashboard_db_path().expanduser()
         if not db_path.is_file():
             self.send_empty_analytics_payload(path, query)
             return
@@ -1011,26 +595,79 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default="127.0.0.1", help="IPv4 loopback address or localhost")
     parser.add_argument("--port", type=int, default=8766)
-    parser.add_argument("--allow-network", action="store_true")
+    parser.add_argument("--codex-dir")
+    parser.add_argument("--output-dir")
+    parser.add_argument("--pin-runtime-paths", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if not is_loopback_host(args.host) and not args.allow_network:
-        print("refusing to bind dashboard to non-loopback host without --allow-network", file=sys.stderr)
-        return 2
     if not is_loopback_host(args.host):
-        print("warning: dashboard is bound to a non-loopback host and may expose local usage data", file=sys.stderr)
-    service_paths.assert_migrated(CODEX_HOME)
+        print("refusing to bind dashboard to an unsupported host; use localhost or an IPv4 loopback address", file=sys.stderr)
+        return 2
+    runtime_paths = service_paths.resolve_runtime_paths(codex_dir=args.codex_dir, output_dir=args.output_dir)
+    module_default_db = RUNTIME_PATHS.output_dir / "analytics" / "bola.sqlite"
+    db_override = os.environ.get("BOLA_ANALYTICS_DB")
+    if not db_override and DB_PATH != module_default_db:
+        db_override = str(DB_PATH)
+    db_path = pathlib.Path(db_override).expanduser() if db_override else runtime_paths.output_dir / "analytics" / "bola.sqlite"
     try:
-        dashboard_cleanup.ensure_service_owned_output(TOKEN_USAGE_ROOT, DB_PATH)
+        dashboard_cleanup.ensure_service_owned_output(runtime_paths.output_dir, db_path)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
-    sweep_transient_progress_files(TOKEN_USAGE_ROOT)
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
-    server.db_path = DB_PATH
+    operation_manager = dashboard_operation_state.DashboardOperationManager()
+    try:
+        runtime_manager = dashboard_server_runtime.DashboardRuntimeManager(
+            runtime_paths,
+            dynamic=not args.pin_runtime_paths,
+            operation_manager=operation_manager,
+        )
+    except dashboard_server_runtime.DashboardServerBusy as exc:
+        print(
+            json.dumps(
+                {
+                    "error": "dashboard_server_already_running",
+                    "lock_path": str(exc.path),
+                    "owner": exc.owner,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        server = ThreadingHTTPServer((args.host, args.port), Handler)
+    except Exception:
+        runtime_manager.close()
+        raise
+    server.runtime_paths = runtime_paths
+    server.dynamic_runtime_paths = not args.pin_runtime_paths
+    server.runtime_manager = runtime_manager
+    server.operation_manager = operation_manager
+    server.db_override = pathlib.Path(db_override).expanduser() if db_override else None
+    server.allowed_authority = dashboard_authority(args.host, args.port)
+    server.allowed_origin = f"http://{server.allowed_authority}"
     print(f"http://{args.host}:{args.port}")
-    server.serve_forever()
+    previous_handlers: dict[int, Any] = {}
+
+    def request_shutdown(_signum, _frame) -> None:
+        if operation_manager.shutting_down:
+            return
+        operation_manager.begin_shutdown()
+        threading.Thread(target=server.shutdown, name="dashboard-shutdown", daemon=True).start()
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[signum] = signal.getsignal(signum)
+        signal.signal(signum, request_shutdown)
+    try:
+        server.serve_forever()
+    finally:
+        shutdown_dashboard_operations(operation_manager)
+        server.server_close()
+        runtime_manager.close()
+        for signum, previous in previous_handlers.items():
+            signal.signal(signum, previous)
     return 0
 
 

@@ -7,6 +7,17 @@ import pathlib
 from typing import Any
 
 
+def parse_transcript_object(line: str | bytes) -> tuple[dict[str, Any] | None, bool]:
+    try:
+        text = line.decode("utf-8") if isinstance(line, bytes) else line
+        item = json.loads(text)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, True
+    if not isinstance(item, dict):
+        return None, True
+    return item, False
+
+
 class TranscriptEventStream:
     def __init__(self, path: pathlib.Path, offset: int | None = None, max_offset: int | None = None) -> None:
         self.path = pathlib.Path(path).expanduser()
@@ -36,18 +47,11 @@ class TranscriptEventStream:
                 if not line_bytes:
                     break
                 next_offset = handle.tell()
-                try:
-                    line = line_bytes.decode("utf-8")
-                except UnicodeDecodeError:
+                item, parse_error = parse_transcript_object(line_bytes)
+                if parse_error:
                     self.parse_error_seen = True
                     continue
-                try:
-                    item = json.loads(line)
-                except json.JSONDecodeError:
-                    self.parse_error_seen = True
-                    continue
-                if isinstance(item, dict):
-                    yield {"item": item, "line_start": line_start, "next_offset": next_offset}
+                yield {"item": item, "line_start": line_start, "next_offset": next_offset}
 
 
 def transcript_event_stream(transcript_path: str | pathlib.Path | None, offset: int | None = None, max_offset: int | None = None) -> tuple[TranscriptEventStream | None, dict[str, Any] | None]:

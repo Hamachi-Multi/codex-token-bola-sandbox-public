@@ -33,6 +33,7 @@ except ModuleNotFoundError:
         unittest,
     )
 
+
 class DashboardCleanupPayloadTests(DashboardFixtureMixin, unittest.TestCase):
     LEGACY_CLEANUP_ROW_FIELDS = {
         "retention_role",
@@ -70,6 +71,89 @@ class DashboardCleanupPayloadTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertEqual(payload["targets_truncated"], 0)
         self.assertEqual(payload["targets"][0], "/tmp/cleanup-affected-file-0.jsonl")
         self.assertEqual(payload["targets"][-1], "/tmp/cleanup-affected-file-74.jsonl")
+
+    def test_cleanup_target_set_centralizes_summary_and_detail_paths(self) -> None:
+        cleanup_payload = load_module(
+            "dashboard_cleanup_target_set_test",
+            ROOT / "scripts" / "dashboard_cleanup_payload.py",
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = pathlib.Path(tmp_dir) / "token-usage"
+            state_dir = base / "state"
+            state_dir.mkdir(parents=True)
+            pending = state_dir / ("a" * 32 + ".json")
+            pending.write_text('{"record_type":"turn_start"}\n', encoding="utf-8")
+            service_state = state_dir / "custom-state.json"
+            service_state.write_text("{}\n", encoding="utf-8")
+            (state_dir / "service.lock").write_text("lock\n", encoding="utf-8")
+            hook_probe = base / "hook-probe-events.jsonl"
+            hook_probe.write_text("{}\n", encoding="utf-8")
+            db = base / "analytics" / "bola.sqlite"
+
+            targets = cleanup_payload._cleanup_target_set(base, db)
+
+        self.assertEqual(
+            set(targets.by_label),
+            {
+                "Normalized Outputs",
+                "Analytics Database",
+                "Archived Raw Logs",
+                "Raw Current Segments",
+                "Pending Turn State",
+                "State Files",
+            },
+        )
+        self.assertEqual(targets.by_label["Pending Turn State"], [pending])
+        self.assertEqual(targets.by_label["State Files"], [service_state, hook_probe])
+        self.assertEqual(
+            targets.retention_reset_by_label["Normalized Outputs"],
+            [base / "normalized" / "prompt-usage.normalized.jsonl", base / "normalized" / "normalize-state.json"],
+        )
+
+    def test_cleanup_detail_payload_pages_affected_files_on_server(self) -> None:
+        cleanup_payload = load_module(
+            "dashboard_cleanup_payload_pagination_test",
+            ROOT / "scripts" / "dashboard_cleanup_payload.py",
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = pathlib.Path(tmp_dir) / "token-usage"
+            archive = base / "raw" / "archive"
+            files = [
+                {
+                    "path": str(archive / f"segment-{index:03d}.jsonl.gz"),
+                    "affected": True,
+                    "scanned_rows": 10,
+                    "deletable_rows": 10,
+                    "source_size": 100,
+                }
+                for index in range(60)
+            ]
+            with mock.patch.object(cleanup_payload, "retention_preview", return_value={"files": files}):
+                detail = cleanup_payload.cleanup_detail_payload(
+                    base,
+                    base / "analytics" / "bola.sqlite",
+                    "archived_raw_logs",
+                    base_dir=base,
+                    retention_cutoff_unix=1.0,
+                    page=2,
+                    page_size=25,
+                )
+
+        display = detail["row"]["display"]
+        self.assertEqual(len(display["items"]), 25)
+        self.assertTrue(display["items"][0]["path"].endswith("segment-025.jsonl.gz"))
+        self.assertEqual(
+            display["pagination"],
+            {
+                "page": 2,
+                "page_size": 25,
+                "total_items": 60,
+                "total_pages": 3,
+                "has_previous": True,
+                "has_next": True,
+            },
+        )
+        self.assertEqual(display["targets_truncated"], 35)
 
     def test_cleanup_impact_payload_uses_affected_files_as_file_count_contract(self) -> None:
         cleanup_common = load_module(
@@ -186,14 +270,14 @@ class DashboardCleanupPayloadTests(DashboardFixtureMixin, unittest.TestCase):
             bad_dir = base / "bad"
             for directory in (raw_dir, normalized_dir, archive_dir, analytics_dir, state_dir, tmp_work_dir, bad_dir):
                 directory.mkdir(parents=True, exist_ok=True)
-            current = serve.dashboard_cleanup.raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
+            current = serve.raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
             pathlib.Path(current["path"]).write_bytes(b'{"a":1}\n{"b":2}\n')
             (normalized_dir / "prompt-usage.normalized.jsonl").write_bytes(b"n\n")
             (state_dir / "abc.json").write_bytes(b"{}")
             (tmp_work_dir / "work.tmp").write_bytes(b"tmp\n")
             (bad_dir / "bad.jsonl").write_bytes(b"bad\n")
             (archive_dir / "prompt.gz").write_bytes(b"gz")
-            db_path = analytics_dir / "token-usage.sqlite"
+            db_path = analytics_dir / "bola.sqlite"
             con = sqlite3.connect(db_path)
             con.execute("create table run_metadata (key text primary key, value text)")
             con.executemany(
@@ -264,11 +348,13 @@ class DashboardCleanupPayloadTests(DashboardFixtureMixin, unittest.TestCase):
             bad_dir = base / "bad"
             for directory in (raw_dir, normalized_dir, analytics_dir, state_dir, tmp_work_dir, bad_dir):
                 directory.mkdir(parents=True, exist_ok=True)
-            current = serve.dashboard_cleanup.raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
+            current = serve.raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
             raw_file = pathlib.Path(current["path"])
             raw_file.write_text(
-                json.dumps(_turn_raw("s-old", "t-old", total=100) | {"captured_at": "2026-05-01T00:00:00+00:00"}) + "\n"
-                + json.dumps(_turn_raw("s-new", "t-new", total=200) | {"captured_at": "2026-05-23T00:00:00+00:00"}) + "\n",
+                json.dumps(_turn_raw("s-old", "t-old", total=100) | {"captured_at": "2026-05-01T00:00:00+00:00"})
+                + "\n"
+                + json.dumps(_turn_raw("s-new", "t-new", total=200) | {"captured_at": "2026-05-23T00:00:00+00:00"})
+                + "\n",
                 encoding="utf-8",
             )
             prompt_normalized = normalized_dir / "prompt-usage.normalized.jsonl"
@@ -277,7 +363,7 @@ class DashboardCleanupPayloadTests(DashboardFixtureMixin, unittest.TestCase):
             prompt_archive.write_bytes(b"prompt-gz\n")
             normalize_state = normalized_dir / "normalize-state.json"
             normalize_state.write_bytes(b'{"state":true}\n')
-            db_path = analytics_dir / "token-usage.sqlite"
+            db_path = analytics_dir / "bola.sqlite"
             db_path.write_bytes(b"sqlite-bytes\n")
             state_json = state_dir / "custom-state.json"
             state_json.write_bytes(b"state\n")
@@ -302,11 +388,9 @@ class DashboardCleanupPayloadTests(DashboardFixtureMixin, unittest.TestCase):
             cutoff_unix = datetime.fromisoformat("2026-05-20T00:00:00+00:00").timestamp()
             payload = handler.cleanup_payload(db_path=db_path, base_dir=base, retention_cutoff_unix=cutoff_unix)
             detail = handler.cleanup_detail_payload("state_files", db_path=db_path, base_dir=base, retention_cutoff_unix=cutoff_unix)
-            sizes["state_delete_all"] = sum(
-                path.stat().st_size
-                for path in state_dir.iterdir()
-                if path.is_file() and not path.name.endswith(".lock")
-            ) + sizes["hook_probe"]
+            sizes["state_delete_all"] = (
+                sum(path.stat().st_size for path in state_dir.iterdir() if path.is_file() and not path.name.endswith(".lock")) + sizes["hook_probe"]
+            )
 
         rows = {row["label"]: row for row in payload["rows"]}
         self.assertNotIn("profile", payload)
@@ -360,7 +444,7 @@ class DashboardCleanupPayloadTests(DashboardFixtureMixin, unittest.TestCase):
 
     def test_log_cleanup_payload_profiles_index_retention_preview_source(self) -> None:
         cleanup = load_module("cleanup_payload_retention_preview_source_test", ROOT / "scripts" / "dashboard_cleanup.py")
-        raw_segments = cleanup.raw_segments
+        raw_segments = cleanup._retention.raw_segments
         with tempfile.TemporaryDirectory() as tmp:
             base = pathlib.Path(tmp) / "token-usage"
             analytics_dir = base / "analytics"
@@ -389,7 +473,7 @@ class DashboardCleanupPayloadTests(DashboardFixtureMixin, unittest.TestCase):
             cutoff = datetime(2026, 5, 20, tzinfo=timezone.utc).timestamp()
 
             with mock.patch.object(raw_segments._retention, "scan_segment_file_for_cutoff", side_effect=AssertionError("raw current scan")):
-                payload = cleanup.cleanup_payload(base, analytics_dir / "token-usage.sqlite", retention_cutoff_unix=cutoff)
+                payload = cleanup.cleanup_payload(base, analytics_dir / "bola.sqlite", retention_cutoff_unix=cutoff)
 
         self.assertNotIn("profile", payload)
         self.assertEqual(payload["retention"]["selected"]["preview_source"], "refreshed_index")
@@ -403,17 +487,19 @@ class DashboardCleanupPayloadTests(DashboardFixtureMixin, unittest.TestCase):
             analytics_dir = base / "analytics"
             for directory in (raw_dir, normalized_dir, analytics_dir):
                 directory.mkdir(parents=True, exist_ok=True)
-            current = serve.dashboard_cleanup.raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
+            current = serve.raw_segments.ensure_current_segment(base, kind="prompt_usage", source_name="prompt-usage.raw.jsonl")
             pathlib.Path(current["path"]).write_text(
-                json.dumps(_turn_raw("s-old", "t-old", total=100) | {"captured_at": "2026-05-01T00:00:00+00:00"}) + "\n"
-                + json.dumps(_turn_raw("s-new", "t-new", total=200) | {"captured_at": "2026-05-23T00:00:00+00:00"}) + "\n",
+                json.dumps(_turn_raw("s-old", "t-old", total=100) | {"captured_at": "2026-05-01T00:00:00+00:00"})
+                + "\n"
+                + json.dumps(_turn_raw("s-new", "t-new", total=200) | {"captured_at": "2026-05-23T00:00:00+00:00"})
+                + "\n",
                 encoding="utf-8",
             )
             prompt_normalized = normalized_dir / "prompt-usage.normalized.jsonl"
             prompt_normalized.write_bytes(b"p" * 1000)
             normalize_state = normalized_dir / "normalize-state.json"
             normalize_state.write_bytes(b"s" * 1000)
-            db_path = analytics_dir / "token-usage.sqlite"
+            db_path = analytics_dir / "bola.sqlite"
             db_path.write_bytes(b"d" * 1000)
 
             handler = serve.Handler.__new__(serve.Handler)
@@ -449,7 +535,6 @@ class DashboardCleanupPayloadTests(DashboardFixtureMixin, unittest.TestCase):
                 json.dumps({"record_type": "turn_start", "captured_at": "2026-05-23T00:00:00+00:00", "session_id": "s-new", "turn_id": "t-new"}) + "\n",
                 encoding="utf-8",
             )
-            old_state_size = old_state.stat().st_size
             service_state = state_dir / "custom-state.json"
             service_state.write_text("{}\n", encoding="utf-8")
             service_state_size = service_state.stat().st_size
@@ -457,16 +542,18 @@ class DashboardCleanupPayloadTests(DashboardFixtureMixin, unittest.TestCase):
 
             handler = serve.Handler.__new__(serve.Handler)
             cutoff_unix = datetime.fromisoformat("2026-05-20T00:00:00+00:00").timestamp()
-            payload = handler.cleanup_payload(db_path=analytics_dir / "token-usage.sqlite", base_dir=base, retention_cutoff_unix=cutoff_unix)
-            detail = handler.cleanup_detail_payload("state_files", db_path=analytics_dir / "token-usage.sqlite", base_dir=base, retention_cutoff_unix=cutoff_unix)
+            payload = handler.cleanup_payload(db_path=analytics_dir / "bola.sqlite", base_dir=base, retention_cutoff_unix=cutoff_unix)
+            detail = handler.cleanup_detail_payload("state_files", db_path=analytics_dir / "bola.sqlite", base_dir=base, retention_cutoff_unix=cutoff_unix)
 
         rows = {row["label"]: row for row in payload["rows"]}
         self.assertIn("Pending Turn State", rows)
         self.assertEqual(rows["Pending Turn State"]["display"]["detail_items_kind"], "file_targets")
-        self.assertEqual(rows["Pending Turn State"]["display"]["total_rows"], 0)
+        self.assertEqual(rows["Pending Turn State"]["display"]["total_rows"], 2)
         self.assertEqual(rows["Pending Turn State"]["display"]["affected_rows"], 0)
-        self.assertEqual(rows["Pending Turn State"]["display"]["affected_files"], 1)
-        self.assertEqual(rows["Pending Turn State"]["display"]["delete_size"], old_state_size)
+        self.assertEqual(rows["Pending Turn State"]["display"]["affected_files"], 0)
+        self.assertEqual(rows["Pending Turn State"]["display"]["delete_size"], 0)
+        self.assertEqual(rows["Pending Turn State"]["retention_effect"], "protected from date retention")
+        self.assertNotIn("retention_delete", rows["Pending Turn State"]["capabilities"])
         self.assertEqual(rows["Pending Turn State"]["delete_all_display"]["affected_files"], 2)
         self.assertGreaterEqual(rows["State Files"]["delete_all_display"]["affected_files"], 1)
         self.assertGreaterEqual(rows["State Files"]["delete_all_display"]["delete_size"], service_state_size)
@@ -475,7 +562,7 @@ class DashboardCleanupPayloadTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertNotIn(str(old_state), state_targets)
         self.assertNotIn(str(new_state), state_targets)
 
-    def test_log_cleanup_selected_retention_includes_old_pending_turn_state(self) -> None:
+    def test_log_cleanup_selected_retention_protects_old_pending_turn_state(self) -> None:
         serve = load_module("serve_dashboard_pending_state_selected_retention_test", ROOT / "scripts" / "serve_dashboard.py")
         with tempfile.TemporaryDirectory() as tmp_dir:
             base = pathlib.Path(tmp_dir) / "token-usage"
@@ -491,15 +578,18 @@ class DashboardCleanupPayloadTests(DashboardFixtureMixin, unittest.TestCase):
             handler = serve.Handler.__new__(serve.Handler)
             payload = handler.cleanup_payload(
                 base_dir=base,
-                db_path=base / "analytics" / "token-usage.sqlite",
+                db_path=base / "analytics" / "bola.sqlite",
                 retention_cutoff_unix=datetime.fromisoformat("2026-05-10T00:00:00+00:00").timestamp(),
             )
 
         selected = payload["retention"]["selected"]
         self.assertEqual(selected["deletable_rows"], 0)
-        self.assertEqual(selected["pending_turn_state_deletable_files"], 1)
+        self.assertEqual(selected["pending_turn_state_deletable_files"], 0)
+        self.assertEqual(selected["pending_turn_state_deletable_bytes"], 0)
+        self.assertEqual(selected["pending_turn_state_protected_files"], 1)
+        self.assertGreater(selected["pending_turn_state_protected_bytes"], 0)
 
-    def test_retention_preview_signature_changes_when_pending_turn_state_changes(self) -> None:
+    def test_retention_preview_signature_ignores_protected_pending_turn_state_changes(self) -> None:
         cleanup = load_module("cleanup_pending_state_signature_test", ROOT / "scripts" / "dashboard_cleanup.py")
         with tempfile.TemporaryDirectory() as tmp_dir:
             base = pathlib.Path(tmp_dir) / "token-usage"
@@ -517,7 +607,7 @@ class DashboardCleanupPayloadTests(DashboardFixtureMixin, unittest.TestCase):
             )
             second = cleanup.retention_preview_signature(base, cutoff)
 
-        self.assertNotEqual(first, second)
+        self.assertEqual(first, second)
 
     def test_log_cleanup_payload_exposes_current_segment_targets(self) -> None:
         serve = load_module("serve_dashboard_cleanup_current_segment_row_test", ROOT / "scripts" / "serve_dashboard.py")
@@ -551,7 +641,7 @@ class DashboardCleanupPayloadTests(DashboardFixtureMixin, unittest.TestCase):
                     }
                 },
             )
-            db_path = analytics_dir / "token-usage.sqlite"
+            db_path = analytics_dir / "bola.sqlite"
             sqlite3.connect(db_path).close()
             handler = serve.Handler.__new__(serve.Handler)
             payload = handler.cleanup_payload(
@@ -571,17 +661,10 @@ class DashboardCleanupPayloadTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertNotIn("retention", detail)
         row_paths = [path.strip() for path in current_row["path"].split(",")]
         deletable_current_files = [
-            item
-            for item in detail["row"]["display"]["items"]
-            if int(item.get("deletable_rows") or 0) > 0 and "/raw/current/" in str(item.get("path") or "")
+            item for item in detail["row"]["display"]["items"] if int(item.get("deletable_rows") or 0) > 0 and "/raw/current/" in str(item.get("path") or "")
         ]
         self.assertGreaterEqual(len(deletable_current_files), 1)
-        self.assertTrue(
-            any(
-                any(file["path"] == path or file["path"].startswith(path + "/") for path in row_paths)
-                for file in deletable_current_files
-            )
-        )
+        self.assertTrue(any(any(file["path"] == path or file["path"].startswith(path + "/") for path in row_paths) for file in deletable_current_files))
 
     def test_log_cleanup_default_cutoff_uses_retention_index(self) -> None:
         serve = load_module("serve_dashboard_default_cleanup_cutoff_test", ROOT / "scripts" / "serve_dashboard.py")
@@ -604,16 +687,16 @@ class DashboardCleanupPayloadTests(DashboardFixtureMixin, unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            db_path = analytics_dir / "token-usage.sqlite"
+            db_path = analytics_dir / "bola.sqlite"
             con = sqlite3.connect(db_path)
             con.execute("create table run_metadata (key text primary key, value text)")
             con.commit()
             con.close()
             now_unix = datetime.fromisoformat("2026-01-15T12:34:56+00:00").timestamp()
             handler = serve.Handler.__new__(serve.Handler)
-            serve.dashboard_cleanup.RETENTION_PREVIEW_CACHE.clear()
+            serve.dashboard_cleanup.clear_retention_preview_cache()
 
-            with mock.patch.object(serve.dashboard_cleanup.time, "time", return_value=now_unix):
+            with mock.patch.object(serve.dashboard_cleanup._index.time, "time", return_value=now_unix):
                 payload = handler.cleanup_payload(db_path=db_path, base_dir=base)
 
         selected = payload["retention"]["selected"]

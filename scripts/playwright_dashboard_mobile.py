@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-from playwright_dashboard_helpers import assert_true
+from playwright_dashboard_helpers import assert_true, open_dashboard
 
 
 def check_mobile(page, base_url: str) -> None:
-    page.set_viewport_size({"width": 390, "height": 844})
-    page.goto(base_url, wait_until="networkidle")
-    page.evaluate("localStorage.clear()")
-    page.reload(wait_until="networkidle")
+    open_dashboard(page, base_url)
     page.locator('button[data-view-target="turns"]').click()
     page.wait_for_selector("#turn-list tr[data-turn]", timeout=10_000)
 
@@ -22,12 +19,17 @@ def check_mobile(page, base_url: str) -> None:
           const dateTimeCell = first ? first.querySelector('td:nth-child(1)') : null;
           const sessionCell = first ? first.querySelector('td:nth-child(2)') : null;
           const themeToggle = document.querySelector('.theme-toggle');
+          const appbar = document.querySelector('.appbar');
           const themeText = document.querySelector('[data-theme-mode="light"] .theme-toggle-text');
           return {
             scrollWidth: doc.scrollWidth,
             clientWidth: doc.clientWidth,
+            viewportHeight: window.innerHeight,
             themeInsetRight: themeToggle ? Math.round(window.innerWidth - themeToggle.getBoundingClientRect().right) : null,
             themeInsetBottom: themeToggle ? Math.round(window.innerHeight - themeToggle.getBoundingClientRect().bottom) : null,
+            themeTop: themeToggle ? Math.round(themeToggle.getBoundingClientRect().top) : null,
+            appbarTop: appbar ? Math.round(appbar.getBoundingClientRect().top) : null,
+            appbarBottom: appbar ? Math.round(appbar.getBoundingClientRect().bottom) : null,
             themeTextDisplay: themeText ? getComputedStyle(themeText).display : null,
             promptDisplay: prompt ? getComputedStyle(prompt).display : null,
             dateTimeDisplay: dateTimeCell ? getComputedStyle(dateTimeCell).display : null,
@@ -41,7 +43,11 @@ def check_mobile(page, base_url: str) -> None:
         f"mobile page overflows horizontally: {mobile_state}",
     )
     assert_true(12 <= mobile_state["themeInsetRight"] <= 16, f"mobile theme toggle should sit near the page right edge: {mobile_state}")
-    assert_true(12 <= mobile_state["themeInsetBottom"] <= 16, f"mobile theme toggle should sit near the page bottom edge: {mobile_state}")
+    assert_true(
+        mobile_state["appbarTop"] <= mobile_state["themeTop"]
+        and mobile_state["viewportHeight"] - mobile_state["themeInsetBottom"] <= mobile_state["appbarBottom"],
+        f"mobile theme toggle should stay inside the header: {mobile_state}",
+    )
     assert_true(mobile_state["themeTextDisplay"] == "none", f"mobile theme toggle should hide text labels: {mobile_state}")
     assert_true(mobile_state["promptDisplay"] != "none", f"mobile prompt cell hidden: {mobile_state}")
     assert_true(mobile_state["dateTimeDisplay"] == "none", f"mobile date-time column should collapse into row meta: {mobile_state}")

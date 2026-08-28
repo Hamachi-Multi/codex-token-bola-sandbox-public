@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import time
 import urllib.request
+
+DEFAULT_UI_TIMEOUT_MS = 10_000
 
 def compact_date(value: str) -> str:
     if not value:
@@ -42,6 +45,63 @@ def fetch_json(url: str) -> dict:
 def assert_true(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
+
+
+def open_dashboard(page, base_url: str, *, path: str = "") -> None:
+    page.goto(f"{base_url}{path}", wait_until="domcontentloaded")
+    page.wait_for_function(
+        """
+        () => {
+          const summary = document.querySelector('#summary');
+          return Boolean(summary && !summary.querySelector('.loading, .loading-line'));
+        }
+        """,
+        timeout=DEFAULT_UI_TIMEOUT_MS,
+    )
+
+
+def wait_for_view_content(
+    page,
+    *,
+    view: str,
+    container: str,
+    row: str,
+    empty: str,
+    require_focus: bool = False,
+) -> None:
+    page.wait_for_function(
+        """
+        ({view, container, row, empty, requireFocus}) => {
+          const section = document.querySelector(`[data-view="${view}"]`);
+          const panel = document.querySelector(container);
+          if (!section?.classList.contains('active') || !panel) return false;
+          const rows = Array.from(panel.querySelectorAll(row));
+          if (!rows.length && !panel.querySelector(empty)) return false;
+          if (!requireFocus || !rows.length) return true;
+          const buttons = rows
+            .map(item => item.querySelector('.row-select-button'))
+            .filter(Boolean);
+          return buttons.includes(document.activeElement) && document.activeElement.isConnected;
+        }
+        """,
+        arg={
+            "view": view,
+            "container": container,
+            "row": row,
+            "empty": empty,
+            "requireFocus": require_focus,
+        },
+        timeout=DEFAULT_UI_TIMEOUT_MS,
+    )
+
+
+def wait_for_python_condition(page, predicate, *, description: str, timeout_ms: int = DEFAULT_UI_TIMEOUT_MS) -> None:
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        page.wait_for_timeout(25)
+    raise AssertionError(f"timed out waiting for {description}")
 
 
 def parse_number(value: str | None) -> float:

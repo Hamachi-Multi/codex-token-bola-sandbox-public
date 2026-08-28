@@ -9,7 +9,7 @@ import time
 from typing import Any
 
 
-CANCEL_ENV = "CODEX_TOKEN_USAGE_CANCEL_FILE"
+CANCEL_ENV = "BOLA_CANCEL_FILE"
 CANCEL_EXIT_CODE = 130
 
 

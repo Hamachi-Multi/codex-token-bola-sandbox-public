@@ -37,8 +37,8 @@ CLEANUP_ROW_DEFINITIONS = (
         "label": "Pending Turn State",
         "group_id": "pending_turn_state",
         "role": "pending_turn_state",
-        "retention_effect": "orphan start state deleted by cutoff",
-        "capabilities": ["retention_delete", "delete_all"],
+        "retention_effect": "protected from date retention",
+        "capabilities": ["delete_all"],
     },
     {
         "label": "State Files",

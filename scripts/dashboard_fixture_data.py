@@ -16,7 +16,6 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from build_analytics_schema import setup_db
 import raw_segments
-import service_paths
 
 
 def _iso(unix_time: float) -> str:
@@ -56,10 +55,10 @@ def _write_jsonl(path: pathlib.Path, rows: list[dict[str, Any]]) -> None:
     path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
 
 
-def write_dashboard_fixture(codex_home: pathlib.Path, *, now_unix: float | None = None) -> pathlib.Path:
-    """Create a deterministic token-usage fixture under ``codex_home``."""
+def write_dashboard_fixture(output_dir: pathlib.Path, *, now_unix: float | None = None) -> pathlib.Path:
+    """Create deterministic token-usage fixture data under ``output_dir``."""
     now = float(now_unix if now_unix is not None else time.time())
-    root = service_paths.service_root(codex_home)
+    root = pathlib.Path(output_dir).expanduser().resolve(strict=False)
     analytics_dir = root / "analytics"
     normalized_dir = root / "normalized"
     raw_dir = root / "raw"
@@ -69,7 +68,7 @@ def write_dashboard_fixture(codex_home: pathlib.Path, *, now_unix: float | None 
     for directory in (analytics_dir, normalized_dir, raw_dir, state_dir, tmp_dir, bad_dir):
         directory.mkdir(parents=True, exist_ok=True)
 
-    db_path = analytics_dir / "token-usage.sqlite"
+    db_path = analytics_dir / "bola.sqlite"
     con = sqlite3.connect(db_path)
     setup_db(con)
     turns = []
@@ -115,6 +114,7 @@ def write_dashboard_fixture(codex_home: pathlib.Path, *, now_unix: float | None 
                 "development",
                 "dashboard-check",
                 f"/tmp/transcript-{index:02d}.jsonl",
+                captured - 45,
             )
         )
     con.executemany(
@@ -126,8 +126,8 @@ def write_dashboard_fixture(codex_home: pathlib.Path, *, now_unix: float | None 
           assistant_chars, input_tokens, cached_input_tokens, non_cached_input_tokens,
           output_tokens, reasoning_output_tokens, total_tokens, cached_ratio,
           model_call_count, weighted_credits, uncached_input_equivalent, category,
-          workflow, transcript_path
-        ) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+          workflow, transcript_path, started_at_unix
+        ) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         turns,
     )

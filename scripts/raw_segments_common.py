@@ -20,6 +20,7 @@ PENDING_APPLY_RELATIVE_PATH = pathlib.Path("state") / "raw-segment-apply-pending
 RAW_SEGMENT_LOCK_RELATIVE_PATH = pathlib.Path("state") / "raw-segment.lock"
 RAW_SEGMENT_MANIFEST_LOCK_RELATIVE_PATH = pathlib.Path("state") / "raw-segment-manifest.lock"
 PROMPT_RAW_NAME = "prompt-usage.raw.jsonl"
+PROMPT_TIME_BASIS = "started_at"
 _THREAD_LOCKS: dict[str, threading.Lock] = {}
 _THREAD_LOCKS_GUARD = threading.Lock()
 
@@ -153,6 +154,65 @@ def read_segment_payload(path: pathlib.Path) -> bytes:
     return path.read_bytes()
 
 
+def open_segment_payload(path: pathlib.Path):
+    """Open an uncompressed payload stream for a plain or gzip segment."""
+    return gzip.open(path, "rb") if path.suffix == ".gz" else path.open("rb")
+
+
+class JsonlScanAccumulator:
+    """Incrementally compute the same metadata as :func:`scan_jsonl_bytes`."""
+
+    def __init__(self, *, kind: str) -> None:
+        self.kind = kind
+        self.rows = 0
+        self.undated_rows = 0
+        self.corrupt_rows = 0
+        self.unknown_rows = 0
+        self.min_time: float | None = None
+        self.max_time: float | None = None
+        self.days: dict[int, int] = {}
+        self.day_bytes: dict[int, int] = {}
+
+    def add(self, line: bytes) -> dict[str, Any] | None:
+        raw_line = line.rstrip(b"\r\n")
+        if not raw_line:
+            return None
+        line_bytes = len(raw_line) + 1
+        try:
+            parsed = json.loads(raw_line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.rows += 1
+            self.corrupt_rows += 1
+            return None
+        if not isinstance(parsed, dict):
+            self.rows += 1
+            self.unknown_rows += 1
+            return None
+        self.rows += 1
+        parsed_time = row_time(parsed, kind=self.kind)
+        if parsed_time is None:
+            self.undated_rows += 1
+            return parsed
+        self.min_time = parsed_time if self.min_time is None else min(self.min_time, parsed_time)
+        self.max_time = parsed_time if self.max_time is None else max(self.max_time, parsed_time)
+        day = int(datetime.fromtimestamp(parsed_time, tz=timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        self.days[day] = self.days.get(day, 0) + 1
+        self.day_bytes[day] = self.day_bytes.get(day, 0) + line_bytes
+        return parsed
+
+    def result(self) -> dict[str, Any]:
+        return {
+            "time_basis": PROMPT_TIME_BASIS,
+            "rows": self.rows,
+            "undated_rows": self.undated_rows,
+            "corrupt_rows": self.corrupt_rows,
+            "unknown_rows": self.unknown_rows,
+            "min_time_unix": self.min_time,
+            "max_time_unix": self.max_time,
+            "days": [[day, count, self.day_bytes.get(day, 0)] for day, count in sorted(self.days.items())],
+        }
+
+
 
 def _parse_time(value: Any) -> float | None:
     if isinstance(value, (int, float)):
@@ -169,7 +229,7 @@ def _parse_time(value: Any) -> float | None:
 def row_time(row: dict[str, Any], *, kind: str) -> float | None:
     if kind != "prompt_usage":
         raise ManifestError(f"unsupported raw segment kind: {kind}")
-    keys = ("captured_at", "stopped_at", "started_at", "timestamp")
+    keys = ("started_at", "captured_at", "stopped_at", "timestamp")
     for key in keys:
         parsed = _parse_time(row.get(key))
         if parsed is not None:
@@ -211,6 +271,7 @@ def scan_jsonl_bytes(payload: bytes, *, kind: str) -> dict[str, Any]:
         days[day] = days.get(day, 0) + 1
         day_bytes[day] = day_bytes.get(day, 0) + line_bytes
     return {
+        "time_basis": PROMPT_TIME_BASIS,
         "rows": rows,
         "undated_rows": undated_rows,
         "corrupt_rows": corrupt_rows,

@@ -1,25 +1,56 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools==84.0.0", "setuptools-scm==9.2.2"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex-token-bola"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Codex Token Bola local token usage capture, analytics, and dashboard tooling"
 requires-python = ">=3.10"
 readme = "README.md"
 license = "MIT"
+license-files = [
+  "LICENSE",
+  "LICENSES/*.txt",
+  "THIRD_PARTY_NOTICES.md",
+]
+dependencies = [
+  "platformdirs==4.11.4",
+  "tzdata==2026.3",
+]
+
+[project.scripts]
+bola = "codex_token_bola.cli:main"
 
 [project.optional-dependencies]
 dev = [
-  "ruff>=0.5,<1",
+  "build==1.5.0",
+  "ruff==0.16.5",
 ]
 ui = [
-  "playwright>=1.40,<2",
+  "playwright==1.62.0",
 ]
 
 [tool.setuptools]
-py-modules = []
+include-package-data = true
+packages = [
+  "codex_token_bola",
+  "codex_token_bola._runtime",
+  "codex_token_bola._runtime.assets",
+  "codex_token_bola._runtime.assets.dashboard",
+  "codex_token_bola._runtime.assets.fonts",
+]
+
+[tool.setuptools.package-dir]
+"codex_token_bola._runtime" = "scripts"
+
+[tool.setuptools.package-data]
+"codex_token_bola._runtime.assets" = ["*.css", "*.html", "*.js"]
+"codex_token_bola._runtime.assets.dashboard" = ["*.js"]
+"codex_token_bola._runtime.assets.fonts" = ["*.woff2"]
+
+[tool.setuptools_scm]
+parentdir_prefix_version = "codex-token-bola-"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

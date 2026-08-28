@@ -14,9 +14,9 @@ from typing import Iterator
 import service_paths
 
 
-LOCK_HELD_ENV = "CODEX_TOKEN_USAGE_LOCK_HELD"
-LOCK_PATH_ENV = "CODEX_TOKEN_USAGE_LOCK_PATH"
-LOCK_FD_ENV = "CODEX_TOKEN_USAGE_LOCK_FD"
+LOCK_HELD_ENV = "BOLA_LOCK_HELD"
+LOCK_PATH_ENV = "BOLA_LOCK_PATH"
+LOCK_FD_ENV = "BOLA_LOCK_FD"
 LOCK_ENV_KEYS = (LOCK_HELD_ENV, LOCK_PATH_ENV, LOCK_FD_ENV)
 
 
@@ -32,8 +32,12 @@ class ServiceLock:
         self.fd = fd
 
 
-def default_lock_path(codex_home: str | pathlib.Path | None = None) -> pathlib.Path:
-    return service_paths.service_root(codex_home) / "state" / "service.lock"
+def default_lock_path(
+    codex_dir: str | pathlib.Path | None = None,
+    output_dir: str | pathlib.Path | None = None,
+) -> pathlib.Path:
+    root = service_paths.output_dir_path(output_dir)
+    return root / "state" / "service.lock"
 
 
 def scrub_lock_env(base: dict[str, str] | None = None) -> dict[str, str]:
@@ -72,7 +76,11 @@ def lock_pass_fds(env: dict[str, str] | None = None) -> tuple[int, ...]:
     return (fd,)
 
 
-def valid_inherited_lock(lock_path: pathlib.Path | str | None = None, codex_home: str | pathlib.Path | None = None) -> tuple[pathlib.Path, int] | None:
+def valid_inherited_lock(
+    lock_path: pathlib.Path | str | None = None,
+    codex_dir: str | pathlib.Path | None = None,
+    output_dir: str | pathlib.Path | None = None,
+) -> tuple[pathlib.Path, int] | None:
     if os.environ.get(LOCK_HELD_ENV) != "1":
         return None
     try:
@@ -81,8 +89,8 @@ def valid_inherited_lock(lock_path: pathlib.Path | str | None = None, codex_home
         return None
     if fd < 0:
         return None
-    inherited_path = pathlib.Path(os.environ.get(LOCK_PATH_ENV) or lock_path or default_lock_path(codex_home)).expanduser()
-    expected_path = pathlib.Path(lock_path).expanduser() if lock_path else default_lock_path(codex_home)
+    inherited_path = pathlib.Path(os.environ.get(LOCK_PATH_ENV) or lock_path or default_lock_path(codex_dir, output_dir)).expanduser()
+    expected_path = pathlib.Path(lock_path).expanduser() if lock_path else default_lock_path(codex_dir, output_dir)
     try:
         fd_stat = os.fstat(fd)
         path_stat = inherited_path.stat()
@@ -96,19 +104,56 @@ def valid_inherited_lock(lock_path: pathlib.Path | str | None = None, codex_home
     return inherited_path, fd
 
 
+def inspect_service_lock(path: pathlib.Path | str) -> dict[str, object]:
+    """Read lock ownership without creating or modifying the lock file."""
+    target = pathlib.Path(path).expanduser()
+    result: dict[str, object] = {"path": str(target), "exists": False, "held": False, "valid": True, "owner": None}
+    try:
+        fd = os.open(target, os.O_RDONLY)
+    except FileNotFoundError:
+        return result
+    except OSError as exc:
+        result.update(exists=True, valid=False, error=str(exc))
+        return result
+    result["exists"] = True
+    try:
+        raw = os.read(fd, 64 * 1024).decode("utf-8")
+        try:
+            owner = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            owner = None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            result["held"] = True
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        if owner is not None and not isinstance(owner, dict):
+            owner = None
+        result["owner"] = owner
+        if result["held"] and owner is None:
+            result.update(valid=False, error="held service lock has invalid owner metadata")
+    except OSError as exc:
+        result.update(valid=False, error=str(exc))
+    finally:
+        os.close(fd)
+    return result
+
+
 @contextlib.contextmanager
 def acquire_service_lock(
     lock_path: pathlib.Path | str | None = None,
-    reason: str = "token-usage",
-    codex_home: str | pathlib.Path | None = None,
+    reason: str = "bola",
+    codex_dir: str | pathlib.Path | None = None,
+    output_dir: str | pathlib.Path | None = None,
 ) -> Iterator[ServiceLock]:
-    inherited = valid_inherited_lock(lock_path=lock_path, codex_home=codex_home)
+    inherited = valid_inherited_lock(lock_path=lock_path, codex_dir=codex_dir, output_dir=output_dir)
     if inherited is not None:
         inherited_path, fd = inherited
         yield ServiceLock(inherited_path, fd)
         return
 
-    path = pathlib.Path(lock_path).expanduser() if lock_path else default_lock_path(codex_home)
+    path = pathlib.Path(lock_path).expanduser() if lock_path else default_lock_path(codex_dir, output_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     locked = False
