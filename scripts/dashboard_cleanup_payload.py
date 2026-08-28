@@ -20,19 +20,61 @@ from dashboard_cleanup_common import (
     existing_target_paths,
     impact_payload,
     read_run_metadata,
-    safe_file_size,
     safe_tree_size,
     target_paths_count,
 )
 from dashboard_cleanup_recovery import read_cleanup_retention_job
-from dashboard_cleanup_retention import (
-    RETENTION_PREVIEW_CACHE,
-    default_retention_cutoff_unix,
-    pending_turn_state_paths,
-    plan_pending_turn_state_for_retention,
+from dashboard_cleanup_retention import pending_turn_state_paths, plan_pending_turn_state_for_retention
+from dashboard_retention_index import default_retention_cutoff_unix
+from dashboard_retention_preview import (
+    clear_retention_preview_cache,
     retention_preview,
     retention_preview_signature,
 )
+
+
+class CleanupTargetSet:
+    __slots__ = ("by_label", "retention_reset_by_label")
+
+    def __init__(
+        self,
+        *,
+        by_label: dict[str, list[pathlib.Path]],
+        retention_reset_by_label: dict[str, list[pathlib.Path]],
+    ) -> None:
+        self.by_label = by_label
+        self.retention_reset_by_label = retention_reset_by_label
+
+
+def _cleanup_target_set(base: pathlib.Path, db: pathlib.Path) -> CleanupTargetSet:
+    state_dir = base / "state"
+    pending_targets = pending_turn_state_paths(state_dir)
+    pending_keys = {path.resolve(strict=False) for path in pending_targets}
+    try:
+        state_children = [path for path in sorted(state_dir.iterdir(), key=lambda item: item.name) if not path.name.endswith(".lock")]
+    except FileNotFoundError:
+        state_children = []
+    state_targets = [path for path in state_children if path.resolve(strict=False) not in pending_keys]
+    state_targets.extend(sorted(base.glob("hook-probe-events.jsonl")))
+
+    normalized_prompt = base / "normalized" / "prompt-usage.normalized.jsonl"
+    normalize_state = base / "normalized" / "normalize-state.json"
+    by_label = {
+        "Normalized Outputs": [normalized_prompt, base / "normalized" / "prompt-usage.normalized.jsonl.gz", normalize_state],
+        "Analytics Database": [db],
+        "Archived Raw Logs": [base / "raw" / "archive"],
+        "Raw Current Segments": [base / "raw" / "current"],
+        "Pending Turn State": pending_targets,
+        "State Files": state_targets,
+    }
+    return CleanupTargetSet(
+        by_label=by_label,
+        retention_reset_by_label={
+            "Normalized Outputs": [normalized_prompt, normalize_state],
+            "Analytics Database": [db],
+        },
+    )
+
 
 def _delete_all_target_size(path: pathlib.Path) -> int:
     try:
@@ -66,7 +108,7 @@ def _delete_service_owned_path(path: pathlib.Path, base_resolved: pathlib.Path, 
 
 
 def delete_all_logs(token_usage_root: pathlib.Path | str, db_path: pathlib.Path | str | None = None) -> dict[str, Any]:
-    RETENTION_PREVIEW_CACHE.clear()
+    clear_retention_preview_cache()
     base = pathlib.Path(token_usage_root).expanduser()
     base_resolved = base.resolve(strict=False)
     deleted: list[dict[str, Any]] = []
@@ -149,12 +191,6 @@ def cleanup_payload(
     base = pathlib.Path(base_dir).expanduser() if base_dir is not None else pathlib.Path(token_usage_root).expanduser()
     db = pathlib.Path(db_path).expanduser()
     metadata = read_run_metadata(db)
-    archive_dir = base / "raw" / "archive"
-    current_dir = base / "raw" / "current"
-    normalized_prompt = base / "normalized" / "prompt-usage.normalized.jsonl"
-    normalized_prompt_archive = base / "normalized" / "prompt-usage.normalized.jsonl.gz"
-    normalize_state = base / "normalized" / "normalize-state.json"
-    state_dir = base / "state"
 
     tree_size_cache: dict[str, int] = {}
 
@@ -180,55 +216,32 @@ def cleanup_payload(
             return size
         return max(1, (size * affected + total - 1) // total)
 
-    hook_probe_logs = sorted(base.glob("hook-probe-events.jsonl"))
-    retention_reset_targets = {
-        "Normalized Outputs": [normalized_prompt, normalize_state],
-        "Analytics Database": [db],
-    }
-    delete_all_targets = {
-        "Normalized Outputs": [normalized_prompt, normalized_prompt_archive, normalize_state],
-        "Analytics Database": [db],
-        "Archived Raw Logs": [archive_dir],
-        "Raw Current Segments": [current_dir],
-        "State Files": hook_probe_logs,
-    }
     now_unix = time.time()
     cutoff_unix = float(retention_cutoff_unix) if retention_cutoff_unix is not None else default_retention_cutoff_unix(now_unix)
     selected_retention = retention_preview(base, cutoff_unix, refresh_index=refresh_retention_index)
     selected_retention["preview_signature"] = retention_preview_signature(base, cutoff_unix)
     selected_retention["source_files"] = len(selected_retention.get("files", []))
     selected_retention["all_files"] = sum(
-        1
-        for file in selected_retention.get("files", [])
-        if int(file.get("scanned_rows") or 0) > 0 or int(file.get("source_size") or 0) > 0
+        1 for file in selected_retention.get("files", []) if int(file.get("scanned_rows") or 0) > 0 or int(file.get("source_size") or 0) > 0
     )
+    target_set = _cleanup_target_set(base, db)
+    paths_by_label = target_set.by_label
+    retention_reset_targets = target_set.retention_reset_by_label
+    current_dir = paths_by_label["Raw Current Segments"][0]
+    pending_turn_state_targets = paths_by_label["Pending Turn State"]
     cleanup_job = read_cleanup_retention_job(base)
-    try:
-        state_delete_all_targets = [path for path in sorted(state_dir.iterdir(), key=lambda item: item.name) if not path.name.endswith(".lock")]
-    except FileNotFoundError:
-        state_delete_all_targets = []
-    pending_turn_state_targets = pending_turn_state_paths(state_dir)
     pending_turn_state_plan = plan_pending_turn_state_for_retention(base, cutoff_unix)
     pending_deleted_files = int(pending_turn_state_plan.get("deleted_files") or 0)
     pending_scanned_files = int(pending_turn_state_plan.get("scanned_files") or len(pending_turn_state_targets))
     pending_deleted_bytes = int(pending_turn_state_plan.get("deleted_bytes") or 0)
+    pending_protected_files = int(pending_turn_state_plan.get("protected_files") or pending_scanned_files)
+    pending_protected_bytes = int(pending_turn_state_plan.get("protected_bytes") or 0)
     selected_retention["affected_files"] = int(selected_retention.get("affected_files") or 0) + pending_deleted_files
     selected_retention["pending_turn_state_scanned_files"] = pending_scanned_files
     selected_retention["pending_turn_state_deletable_files"] = pending_deleted_files
     selected_retention["pending_turn_state_deletable_bytes"] = pending_deleted_bytes
-    pending_turn_state_keys = {path.resolve(strict=False) for path in pending_turn_state_targets}
-    service_state_targets = [path for path in state_delete_all_targets if path.resolve(strict=False) not in pending_turn_state_keys]
-    state_file_targets = [*service_state_targets, *hook_probe_logs]
-    delete_all_targets["Pending Turn State"] = pending_turn_state_targets
-    delete_all_targets["State Files"] = state_file_targets
-    paths_by_label = {
-        "Normalized Outputs": [normalized_prompt, normalized_prompt_archive, normalize_state],
-        "Analytics Database": [db],
-        "Archived Raw Logs": [archive_dir],
-        "Raw Current Segments": [current_dir],
-        "Pending Turn State": pending_turn_state_targets,
-        "State Files": state_file_targets,
-    }
+    selected_retention["pending_turn_state_protected_files"] = pending_protected_files
+    selected_retention["pending_turn_state_protected_bytes"] = pending_protected_bytes
     compactable_by_label: dict[str, int] = {}
 
     def retention_matches(paths: list[pathlib.Path]) -> list[dict[str, Any]]:
@@ -243,16 +256,8 @@ def cleanup_payload(
         matches = retention_matches(paths)
         affected_file_paths = [pathlib.Path(str(file.get("path") or "")) for file in matches if file.get("affected")]
         source_count = sum(1 for file in matches if file.get("affected"))
-        delete_files = sum(
-            1
-            for file in matches
-            if file.get("affected") and int(file.get("deletable_rows") or 0) >= int(file.get("scanned_rows") or 0)
-        )
-        rewrite_files = sum(
-            1
-            for file in matches
-            if file.get("affected") and 0 < int(file.get("deletable_rows") or 0) < int(file.get("scanned_rows") or 0)
-        )
+        delete_files = sum(1 for file in matches if file.get("affected") and int(file.get("deletable_rows") or 0) >= int(file.get("scanned_rows") or 0))
+        rewrite_files = sum(1 for file in matches if file.get("affected") and 0 < int(file.get("deletable_rows") or 0) < int(file.get("scanned_rows") or 0))
         impact = impact_payload(
             total_rows=sum(int(file.get("scanned_rows") or 0) for file in matches),
             affected_rows=sum(int(file.get("deletable_rows") or 0) for file in matches),
@@ -301,26 +306,21 @@ def cleanup_payload(
         return [file for file in retention_source_files_for_label(label) if has_rows(file)]
 
     def pending_turn_state_retention_impact() -> dict[str, Any]:
-        affected_file_paths = [pathlib.Path(str(path)) for path in pending_turn_state_plan.get("targets") or []]
         return impact_payload(
-            total_rows=0,
+            total_rows=pending_protected_files,
             affected_rows=0,
-            delete_size=pending_deleted_bytes,
-            affected_files=pending_deleted_files,
-            targets=affected_file_paths,
+            delete_size=0,
+            affected_files=0,
+            targets=[],
             include_targets=include_targets,
         )
 
     def source_delete_all_impact(label: str, paths: list[pathlib.Path]) -> dict[str, Any]:
         matches = retention_matches(paths)
-        candidate_paths = delete_all_targets.get(label, paths)
+        candidate_paths = paths_by_label.get(label, paths)
         affected_file_paths = existing_target_paths(candidate_paths) if include_targets else []
         affected_file_count = len(affected_file_paths) if include_targets else target_paths_count(candidate_paths)
-        source_count = sum(
-            1
-            for file in matches
-            if int(file.get("scanned_rows") or 0) > 0 or int(file.get("source_size") or 0) > 0
-        )
+        source_count = sum(1 for file in matches if int(file.get("scanned_rows") or 0) > 0 or int(file.get("source_size") or 0) > 0)
         affected_files = source_count if source_count > 0 else affected_file_count
         impact = impact_payload(
             total_rows=sum(int(file.get("scanned_rows") or 0) for file in matches),
@@ -336,7 +336,7 @@ def cleanup_payload(
         return impact
 
     def file_delete_all_impact(label: str, *, total_rows: int = 0) -> dict[str, Any]:
-        candidate_paths = delete_all_targets.get(label, [])
+        candidate_paths = paths_by_label.get(label, [])
         affected_file_paths = existing_target_paths(candidate_paths) if include_targets else []
         affected_file_count = len(affected_file_paths) if include_targets else target_paths_count(candidate_paths)
         return impact_payload(
@@ -349,7 +349,7 @@ def cleanup_payload(
         )
 
     def derived_delete_all_impact(label: str, *, total_rows: int = 0) -> dict[str, Any]:
-        candidate_paths = delete_all_targets.get(label, [])
+        candidate_paths = paths_by_label.get(label, [])
         affected_file_paths = existing_target_paths(candidate_paths) if include_targets else []
         affected_file_count = len(affected_file_paths) if include_targets else target_paths_count(candidate_paths)
         source_files = derived_source_files(label, delete_all=True)
@@ -541,6 +541,8 @@ def cleanup_detail_payload(
     base_dir: pathlib.Path | str | None = None,
     retention_cutoff_unix: float | None = None,
     preview_signature: str | None = None,
+    page: int = 1,
+    page_size: int = 25,
 ) -> dict[str, Any]:
     base = pathlib.Path(base_dir).expanduser() if base_dir is not None else pathlib.Path(token_usage_root).expanduser()
     db = pathlib.Path(db_path).expanduser()
@@ -555,42 +557,8 @@ def cleanup_detail_payload(
     group_info = cleanup_group_for_label(label)
     role = str(group_info["role"])
 
-    archive_dir = base / "raw" / "archive"
-    current_dir = base / "raw" / "current"
-    normalized_prompt = base / "normalized" / "prompt-usage.normalized.jsonl"
-    normalized_prompt_archive = base / "normalized" / "prompt-usage.normalized.jsonl.gz"
-    normalize_state = base / "normalized" / "normalize-state.json"
-    state_dir = base / "state"
-    retention_reset_targets = {
-        "Normalized Outputs": [normalized_prompt, normalize_state],
-        "Analytics Database": [db],
-    }
-
-    def state_file_targets() -> list[pathlib.Path]:
-        pending_targets = pending_turn_state_paths(state_dir)
-        pending_keys = {path.resolve(strict=False) for path in pending_targets}
-        try:
-            state_children = [path for path in sorted(state_dir.iterdir(), key=lambda item: item.name) if not path.name.endswith(".lock")]
-        except FileNotFoundError:
-            state_children = []
-        return [path for path in state_children if path.resolve(strict=False) not in pending_keys] + sorted(base.glob("hook-probe-events.jsonl"))
-
-    def paths_for_label(row_label: str) -> list[pathlib.Path]:
-        if row_label == "Normalized Outputs":
-            return [normalized_prompt, normalized_prompt_archive, normalize_state]
-        if row_label == "Analytics Database":
-            return [db]
-        if row_label == "Archived Raw Logs":
-            return [archive_dir]
-        if row_label == "Raw Current Segments":
-            return [current_dir]
-        if row_label == "Pending Turn State":
-            return pending_turn_state_paths(state_dir)
-        if row_label == "State Files":
-            return state_file_targets()
-        return []
-
-    paths = paths_for_label(label)
+    target_set = _cleanup_target_set(base, db)
+    paths = target_set.by_label[label]
 
     def empty_detail_display() -> dict[str, Any]:
         return {"targets": [], "targets_truncated": 0}
@@ -606,14 +574,39 @@ def cleanup_detail_payload(
             return [file for file in files if int(file.get("scanned_rows") or 0) > 0 or int(file.get("source_size") or 0) > 0]
         return [file for file in files if file.get("affected")]
 
-    def detail_display_from_files(files: list[dict[str, Any]]) -> dict[str, Any]:
-        payload = {
-            "targets": [str(file.get("path") or "") for file in files if file.get("path")],
-            "targets_truncated": 0,
+    def pagination_payload(total: int) -> dict[str, Any]:
+        total_pages = (total + page_size - 1) // page_size if total else 0
+        return {
+            "page": page,
+            "page_size": page_size,
+            "total_items": total,
+            "total_pages": total_pages,
+            "has_previous": page > 1,
+            "has_next": page < total_pages,
         }
-        if files:
-            payload["items"] = [dict(file) for file in files]
+
+    def detail_display_from_files(files: list[dict[str, Any]]) -> dict[str, Any]:
+        ordered = sorted(files, key=lambda item: str(item.get("path") or ""))
+        start = (page - 1) * page_size
+        selected = ordered[start : start + page_size]
+        payload = {
+            "targets": [str(file.get("path") or "") for file in selected if file.get("path")],
+            "targets_truncated": max(0, len(ordered) - len(selected)),
+            "pagination": pagination_payload(len(ordered)),
+        }
+        if selected:
+            payload["items"] = [dict(file) for file in selected]
         return payload
+
+    def detail_display_from_paths(paths: list[pathlib.Path]) -> dict[str, Any]:
+        ordered = sorted({str(path) for path in paths})
+        start = (page - 1) * page_size
+        selected = ordered[start : start + page_size]
+        return {
+            "targets": selected,
+            "targets_truncated": max(0, len(ordered) - len(selected)),
+            "pagination": pagination_payload(len(ordered)),
+        }
 
     display = empty_detail_display()
     delete_all_display = empty_detail_display()
@@ -624,16 +617,16 @@ def cleanup_detail_payload(
     elif role == "derived_rebuild":
         selected_retention = retention_preview(base, cutoff_unix)
         affected_rows = sum(int(file.get("deletable_rows") or 0) for file in selected_retention.get("files", []))
-        affected_file_paths = existing_target_paths(retention_reset_targets.get(label, [])) if affected_rows > 0 else []
+        affected_file_paths = existing_target_paths(target_set.retention_reset_by_label.get(label, [])) if affected_rows > 0 else []
         delete_all_file_paths = existing_target_paths(paths)
-        display = {"targets": [str(path) for path in affected_file_paths], "targets_truncated": 0}
-        delete_all_display = {"targets": [str(path) for path in delete_all_file_paths], "targets_truncated": 0}
+        display = detail_display_from_paths(affected_file_paths)
+        delete_all_display = detail_display_from_paths(delete_all_file_paths)
     elif role == "pending_turn_state":
         plan = plan_pending_turn_state_for_retention(base, cutoff_unix)
         affected_file_paths = [pathlib.Path(str(path)) for path in plan.get("targets") or []]
         delete_all_file_paths = existing_target_paths(paths)
-        display = {"targets": [str(path) for path in affected_file_paths], "targets_truncated": 0}
-        delete_all_display = {"targets": [str(path) for path in delete_all_file_paths], "targets_truncated": 0}
+        display = detail_display_from_paths(affected_file_paths)
+        delete_all_display = detail_display_from_paths(delete_all_file_paths)
     public_group_info = {key: value for key, value in group_info.items() if key not in {"label", "role", "retention_effect"}}
     return {
         "row": {

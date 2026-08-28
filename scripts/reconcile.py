@@ -7,7 +7,6 @@ transcripts without blocking a Codex turn.
 
 from __future__ import annotations
 
-import importlib.util
 import gzip
 import json
 import os
@@ -17,44 +16,61 @@ import time
 from typing import Any
 
 
-CODEX_HOME = pathlib.Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
-REPO_HOOK_PATH = SCRIPT_DIR.parent / "hooks" / "token-usage.py"
-HOOK_PATH = REPO_HOOK_PATH if REPO_HOOK_PATH.exists() else CODEX_HOME / "hooks" / "token-usage.py"
-
 import raw_segments
 import service_lock
 import service_paths
 import transcript_parser
+import quarantine_health
+import turn_capture
+import turn_lifecycle
+import turn_resolution
 
-BASE_DIR = service_paths.service_root(CODEX_HOME)
+RUNTIME_PATHS = service_paths.resolve_runtime_paths()
+CODEX_DIR = RUNTIME_PATHS.codex_dir
+BASE_DIR = RUNTIME_PATHS.output_dir
 STATE_DIR = BASE_DIR / "state"
 BAD_DIR = BASE_DIR / "bad"
-
-
-def load_hook():
-    spec = importlib.util.spec_from_file_location("token_usage_hook", HOOK_PATH)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
-
-
-hook = load_hook()
+ERROR_LOG = pathlib.Path(os.environ.get("BOLA_ERROR_LOG", str(BASE_DIR / "prompt-usage-errors.jsonl"))).expanduser()
+QUARANTINE_RESULTS: list[dict[str, Any]] = []
 
 
 def move_bad_state(path: pathlib.Path, reason: str) -> None:
-    BAD_DIR.mkdir(parents=True, exist_ok=True)
-    target = BAD_DIR / f"{path.stem}.{time.time_ns()}{path.suffix}"
+    captured_at_ns = time.time_ns()
     try:
+        if path.is_symlink() or BAD_DIR.is_symlink():
+            raise OSError("quarantine source and destination must not be symlinks")
+        content = path.read_bytes()
+        event = quarantine_health.event_id(kind="reconcile_state", source=path.name, content=content, error=reason)
+        BAD_DIR.mkdir(parents=True, exist_ok=True)
+        target = BAD_DIR / f"{path.stem}.{event}{path.suffix}"
         path.replace(target)
-    except OSError:
-        return
-    hook.safe_append_jsonl(
-        hook.ERROR_LOG,
-        {"captured_at": hook.utc_now(), "event": "reconcile", "warning": "bad_state", "reason": reason, "moved_to": str(target)},
+    except OSError as exc:
+        raise quarantine_health.QuarantineError(f"cannot move bad recovery state: {path}: {type(exc).__name__}") from exc
+    if not turn_capture.safe_append_jsonl(
+        ERROR_LOG,
+        {
+            "captured_at": turn_capture.utc_now(),
+            "event": "reconcile",
+            "warning": "bad_state",
+            "reason": reason,
+            "moved_to": str(target),
+            "quarantine_event_id": event,
+        },
+    ):
+        raise quarantine_health.QuarantineError(f"cannot write bad recovery state evidence log: {ERROR_LOG}")
+    QUARANTINE_RESULTS.append(
+        quarantine_health.record_event(
+            BASE_DIR,
+            event=event,
+            kind="reconcile_state",
+            source=path.name,
+            error=reason,
+            evidence_path=target,
+            captured_at_ns=captured_at_ns,
+        )
     )
 
 
@@ -102,7 +118,7 @@ def completed_turn_index() -> set[tuple[str, str]]:
 
 
 def completed_turn_from_row(row: dict[str, Any]) -> tuple[str, str] | None:
-    if row.get("lifecycle_end_reason") == "pending_token_count" and row.get("estimated"):
+    if turn_resolution.status_from_row(row) == turn_resolution.PENDING:
         return None
     if row.get("turn_status") not in {"completed", "aborted", "incomplete"}:
         return None
@@ -111,6 +127,22 @@ def completed_turn_from_row(row: dict[str, Any]) -> tuple[str, str] | None:
     if session_id and turn_id:
         return (session_id, turn_id)
     return None
+
+
+def record_unavailable_event(row: dict[str, Any]) -> None:
+    event, evidence_path, captured_at_ns = turn_resolution.write_unavailable_evidence(BASE_DIR, row)
+    row["token_resolution_event_id"] = event
+    QUARANTINE_RESULTS.append(
+        quarantine_health.record_event(
+            BASE_DIR,
+            event=event,
+            kind=turn_resolution.UNAVAILABLE_KIND,
+            source=str(row.get("transcript_path") or "unknown"),
+            error=str(row.get("token_resolution_reason") or "unknown"),
+            evidence_path=evidence_path,
+            captured_at_ns=captured_at_ns,
+        )
+    )
 
 
 def completed_turn_exists_in_current_segments(session_id: str, turn_id: str) -> bool:
@@ -132,87 +164,20 @@ def latest_token_until_turn_end(
     stream, error = transcript_parser.transcript_event_stream(transcript_path, offset)
     if error is not None:
         return (error, None)
-
-    latest: dict[str, Any] | None = None
-    model_calls: list[dict[str, Any]] = []
-    event_count = 0
-    file_size = stream.file_size
     try:
-        for event in stream:
-            item = event["item"]
-            line_start = int(event["line_start"])
-            next_offset = int(event["next_offset"])
-            payload = item.get("payload") or {}
-            if item.get("type") != "event_msg":
-                continue
-            payload_type = payload.get("type")
-            if payload_type == "task_started" and payload.get("turn_id") == turn_id:
-                latest = None
-                model_calls = []
-                event_count = 0
-                continue
-            if payload_type in {"task_complete", "task_aborted", "turn_aborted"} and payload.get("turn_id") == turn_id:
-                turn_end = {
-                    "type": payload_type,
-                    "timestamp": item.get("timestamp"),
-                    "turn_id": payload.get("turn_id"),
-                    "reason": payload.get("reason"),
-                    "completed_at": payload.get("completed_at"),
-                    "duration_ms": payload.get("duration_ms"),
-                    "event_offset": line_start,
-                    "bounded_file_offset": next_offset,
-                }
-                if latest is None:
-                    return (
-                        {
-                            "found": False,
-                            "reason": f"no_token_count_before_{payload_type}",
-                            "path": str(stream.path),
-                            "file_size": file_size,
-                            "model_calls": [],
-                            "bounded_at_file_offset": next_offset,
-                        },
-                        turn_end,
-                    )
-                latest.update(
-                    {
-                        "found": True,
-                        "path": str(stream.path),
-                        "file_size": file_size,
-                        "event_count": event_count,
-                        "model_calls": model_calls,
-                        "bounded_at_event_type": payload_type,
-                        "bounded_at_timestamp": item.get("timestamp"),
-                        "bounded_at_file_offset": next_offset,
-                        "turn_end_event_offset": line_start,
-                    }
-                )
-                return (latest, turn_end)
-            if payload_type != "token_count":
-                continue
-            info = payload.get("info")
-            if not isinstance(info, dict):
-                continue
-            event_count += 1
-            last_usage = hook.normalize_usage(info.get("last_token_usage"))
-            model_calls.append(
-                {
-                    "index": event_count,
-                    "timestamp": item.get("timestamp"),
-                    "usage": last_usage,
-                    "model_context_window": info.get("model_context_window"),
-                }
-            )
-            latest = {
-                "timestamp": item.get("timestamp"),
-                "total_token_usage": hook.normalize_usage(info.get("total_token_usage")),
-                "last_token_usage": last_usage,
-                "model_context_window": info.get("model_context_window"),
-            }
+        accumulator = turn_lifecycle.reduce_target_events(stream, turn_id, assume_active=True)
     except OSError as exc:
         return ({"found": False, "reason": "read_error", "error": repr(exc), "path": str(stream.path)}, None)
-
-    return ({"found": False, "reason": "turn_end_not_found", "path": str(stream.path), "file_size": file_size, "model_calls": []}, None)
+    snapshot = turn_lifecycle.bounded_usage_snapshot(
+        accumulator,
+        path=str(stream.path),
+        file_size=stream.file_size,
+        parse_error_seen=stream.parse_error_seen,
+        scan_start=stream.offset or 0,
+    )
+    if accumulator.terminal_event is not None and not snapshot.get("found"):
+        snapshot["bounded_at_file_offset"] = accumulator.terminal_event["bounded_file_offset"]
+    return snapshot, accumulator.terminal_event
 
 
 def reconcile_one(path: pathlib.Path, completed_turns: set[tuple[str, str]]) -> str:
@@ -250,15 +215,22 @@ def reconcile_one(path: pathlib.Path, completed_turns: set[tuple[str, str]]) -> 
     if turn_end is None:
         return "pending"
 
-    start_usage = hook.normalize_usage(state.get("start_token_usage"))
-    end_usage = hook.normalize_usage(end_snapshot.get("total_token_usage")) if end_snapshot.get("found") else start_usage
+    if not end_snapshot.get("found") and offset is not None:
+        full_snapshot, full_turn_end = latest_token_until_turn_end(state.get("transcript_path"), turn_id, None)
+        if full_turn_end is not None:
+            end_snapshot, turn_end = full_snapshot, full_turn_end
+
+    start_usage = turn_capture.normalize_usage(state.get("start_token_usage"))
+    end_usage = turn_capture.normalize_usage(end_snapshot.get("total_token_usage")) if end_snapshot.get("found") else start_usage
     turn_type = turn_end.get("type")
     status = "aborted" if turn_type in {"task_aborted", "turn_aborted"} else "completed"
-    reason = turn_end.get("reason") if status == "aborted" else "missed_stop_hook"
+    lifecycle_reason = turn_end.get("reason") if status == "aborted" else None
+    resolution_status = turn_resolution.RESOLVED if end_snapshot.get("found") else turn_resolution.UNAVAILABLE
+    resolution_reason = None if resolution_status == turn_resolution.RESOLVED else str(end_snapshot.get("reason") or f"no_token_count_before_{turn_type}")
     record = {
         "schema_version": 2,
         "record_type": "turn_usage_raw",
-        "captured_at": hook.utc_now(),
+        "captured_at": turn_capture.utc_now(),
         "captured_at_ns": time.time_ns(),
         "session_id": session_id,
         "turn_id": turn_id,
@@ -266,17 +238,19 @@ def reconcile_one(path: pathlib.Path, completed_turns: set[tuple[str, str]]) -> 
         "model": state.get("model"),
         "transcript_path": state.get("transcript_path"),
         "turn_status": status,
-        "lifecycle_end_reason": reason,
+        "lifecycle_end_reason": lifecycle_reason,
+        "token_resolution_status": resolution_status,
+        "token_resolution_reason": resolution_reason,
         "started_at": state.get("captured_at"),
         "stopped_at": None,
-        "usage": hook.usage_delta(start_usage, end_usage),
+        "usage": turn_capture.usage_delta(start_usage, end_usage),
         "start_token_usage": start_usage,
         "end_token_usage": end_usage,
-        "start_token_snapshot": hook.compact_snapshot(state.get("start_token_snapshot")),
-        "end_token_snapshot": hook.compact_snapshot(end_snapshot),
+        "start_token_snapshot": turn_capture.compact_snapshot(state.get("start_token_snapshot")),
+        "end_token_snapshot": turn_capture.compact_snapshot(end_snapshot),
         "turn_end_event": turn_end,
-        "prompt": state.get("prompt") or hook.prompt_metadata(""),
-        "assistant": hook.assistant_metadata({}),
+        "prompt": state.get("prompt") or turn_capture.prompt_metadata("", preview_chars=0, instruction_excerpt_chars=0),
+        "assistant": turn_capture.assistant_metadata({}),
         "model_call_count": len(end_snapshot.get("model_calls") or []),
         "hook_input": state.get("hook_input"),
         "token_source": "reconcile: transcript token_count diff bounded by turn end event",
@@ -288,10 +262,12 @@ def reconcile_one(path: pathlib.Path, completed_turns: set[tuple[str, str]]) -> 
         path.unlink(missing_ok=True)
         completed_turns.add((session_id, turn_id))
         return "duplicate"
-    if hook.append_prompt_usage(record, base_dir=BASE_DIR):
+    if resolution_status == turn_resolution.UNAVAILABLE:
+        record_unavailable_event(record)
+    if turn_capture.append_prompt_usage(record, base_dir=BASE_DIR):
         completed_turns.add((session_id, turn_id))
         path.unlink(missing_ok=True)
-        return status
+        return resolution_status if resolution_status == turn_resolution.UNAVAILABLE else status
     return "write_failed"
 
 
@@ -308,16 +284,29 @@ def reconcile_missing_start_stop(path: pathlib.Path, state: dict[str, Any], comp
         path.unlink(missing_ok=True)
         return "excluded_missing_transcript_path"
 
-    snapshot = hook.task_lifecycle_token_usage(state.get("transcript_path"), turn_id)
+    stream, error = transcript_parser.transcript_event_stream(state.get("transcript_path"))
+    if error is not None:
+        return "pending"
+    try:
+        accumulator = turn_lifecycle.reduce_target_events(stream, turn_id, assume_active=False)
+    except OSError:
+        return "pending"
+    snapshot = turn_lifecycle.full_lifecycle_snapshot(
+        accumulator,
+        path=str(stream.path),
+        file_size=stream.file_size,
+        parse_error_seen=stream.parse_error_seen,
+        fallback_stopped_at=turn_capture.utc_now(),
+    )
     if not snapshot.get("found"):
         return "pending"
 
     status = str(snapshot.get("turn_status") or "completed")
-    usage = hook.usage_delta(hook.zero_usage(), hook.normalize_usage(snapshot.get("total_token_usage")))
+    usage = turn_capture.usage_delta(turn_capture.zero_usage(), turn_capture.normalize_usage(snapshot.get("total_token_usage")))
     record = {
         "schema_version": 2,
         "record_type": "turn_usage_raw",
-        "captured_at": hook.utc_now(),
+        "captured_at": turn_capture.utc_now(),
         "captured_at_ns": time.time_ns(),
         "session_id": session_id,
         "turn_id": turn_id,
@@ -330,11 +319,11 @@ def reconcile_missing_start_stop(path: pathlib.Path, state: dict[str, Any], comp
         "stopped_at": snapshot.get("turn_stopped_at") or state.get("stopped_at"),
         "usage": usage,
         "start_token_usage": None,
-        "end_token_usage": hook.normalize_usage(snapshot.get("total_token_usage")),
+        "end_token_usage": turn_capture.normalize_usage(snapshot.get("total_token_usage")),
         "start_token_snapshot": None,
-        "end_token_snapshot": hook.compact_snapshot(snapshot),
-        "prompt": hook.prompt_metadata(""),
-        "assistant": state.get("assistant") or hook.assistant_metadata({}),
+        "end_token_snapshot": turn_capture.compact_snapshot(snapshot),
+        "prompt": turn_capture.prompt_metadata("", preview_chars=0, instruction_excerpt_chars=0),
+        "assistant": state.get("assistant") or turn_capture.assistant_metadata({}),
         "model_call_count": len(snapshot.get("model_calls") or []),
         "hook_input": state.get("hook_input"),
         "token_source": snapshot.get("token_source"),
@@ -346,7 +335,7 @@ def reconcile_missing_start_stop(path: pathlib.Path, state: dict[str, Any], comp
         path.unlink(missing_ok=True)
         completed_turns.add((session_id, turn_id))
         return "duplicate"
-    if hook.append_prompt_usage(record, base_dir=BASE_DIR):
+    if turn_capture.append_prompt_usage(record, base_dir=BASE_DIR):
         completed_turns.add((session_id, turn_id))
         path.unlink(missing_ok=True)
         return status
@@ -354,13 +343,14 @@ def reconcile_missing_start_stop(path: pathlib.Path, state: dict[str, Any], comp
 
 
 def run_reconcile() -> int:
+    QUARANTINE_RESULTS.clear()
     counts: dict[str, int] = {}
     try:
         completed_turns = completed_turn_index()
-    except (OSError, raw_segments.ManifestError) as exc:
+    except (OSError, raw_segments.ManifestError, turn_resolution.TokenResolutionError) as exc:
         print(
             json.dumps(
-                {"error": "raw_segment_discovery_failed", "detail": str(exc)},
+                {"status": "failed", "error": "raw_segment_discovery_failed", "detail": str(exc)},
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
@@ -369,16 +359,18 @@ def run_reconcile() -> int:
     for path in sorted(STATE_DIR.glob("*.json")):
         result = reconcile_one(path, completed_turns)
         counts[result] = counts.get(result, 0) + 1
-    print(json.dumps({"counts": counts}, ensure_ascii=False, separators=(",", ":")))
+    quarantine = quarantine_health.operation_summary(QUARANTINE_RESULTS)
     if counts.get("write_failed"):
+        print(json.dumps({"status": "failed", "counts": counts, "quarantine": quarantine}, ensure_ascii=False, separators=(",", ":")))
         return 1
-    return 0
+    status = "degraded" if quarantine["unacknowledged_events"] else "healthy"
+    print(json.dumps({"status": status, "counts": counts, "quarantine": quarantine}, ensure_ascii=False, separators=(",", ":")))
+    return 1 if status == "degraded" else 0
 
 
 def main() -> int:
     try:
-        service_paths.assert_migrated(CODEX_HOME)
-        with service_lock.acquire_service_lock(reason="reconcile", codex_home=CODEX_HOME):
+        with service_lock.acquire_service_lock(reason="reconcile", codex_dir=CODEX_DIR):
             return run_reconcile()
     except service_lock.ServiceLockBusy as exc:
         print(
@@ -389,6 +381,15 @@ def main() -> int:
             )
         )
         return 75
+    except quarantine_health.QuarantineError as exc:
+        print(
+            json.dumps(
+                {"status": "failed", "error": "quarantine_record_failed", "message": str(exc)},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+        return 2
 
 
 if __name__ == "__main__":

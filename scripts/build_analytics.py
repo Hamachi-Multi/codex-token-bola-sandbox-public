@@ -4,10 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import bisect
+import contextlib
 import json
 import os
 import pathlib
+import re
 import sqlite3
+import stat
 import sys
 import time
 from datetime import datetime
@@ -24,21 +28,25 @@ import cancel_control
 import progress_control
 import analysis_inputs
 import service_paths
+import build_analytics_context
 from build_analytics_io import file_size, iter_jsonl, iter_jsonl_from_offset, parse_time
 from build_analytics_rows import safe_int, usage
-from build_analytics_schema import ensure_indexes, setup_db
+from build_analytics_schema import ANALYTICS_SCHEMA_VERSION, ensure_indexes, setup_db
 import build_analytics_tool_calls
+import retention_pruned_store
+import turn_resolution
 
-CODEX_HOME = pathlib.Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
-BASE_DIR = service_paths.service_root(CODEX_HOME)
+RUNTIME_PATHS = service_paths.resolve_runtime_paths()
+CODEX_DIR = RUNTIME_PATHS.codex_dir
+BASE_DIR = RUNTIME_PATHS.output_dir
 NORMALIZED_LOG = BASE_DIR / "normalized" / "prompt-usage.normalized.jsonl"
-ANALYTICS_DB = pathlib.Path(os.environ.get("CODEX_TOKEN_USAGE_ANALYTICS_DB", str(BASE_DIR / "analytics" / "token-usage.sqlite"))).expanduser()
-STATE_DB = pathlib.Path(os.environ.get("CODEX_TOKEN_USAGE_STATE_DB", str(CODEX_HOME / "state_5.sqlite"))).expanduser()
-SESSION_INDEX = pathlib.Path(os.environ.get("CODEX_TOKEN_USAGE_SESSION_INDEX", str(CODEX_HOME / "session_index.jsonl"))).expanduser()
+ANALYTICS_DB = pathlib.Path(os.environ.get("BOLA_ANALYTICS_DB", str(BASE_DIR / "analytics" / "bola.sqlite"))).expanduser()
+STATE_DB = pathlib.Path(os.environ.get("BOLA_STATE_DB", str(CODEX_DIR / "state_5.sqlite"))).expanduser()
+SESSION_INDEX = pathlib.Path(os.environ.get("BOLA_SESSION_INDEX", str(CODEX_DIR / "session_index.jsonl"))).expanduser()
 RETENTION_PRUNED_TURNS_FILE = BASE_DIR / "state" / "retention-pruned-turns.json"
 PROJECT_ROOTS = [
     pathlib.Path(value).expanduser()
-    for value in os.environ.get("CODEX_TOKEN_USAGE_PROJECT_ROOTS", "").split(os.pathsep)
+    for value in os.environ.get("BOLA_PROJECT_ROOTS", "").split(os.pathsep)
     if value
 ]
 
@@ -47,6 +55,69 @@ class BuildInputError(RuntimeError):
     def __init__(self, error: str, **payload: Any) -> None:
         super().__init__(error)
         self.payload = {"error": error, **payload}
+
+
+ANALYTICS_TEMP_SIDECARS = ("", "-journal", "-wal", "-shm")
+
+
+def analytics_temp_artifact_pattern(output: pathlib.Path) -> re.Pattern[str]:
+    return re.compile(rf"^\.{re.escape(output.name)}(?:\.\d+){{1,2}}\.tmp(?:-journal|-wal|-shm)?$")
+
+
+def remove_analytics_temp_artifacts(output: pathlib.Path, paths: Iterable[pathlib.Path]) -> list[str]:
+    output = pathlib.Path(output).expanduser()
+    pattern = analytics_temp_artifact_pattern(output)
+    removed: list[str] = []
+    for path in sorted({pathlib.Path(item) for item in paths}, key=lambda item: item.name):
+        if path.parent != output.parent or pattern.fullmatch(path.name) is None:
+            raise BuildInputError("analytics_temp_path_invalid", path=str(path), output=str(output))
+        try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+            raise BuildInputError("analytics_temp_artifact_unsafe", path=str(path), output=str(output))
+        path.unlink()
+        removed.append(str(path))
+    if removed:
+        raw_segments.fsync_dir(output.parent)
+    return removed
+
+
+def sweep_stale_analytics_temp_artifacts(output: pathlib.Path) -> list[str]:
+    output = pathlib.Path(output).expanduser()
+    pattern = analytics_temp_artifact_pattern(output)
+    try:
+        candidates = [path for path in output.parent.iterdir() if pattern.fullmatch(path.name)]
+    except FileNotFoundError:
+        return []
+    return remove_analytics_temp_artifacts(output, candidates)
+
+
+@contextlib.contextmanager
+def full_build_connection(output: pathlib.Path) -> Iterable[sqlite3.Connection]:
+    output = pathlib.Path(output).expanduser()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    sweep_stale_analytics_temp_artifacts(output)
+    tmp_db = output.with_name(f".{output.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    fd = os.open(tmp_db, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(fd)
+    con: sqlite3.Connection | None = None
+    try:
+        con = sqlite3.connect(tmp_db)
+        yield con
+        con.commit()
+        con.close()
+        con = None
+        tmp_db.chmod(0o600)
+        tmp_db.replace(output)
+        output.chmod(0o600)
+        raw_segments.fsync_dir(output.parent)
+    finally:
+        if con is not None:
+            con.close()
+        cleanup_paths = [pathlib.Path(str(tmp_db) + suffix) for suffix in ANALYTICS_TEMP_SIDECARS]
+        remove_analytics_temp_artifacts(output, cleanup_paths)
 
 
 def token_usage_root() -> pathlib.Path:
@@ -67,10 +138,10 @@ def int_env(name: str, default: int) -> int:
         return default
 
 
-NON_CACHED_INPUT_WEIGHT = float_env("CODEX_TOKEN_USAGE_NON_CACHED_INPUT_WEIGHT", 1.0)
-CACHED_INPUT_WEIGHT = float_env("CODEX_TOKEN_USAGE_CACHED_INPUT_WEIGHT", 0.1)
-OUTPUT_WEIGHT = float_env("CODEX_TOKEN_USAGE_OUTPUT_WEIGHT", 6.0)
-TOOL_OUTPUT_PREVIEW_CHARS = int_env("CODEX_TOKEN_USAGE_TOOL_OUTPUT_PREVIEW_CHARS", 0)
+NON_CACHED_INPUT_WEIGHT = float_env("BOLA_NON_CACHED_INPUT_WEIGHT", 1.0)
+CACHED_INPUT_WEIGHT = float_env("BOLA_CACHED_INPUT_WEIGHT", 0.1)
+OUTPUT_WEIGHT = float_env("BOLA_OUTPUT_WEIGHT", 6.0)
+TOOL_OUTPUT_PREVIEW_CHARS = int_env("BOLA_TOOL_OUTPUT_PREVIEW_CHARS", 0)
 
 
 def weighted_credits(non_cached_input: int, cached_input: int, output: int) -> float:
@@ -140,7 +211,11 @@ def upsert_turn_row(
     row: dict[str, Any],
     threads: dict[str, dict[str, Any]],
 ) -> dict[str, Any] | None:
-    u = usage(row)
+    resolution_status = turn_resolution.status_from_row(row)
+    if resolution_status == turn_resolution.PENDING:
+        return None
+    analytics_eligible = 1 if resolution_status == turn_resolution.RESOLVED else 0
+    u = usage(row) if analytics_eligible else usage({})
     session_id = str(row.get("session_id") or "")
     turn_id = str(row.get("turn_id") or "")
     if not session_id or not turn_id:
@@ -157,30 +232,41 @@ def upsert_turn_row(
     thread = threads.get(session_id, {})
     thread_name = str(thread.get("thread_name") or "").strip()
     reasoning_effort = thread.get("reasoning_effort")
+    raw_model = row.get("model")
+    captured_at_unix = parse_time(row.get("captured_at"))
+    started_at_unix = parse_time(row.get("started_at"))
+    if started_at_unix is None:
+        started_at_unix = captured_at_unix
     con.execute(
         """
         insert or replace into turns (
-          session_id, turn_id, captured_at, captured_at_unix, started_at, stopped_at,
-          cwd, project, thread_name, model, reasoning_effort, turn_status, estimated, schema_version, source_priority,
+          session_id, turn_id, captured_at, captured_at_unix, started_at, started_at_unix, stopped_at,
+          cwd, project, thread_name, model, model_from_context, reasoning_effort, turn_status,
+          token_resolution_status, token_resolution_reason, analytics_eligible, estimated, schema_version, source_priority,
           prompt_preview, prompt_sha256, prompt_chars, prompt_lines, code_block_chars,
           assistant_chars, input_tokens, cached_input_tokens, non_cached_input_tokens,
           output_tokens, reasoning_output_tokens, total_tokens, cached_ratio, model_call_count,
           weighted_credits, uncached_input_equivalent, category, workflow, transcript_path
-        ) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             session_id,
             turn_id,
             row.get("captured_at"),
-            parse_time(row.get("captured_at")),
+            captured_at_unix,
             row.get("started_at"),
+            started_at_unix,
             row.get("stopped_at"),
             row.get("cwd"),
             project,
             thread_name,
-            row.get("model") or thread.get("model"),
+            raw_model or thread.get("model"),
+            0 if raw_model else 1,
             reasoning_effort,
             row.get("turn_status"),
+            resolution_status,
+            row.get("token_resolution_reason"),
+            analytics_eligible,
             1 if row.get("estimated") else 0,
             safe_int(row.get("schema_version")),
             safe_int(row.get("_source_priority")),
@@ -197,7 +283,7 @@ def upsert_turn_row(
             u["reasoning_output_tokens"],
             u["total_tokens"],
             cached_ratio,
-            safe_int(row.get("model_call_count")),
+            safe_int(row.get("model_call_count")) if analytics_eligible else 0,
             credits,
             equivalent,
             category,
@@ -208,6 +294,7 @@ def upsert_turn_row(
     return {
         "session_id": session_id,
         "turn_id": turn_id,
+        "analytics_eligible": bool(analytics_eligible),
         "usage": {**u, "weighted_credits": credits},
         "range": {
             "turn_id": turn_id,
@@ -218,29 +305,37 @@ def upsert_turn_row(
     }
 
 
-def turn_rank_values(status: Any, estimated: Any, schema_version: Any = 0, source_priority: Any = 0) -> tuple[int, int, int, int]:
+def turn_rank_values(
+    status: Any,
+    estimated: Any,
+    schema_version: Any = 0,
+    source_priority: Any = 0,
+    token_resolution_status: Any = turn_resolution.RESOLVED,
+) -> tuple[int, int, int, int, int]:
     status_rank = {"completed": 3, "aborted": 2, "incomplete": 1}.get(str(status or ""), 0)
+    resolution_rank = {turn_resolution.RESOLVED: 2, turn_resolution.UNAVAILABLE: 1, turn_resolution.PENDING: 0}.get(str(token_resolution_status or ""), 0)
     estimated_rank = 0 if bool(estimated) else 1
-    return (status_rank, estimated_rank, safe_int(schema_version), safe_int(source_priority))
+    return (resolution_rank, status_rank, estimated_rank, safe_int(schema_version), safe_int(source_priority))
 
 
-def row_turn_rank(row: dict[str, Any]) -> tuple[int, int, int, int]:
+def row_turn_rank(row: dict[str, Any]) -> tuple[int, int, int, int, int]:
     return turn_rank_values(
         row.get("turn_status"),
         row.get("estimated"),
         row.get("schema_version"),
         row.get("_source_priority"),
+        turn_resolution.status_from_row(row),
     )
 
 
-def existing_turn_rank(con: sqlite3.Connection, session_id: str, turn_id: str) -> tuple[int, int, int, int] | None:
+def existing_turn_rank(con: sqlite3.Connection, session_id: str, turn_id: str) -> tuple[int, int, int, int, int] | None:
     existing = con.execute(
-        "select turn_status, estimated, schema_version, source_priority from turns where session_id=? and turn_id=?",
+        "select turn_status, estimated, schema_version, source_priority, token_resolution_status from turns where session_id=? and turn_id=?",
         (session_id, turn_id),
     ).fetchone()
     if existing is None:
         return None
-    return turn_rank_values(existing[0], bool(existing[1]), existing[2], existing[3])
+    return turn_rank_values(existing[0], bool(existing[1]), existing[2], existing[3], existing[4])
 
 
 def should_keep_existing_turn(con: sqlite3.Connection, row: dict[str, Any], session_id: str, turn_id: str) -> bool:
@@ -250,14 +345,33 @@ def should_keep_existing_turn(con: sqlite3.Connection, row: dict[str, Any], sess
     return row_turn_rank(row) < existing_rank
 
 
-def refresh_turn_thread_names(con: sqlite3.Connection, threads: dict[str, dict[str, Any]]) -> None:
-    updates = [
-        (str(thread.get("thread_name") or "").strip(), session_id)
-        for session_id, thread in threads.items()
-        if str(thread.get("thread_name") or "").strip()
-    ]
+def sync_turn_context_fields(
+    con: sqlite3.Connection,
+    threads: dict[str, dict[str, Any]],
+    changed_sessions: set[str],
+) -> None:
+    updates = []
+    for session_id in sorted(changed_sessions):
+        thread = threads.get(session_id, {})
+        updates.append(
+            (
+                str(thread.get("thread_name") or "").strip(),
+                thread.get("reasoning_effort"),
+                thread.get("model"),
+                session_id,
+            )
+        )
     if updates:
-        con.executemany("update turns set thread_name=? where session_id=?", updates)
+        con.executemany(
+            """
+            update turns
+            set thread_name=?,
+                reasoning_effort=?,
+                model=case when model_from_context=1 then ? else model end
+            where session_id=?
+            """,
+            updates,
+        )
 
 
 def tool_output_tokens(row: dict[str, Any]) -> int:
@@ -433,10 +547,20 @@ def replace_tool_call_rollups_from_batches(
         )
 
 
-def load_turn_usage_context(con: sqlite3.Connection) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+def load_turn_usage_context(
+    con: sqlite3.Connection,
+    sessions: set[str] | None = None,
+) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[str, list[dict[str, Any]]]]:
     turn_usage_by_key: dict[tuple[str, str], dict[str, Any]] = {}
     turn_ranges: dict[str, list[dict[str, Any]]] = {}
-    for row in con.execute("select session_id, turn_id, started_at, captured_at, stopped_at, total_tokens, weighted_credits from turns"):
+    sql = "select session_id, turn_id, started_at, captured_at, stopped_at, total_tokens, weighted_credits from turns where analytics_eligible=1"
+    args: list[str] = []
+    if sessions is not None:
+        if not sessions:
+            return turn_usage_by_key, turn_ranges
+        args = sorted(sessions)
+        sql += f" and session_id in ({','.join('?' for _ in args)})"
+    for row in con.execute(sql, args):
         session_id = str(row["session_id"])
         turn_id = str(row["turn_id"])
         turn_usage_by_key[(session_id, turn_id)] = {
@@ -453,44 +577,53 @@ def load_turn_usage_context(con: sqlite3.Connection) -> tuple[dict[tuple[str, st
     return turn_usage_by_key, turn_ranges
 
 
-def read_retention_pruned_turns() -> dict[str, list[dict[str, Any]]]:
-    state_files = [
-        RETENTION_PRUNED_TURNS_FILE,
-        RETENTION_PRUNED_TURNS_FILE.with_name("retention-pruned-turns.pending.json"),
-    ]
-    rows_by_key: dict[tuple[str, str], dict[str, Any]] = {}
-    for path in state_files:
+class PrunedTurnIndex(dict[str, list[dict[str, Any]]]):
+    def __init__(self) -> None:
+        super().__init__()
+        self.turn_keys: set[tuple[str, str]] = set()
+        self.start_times: dict[str, list[float]] = {}
+
+
+def read_retention_pruned_turns(session_ids: Iterable[str] | None = None) -> PrunedTurnIndex:
+    standard_layout = RETENTION_PRUNED_TURNS_FILE.parent.name == "state"
+    base = RETENTION_PRUNED_TURNS_FILE.parent.parent if standard_layout else RETENTION_PRUNED_TURNS_FILE.parent
+    result = PrunedTurnIndex()
+    if standard_layout:
         try:
-            parsed = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        parsed_rows = parsed.get("pruned_turns") if isinstance(parsed, dict) else []
-        if isinstance(parsed_rows, list):
-            for item in parsed_rows:
+            rows = retention_pruned_store.rows_for_sessions(base, session_ids)
+        except retention_pruned_store.RetentionPrunedStoreError as exc:
+            raise BuildInputError("retention_pruned_state_invalid", path=str(retention_pruned_store.database_path(base)), message=str(exc)) from exc
+    else:
+        rows = []
+        for path in (RETENTION_PRUNED_TURNS_FILE, RETENTION_PRUNED_TURNS_FILE.with_name("retention-pruned-turns.pending.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            for item in payload.get("pruned_turns", []) if isinstance(payload, dict) else []:
                 if not isinstance(item, dict):
                     continue
-                session_id = str(item.get("session_id") or "")
-                turn_id = str(item.get("turn_id") or "")
-                if session_id and turn_id:
-                    rows_by_key[(session_id, turn_id)] = item
-    result: dict[str, list[dict[str, Any]]] = {}
-    for row in rows_by_key.values():
+                captured = parse_time(item.get("captured_at")) or safe_float(item.get("captured_at_unix"))
+                rows.append(
+                    {
+                        "session_id": str(item.get("session_id") or ""),
+                        "turn_id": str(item.get("turn_id") or ""),
+                        "start_ts": parse_time(item.get("started_at")) or captured,
+                        "stop_ts": parse_time(item.get("stopped_at")) or captured,
+                    }
+                )
+    for row in rows:
         session_id = str(row.get("session_id") or "")
         turn_id = str(row.get("turn_id") or "")
         if not session_id or not turn_id:
             continue
-        captured_ts = parse_time(row.get("captured_at")) or safe_float(row.get("captured_at_unix"))
-        start_ts = parse_time(row.get("started_at")) or captured_ts
-        stop_ts = parse_time(row.get("stopped_at")) or captured_ts
-        if stop_ts < start_ts:
-            stop_ts = start_ts
-        result.setdefault(session_id, []).append(
-            {
-                "turn_id": turn_id,
-                "start_ts": start_ts,
-                "stop_ts": stop_ts,
-            }
-        )
+        start_ts = safe_float(row.get("start_ts"))
+        stop_ts = max(start_ts, safe_float(row.get("stop_ts")))
+        result.setdefault(session_id, []).append({"turn_id": turn_id, "start_ts": start_ts, "stop_ts": stop_ts})
+        result.turn_keys.add((session_id, turn_id))
+    for session_id, session_rows in result.items():
+        session_rows.sort(key=lambda item: (safe_float(item.get("start_ts")), str(item.get("turn_id") or "")))
+        result.start_times[session_id] = [safe_float(item.get("start_ts")) for item in session_rows]
     return result
 
 
@@ -502,6 +635,8 @@ def safe_float(value: Any, default: float = 0.0) -> float:
 
 
 def pruned_turn_key(pruned_turns: dict[str, list[dict[str, Any]]], session_id: str, turn_id: str) -> bool:
+    if isinstance(pruned_turns, PrunedTurnIndex):
+        return (session_id, turn_id) in pruned_turns.turn_keys
     return any(str(row.get("turn_id") or "") == turn_id for row in pruned_turns.get(session_id, []))
 
 
@@ -509,6 +644,10 @@ def nearest_pruned_parent_turn(pruned_turns: dict[str, list[dict[str, Any]]], se
     candidates = pruned_turns.get(session_id, [])
     if not candidates:
         return None
+    if isinstance(pruned_turns, PrunedTurnIndex):
+        starts = pruned_turns.start_times.get(session_id, [])
+        index = bisect.bisect_right(starts, child_started_ts) - 1
+        return candidates[index] if index >= 0 else candidates[-1]
     before = [row for row in candidates if safe_float(row.get("start_ts")) <= child_started_ts]
     return max(before or candidates, key=lambda item: safe_float(item.get("start_ts")))
 
@@ -539,10 +678,11 @@ def rebuild_task_rollups(
         con.execute("delete from task_rollups")
     else:
         delete_affected_rollups(con, affected_sessions)
-    pruned_turns = read_retention_pruned_turns()
     edge_rows = read_edges() if edges is None else edges
+    pruned_turns = read_retention_pruned_turns(parent for parent, _child, _status in edge_rows)
     edge_total = len(edge_rows)
     child_usage_by_session = child_usage_totals_by_session(turn_usage_by_key)
+    child_started_cache: dict[str, float | None] = {}
     for index, (parent, child, _status) in enumerate(edge_rows, 1):
         if index % 100 == 0:
             cancel_control.check_cancelled("build", f"task-rollups:{index}")
@@ -557,7 +697,7 @@ def rebuild_task_rollups(
         if affected_sessions is not None and parent not in affected_sessions and child not in affected_sessions:
             continue
         child_thread = threads.get(child, {})
-        child_started_ts = child_task_started_ts(child_thread) or (child_thread.get("created_at_ms") or 0) / 1000
+        child_started_ts = child_task_started_ts(child_thread, child_started_cache) or (child_thread.get("created_at_ms") or 0) / 1000
         candidates = turn_ranges.get(parent, [])
         chosen = None
         confidence = "orphan"
@@ -655,9 +795,34 @@ def delete_affected_rollups(con: sqlite3.Connection, sessions: set[str]) -> None
     )
 
 
+def compact_retention_pruned_state() -> dict[str, int]:
+    if not ANALYTICS_DB.exists():
+        return {"required_rows": 0, "deleted_rows": 0}
+    con = sqlite3.connect(f"file:{ANALYTICS_DB}?mode=ro", uri=True)
+    try:
+        required = {
+            (str(session_id), str(turn_id))
+            for session_id, turn_id in con.execute(
+                """
+                select parent_session_id, parent_turn_id
+                from task_rollups
+                where confidence = 'parent_pruned_by_retention'
+                """
+            )
+        }
+    finally:
+        con.close()
+    return retention_pruned_store.mark_required_and_compact(
+        RETENTION_PRUNED_TURNS_FILE.parent.parent,
+        required,
+    )
+
+
 def db_metadata(con: sqlite3.Connection) -> dict[str, Any]:
     return {
         "turn_rows": con.execute("select count(*) from turns").fetchone()[0],
+        "eligible_turn_rows": con.execute("select count(*) from turns where analytics_eligible=1").fetchone()[0],
+        "unavailable_turn_rows": con.execute("select count(*) from turns where token_resolution_status='unavailable'").fetchone()[0],
         "tool_call_rows": con.execute("select coalesce(sum(calls),0) from tool_call_summaries").fetchone()[0],
         "tool_call_summary_rows": con.execute("select count(*) from tool_call_summaries").fetchone()[0],
         "tool_call_sample_rows": con.execute("select count(*) from tool_call_samples").fetchone()[0],
@@ -665,6 +830,7 @@ def db_metadata(con: sqlite3.Connection) -> dict[str, Any]:
         "non_cached_input_weight": NON_CACHED_INPUT_WEIGHT,
         "cached_input_weight": CACHED_INPUT_WEIGHT,
         "output_weight": OUTPUT_WEIGHT,
+        "analytics_schema_version": ANALYTICS_SCHEMA_VERSION,
     }
 
 
@@ -683,6 +849,10 @@ def applied_offset_metadata() -> dict[str, Any]:
 
 def analysis_input_fingerprint() -> str:
     return analysis_inputs.paths_fingerprint([STATE_DB, SESSION_INDEX, RETENTION_PRUNED_TURNS_FILE])
+
+
+def retention_input_fingerprint() -> str:
+    return analysis_inputs.paths_fingerprint([RETENTION_PRUNED_TURNS_FILE])
 
 
 def write_build_work_progress(
@@ -710,7 +880,7 @@ def scan_normalized_build_inputs(path: pathlib.Path, *, offset: int = 0) -> tupl
     for row in iterator or ():
         rows += 1
         transcript_path = str(row.get("transcript_path") or "")
-        if transcript_path:
+        if transcript_path and turn_resolution.analytics_eligible(row):
             transcript_paths.add(transcript_path)
     return rows, transcript_paths
 
@@ -725,7 +895,7 @@ def read_session_index() -> dict[str, str]:
     return names
 
 
-def read_threads() -> dict[str, dict[str, Any]]:
+def read_threads(*, required: bool = False) -> dict[str, dict[str, Any]]:
     thread_names = read_session_index()
     if not STATE_DB.exists():
         return {session_id: {"thread_name": name} for session_id, name in thread_names.items()}
@@ -741,19 +911,23 @@ def read_threads() -> dict[str, dict[str, Any]]:
         for session_id, thread_name in thread_names.items():
             threads.setdefault(session_id, {})["thread_name"] = thread_name
         return threads
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        if required:
+            raise BuildInputError("context_threads_unavailable", path=str(STATE_DB), message=str(exc)) from exc
         return {session_id: {"thread_name": name} for session_id, name in thread_names.items()}
     finally:
         con.close()
 
 
-def read_edges() -> list[tuple[str, str, str]]:
+def read_edges(*, required: bool = False) -> list[tuple[str, str, str]]:
     if not STATE_DB.exists():
         return []
     con = sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True)
     try:
         return [(str(p), str(c), str(s)) for p, c, s in con.execute("select parent_thread_id, child_thread_id, status from thread_spawn_edges")]
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        if required:
+            raise BuildInputError("context_edges_unavailable", path=str(STATE_DB), message=str(exc)) from exc
         return []
     finally:
         con.close()
@@ -771,18 +945,29 @@ def parse_json_object(value: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def child_task_started_ts(thread: dict[str, Any]) -> float | None:
+def child_task_started_ts(thread: dict[str, Any], cache: dict[str, float | None] | None = None) -> float | None:
     path_text = thread.get("rollout_path")
     if not path_text:
         return None
     path = pathlib.Path(str(path_text))
+    cache_key = str(path.resolve(strict=False))
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
     if not path.exists():
+        if cache is not None:
+            cache[cache_key] = None
         return None
+    result: float | None = None
     for item in iter_jsonl(path) or []:
         payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
-        if item.get("type") == "event_msg" and payload.get("msg") == "task_started":
-            return parse_time(item.get("timestamp"))
-    return None
+        if item.get("type") != "event_msg":
+            continue
+        if payload.get("type") == "task_started" or payload.get("msg") == "task_started":
+            result = parse_time(payload.get("started_at")) or parse_time(item.get("timestamp"))
+            break
+    if cache is not None:
+        cache[cache_key] = result
+    return result
 
 
 def spawn_turn_contexts(
@@ -873,7 +1058,7 @@ def configure_paths(args: argparse.Namespace) -> None:
     global NORMALIZED_LOG, STATE_DB, ANALYTICS_DB, SESSION_INDEX, RETENTION_PRUNED_TURNS_FILE, PROJECT_ROOTS
     NORMALIZED_LOG = pathlib.Path(args.normalized_log).expanduser()
     STATE_DB = pathlib.Path(args.state_db).expanduser()
-    SESSION_INDEX = pathlib.Path(os.environ.get("CODEX_TOKEN_USAGE_SESSION_INDEX", str(STATE_DB.parent / "session_index.jsonl"))).expanduser()
+    SESSION_INDEX = pathlib.Path(os.environ.get("BOLA_SESSION_INDEX", str(STATE_DB.parent / "session_index.jsonl"))).expanduser()
     ANALYTICS_DB = pathlib.Path(args.output).expanduser()
     RETENTION_PRUNED_TURNS_FILE = NORMALIZED_LOG.parent.parent / "state" / "retention-pruned-turns.json"
     if args.project_root:
@@ -896,101 +1081,164 @@ def incremental_build(args: argparse.Namespace) -> dict[str, Any] | None:
     try:
         con.execute("select 1 from turns limit 1")
         con.execute("select 1 from run_metadata limit 1")
+        if metadata_value(con, "context_snapshot_version") != build_analytics_context.CONTEXT_SNAPSHOT_VERSION:
+            con.close()
+            return None
+        if metadata_value(con, "analytics_schema_version") != ANALYTICS_SCHEMA_VERSION:
+            con.close()
+            return None
         ensure_indexes(con)
         existing_tables = {str(row[0]) for row in con.execute("select name from sqlite_master where type='table'")}
-        required_tables = {"model_call_summaries", "tool_call_summaries", "tool_call_samples"}
+        required_tables = {
+            "model_call_summaries",
+            "tool_call_summaries",
+            "tool_call_samples",
+            "task_rollups",
+            "source_context_threads",
+            "source_context_edges",
+        }
         if not required_tables.issubset(existing_tables):
             con.close()
             return None
     except sqlite3.Error:
         con.close()
         return None
+    try:
+        started = time.monotonic()
+        threads = read_threads(required=True)
+        edges = read_edges(required=True)
+        previous_threads = build_analytics_context.read_thread_snapshot(con)
+        previous_edges = build_analytics_context.read_edge_snapshot(con)
+        current_threads = build_analytics_context.thread_projection(threads)
+        current_edges = build_analytics_context.edge_projection(edges)
+        changed_context_threads = build_analytics_context.changed_keys(previous_threads, current_threads)
+        changed_context_edges = build_analytics_context.changed_keys(previous_edges, current_edges)
+        current_retention_fingerprint = retention_input_fingerprint()
+        retention_changed = metadata_value(con, "applied_retention_fingerprint") != current_retention_fingerprint
+        context_seed_sessions = changed_context_threads | build_analytics_context.edge_change_sessions(
+            previous_edges,
+            current_edges,
+        )
+        sync_turn_context_fields(con, threads, changed_context_threads)
 
-    started = time.monotonic()
-    threads = read_threads()
-    refresh_turn_thread_names(con, threads)
-    edges = read_edges()
-    turn_row_count, _planned_transcript_paths = scan_normalized_build_inputs(NORMALIZED_LOG, offset=max(0, args.turns_offset))
-    total_units = max(1, len(threads) + turn_row_count + turn_row_count + len(edges) + 2)
-    write_build_work_progress("start-incremental", 0, total_units)
-    changed_turns: set[tuple[str, str]] = set()
-    changed_tool_turns: set[tuple[str, str]] = set()
-    changed_transcripts: dict[str, dict[str, set[str]]] = {}
+        turn_row_count, _planned_transcript_paths = scan_normalized_build_inputs(
+            NORMALIZED_LOG,
+            offset=max(0, args.turns_offset),
+        )
+        total_units = max(1, len(changed_context_threads) + turn_row_count * 2 + len(edges) + 2)
+        write_build_work_progress("start-incremental", 0, total_units)
+        changed_turns: set[tuple[str, str]] = set()
+        changed_tool_turns: set[tuple[str, str]] = set()
+        changed_transcripts: dict[str, dict[str, set[str]]] = {}
 
-    for index, row in enumerate(iter_jsonl_from_offset(NORMALIZED_LOG, max(0, args.turns_offset)) or (), 1):
-        if index % 100 == 0 or index == turn_row_count:
-            cancel_control.check_cancelled("build", f"turns:{index}")
-            write_build_work_progress(
-                checkpoint=f"turns:{index}",
-                done_units=len(threads) + index,
-                total_units=total_units,
-                processed=index,
-                total=turn_row_count,
-            )
-        info = upsert_turn_row(con, row, threads)
-        if info is None:
-            continue
-        key = (info["session_id"], info["turn_id"])
-        changed_turns.add(key)
-        path = info["transcript_path"]
-        changed_tool_turns.add(key)
-        if path:
-            changed_transcripts.setdefault(path, {}).setdefault(info["session_id"], set()).add(info["turn_id"])
+        for index, row in enumerate(iter_jsonl_from_offset(NORMALIZED_LOG, max(0, args.turns_offset)) or (), 1):
+            if index % 100 == 0 or index == turn_row_count:
+                cancel_control.check_cancelled("build", f"turns:{index}")
+                write_build_work_progress(
+                    checkpoint=f"turns:{index}",
+                    done_units=len(changed_context_threads) + index,
+                    total_units=total_units,
+                    processed=index,
+                    total=turn_row_count,
+                )
+            info = upsert_turn_row(con, row, threads)
+            if info is None:
+                continue
+            key = (info["session_id"], info["turn_id"])
+            changed_turns.add(key)
+            changed_tool_turns.add(key)
+            path = info["transcript_path"]
+            if path and info["analytics_eligible"]:
+                changed_transcripts.setdefault(path, {}).setdefault(info["session_id"], set()).add(info["turn_id"])
 
-    transcript_items = list(changed_transcripts.items())
-    tool_start_units = len(threads) + turn_row_count
+        transcript_items = list(changed_transcripts.items())
+        tool_start_units = len(changed_context_threads) + turn_row_count
 
-    def changed_tool_call_batches() -> Iterable[list[dict[str, Any]]]:
-        for path_index, (path, turns_by_session) in enumerate(transcript_items, 1):
-            cancel_control.check_cancelled("build", f"tool-extract:{pathlib.Path(path).name}")
-            write_build_work_progress(
-                checkpoint=f"tool-extract:{pathlib.Path(path).name}",
-                done_units=tool_start_units + path_index,
-                total_units=total_units,
-                processed=path_index,
-                total=len(transcript_items),
-            )
-            yield extract_tool_calls({path}, turns_by_session)
+        def changed_tool_call_batches() -> Iterable[list[dict[str, Any]]]:
+            for path_index, (path, turns_by_session) in enumerate(transcript_items, 1):
+                cancel_control.check_cancelled("build", f"tool-extract:{pathlib.Path(path).name}")
+                write_build_work_progress(
+                    checkpoint=f"tool-extract:{pathlib.Path(path).name}",
+                    done_units=tool_start_units + path_index,
+                    total_units=total_units,
+                    processed=path_index,
+                    total=len(transcript_items),
+                )
+                yield extract_tool_calls({path}, turns_by_session)
 
-    replace_tool_call_rollups_from_batches(con, changed_tool_call_batches(), changed_tool_turns)
+        replace_tool_call_rollups_from_batches(con, changed_tool_call_batches(), changed_tool_turns)
 
-    turn_usage_by_key, turn_ranges = load_turn_usage_context(con)
-    affected_sessions = affected_rollup_sessions(changed_turns)
-    spawn_threads = spawn_context_threads_for_affected_sessions(threads, affected_sessions)
-    spawn_contexts = spawn_turn_contexts(
-        spawn_threads,
-        progress_start_units=tool_start_units + len(transcript_items),
-        progress_total_units=total_units,
-    )
-    rebuild_task_rollups(
-        con,
-        threads,
-        spawn_contexts,
-        turn_usage_by_key,
-        turn_ranges,
-        affected_sessions,
-        edges=edges,
-        progress_start_units=tool_start_units + len(transcript_items) + len(spawn_threads),
-        progress_total_units=total_units,
-    )
-    metadata = db_metadata(con)
-    metadata.update(
-        {
-            "analysis_mode": "incremental",
-            "new_turn_rows": len({key for key in changed_turns}),
-            "processed_turn_log_rows": turn_row_count,
-            "elapsed_ms": round((time.monotonic() - started) * 1000),
-            "normalized_turns_offset": args.turns_offset,
-            **applied_offset_metadata(),
+        seed_sessions = context_seed_sessions | {session_id for session_id, _turn_id in changed_turns}
+        edge_union = {
+            *build_analytics_context.edge_rows(previous_edges),
+            *build_analytics_context.edge_rows(current_edges),
         }
-    )
-    write_metadata(con, metadata)
-    cancel_control.check_cancelled("build", "commit-incremental")
-    write_build_work_progress("commit-incremental", total_units - 1, total_units)
-    con.commit()
-    con.close()
-    ANALYTICS_DB.chmod(0o600)
-    return {"output": str(ANALYTICS_DB), **metadata}
+        if retention_changed:
+            seed_sessions.update(
+                session_id
+                for parent, child, _status in edge_union
+                for session_id in (parent, child)
+            )
+        affected_sessions = build_analytics_context.expand_sessions(seed_sessions, edge_union)
+        if affected_sessions:
+            turn_usage_by_key, turn_ranges = load_turn_usage_context(con, affected_sessions)
+            spawn_threads = spawn_context_threads_for_affected_sessions(threads, affected_sessions)
+            spawn_contexts = spawn_turn_contexts(
+                spawn_threads,
+                progress_start_units=tool_start_units + len(transcript_items),
+                progress_total_units=total_units,
+            )
+            affected_edges = [
+                edge for edge in edges if edge[0] in affected_sessions or edge[1] in affected_sessions
+            ]
+            rebuild_task_rollups(
+                con,
+                threads,
+                spawn_contexts,
+                turn_usage_by_key,
+                turn_ranges,
+                affected_sessions,
+                edges=affected_edges,
+                progress_start_units=tool_start_units + len(transcript_items) + len(spawn_threads),
+                progress_total_units=total_units,
+            )
+
+        build_analytics_context.apply_snapshot_changes(
+            con,
+            previous_threads,
+            current_threads,
+            previous_edges,
+            current_edges,
+        )
+        metadata = db_metadata(con)
+        metadata.update(
+            {
+                "analysis_mode": "incremental",
+                "new_turn_rows": len(changed_turns),
+                "processed_turn_log_rows": turn_row_count,
+                "elapsed_ms": round((time.monotonic() - started) * 1000),
+                "normalized_turns_offset": args.turns_offset,
+                "context_snapshot_version": build_analytics_context.CONTEXT_SNAPSHOT_VERSION,
+                "context_changed_threads": len(changed_context_threads),
+                "context_changed_edges": len(changed_context_edges),
+                "context_affected_sessions": len(affected_sessions),
+                "retention_context_changed": retention_changed,
+                "applied_retention_fingerprint": current_retention_fingerprint,
+                **applied_offset_metadata(),
+            }
+        )
+        write_metadata(con, metadata)
+        cancel_control.check_cancelled("build", "commit-incremental")
+        write_build_work_progress("commit-incremental", total_units - 1, total_units)
+        con.commit()
+        ANALYTICS_DB.chmod(0o600)
+        metadata["retention_pruned_state"] = compact_retention_pruned_state()
+        return {"output": str(ANALYTICS_DB), **metadata}
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
 
 
 def build(output: pathlib.Path | None = None) -> dict[str, Any]:
@@ -1002,85 +1250,91 @@ def build(output: pathlib.Path | None = None) -> dict[str, Any]:
     raw_segments.reconcile_apply_marker(raw_root)
     raw_segments.reconcile_pending_rotation(raw_root)
     turn_row_count, planned_transcript_paths = scan_normalized_build_inputs(NORMALIZED_LOG)
-    threads = read_threads()
-    edges = read_edges()
+    threads = read_threads(required=True)
+    edges = read_edges(required=True)
     total_units = max(1, len(threads) + turn_row_count + len(planned_transcript_paths) + len(edges) + 2)
     write_build_work_progress("start-full", 0, total_units)
     spawn_contexts = spawn_turn_contexts(threads, progress_start_units=0, progress_total_units=total_units)
 
-    ANALYTICS_DB.parent.mkdir(parents=True, exist_ok=True)
-    tmp_db = ANALYTICS_DB.with_name(f".{ANALYTICS_DB.name}.{os.getpid()}.{time.time_ns()}.tmp")
-    if tmp_db.exists():
-        tmp_db.unlink()
-    fd = os.open(tmp_db, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
-    os.close(fd)
-    con = sqlite3.connect(tmp_db)
-    setup_db(con)
+    with full_build_connection(ANALYTICS_DB) as con:
+        setup_db(con)
 
-    turn_usage_by_key: dict[tuple[str, str], dict[str, Any]] = {}
-    turn_ranges: dict[str, list[dict[str, Any]]] = {}
-    transcript_paths: set[str] = set()
-    turn_ids_by_session: dict[str, set[str]] = {}
+        turn_usage_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        turn_ranges: dict[str, list[dict[str, Any]]] = {}
+        transcript_paths: set[str] = set()
+        turn_ids_by_session: dict[str, set[str]] = {}
 
-    for index, row in enumerate(iter_jsonl(NORMALIZED_LOG) or (), 1):
-        if index % 100 == 0 or index == turn_row_count:
-            cancel_control.check_cancelled("build", f"turns:{index}")
-            write_build_work_progress(
-                checkpoint=f"turns:{index}",
-                done_units=len(threads) + index,
-                total_units=total_units,
-                processed=index,
-                total=turn_row_count,
-            )
-        info = upsert_turn_row(con, row, threads)
-        if info is None:
-            continue
-        session_id = info["session_id"]
-        turn_id = info["turn_id"]
-        turn_usage_by_key[(session_id, turn_id)] = info["usage"]
-        turn_ranges.setdefault(session_id, []).append(info["range"])
-        turn_ids_by_session.setdefault(session_id, set()).add(turn_id)
-        if info["transcript_path"]:
-            transcript_paths.add(info["transcript_path"])
+        for index, row in enumerate(iter_jsonl(NORMALIZED_LOG) or (), 1):
+            if index % 100 == 0 or index == turn_row_count:
+                cancel_control.check_cancelled("build", f"turns:{index}")
+                write_build_work_progress(
+                    checkpoint=f"turns:{index}",
+                    done_units=len(threads) + index,
+                    total_units=total_units,
+                    processed=index,
+                    total=turn_row_count,
+                )
+            info = upsert_turn_row(con, row, threads)
+            if info is None:
+                continue
+            session_id = info["session_id"]
+            turn_id = info["turn_id"]
+            if not info["analytics_eligible"]:
+                continue
+            turn_usage_by_key[(session_id, turn_id)] = info["usage"]
+            turn_ranges.setdefault(session_id, []).append(info["range"])
+            turn_ids_by_session.setdefault(session_id, set()).add(turn_id)
+            if info["transcript_path"]:
+                transcript_paths.add(info["transcript_path"])
 
-    tool_start_units = len(threads) + turn_row_count
-    transcript_list = sorted(transcript_paths)
+        tool_start_units = len(threads) + turn_row_count
+        transcript_list = sorted(transcript_paths)
 
-    def tool_call_batches() -> Iterable[list[dict[str, Any]]]:
-        for path_index, path in enumerate(transcript_list, 1):
-            write_build_work_progress(
-                f"tool-extract:{pathlib.Path(path).name}",
-                tool_start_units + path_index,
-                total_units,
-                processed=path_index,
-                total=len(transcript_list),
-            )
-            yield extract_tool_calls({path}, turn_ids_by_session)
+        def tool_call_batches() -> Iterable[list[dict[str, Any]]]:
+            for path_index, path in enumerate(transcript_list, 1):
+                write_build_work_progress(
+                    f"tool-extract:{pathlib.Path(path).name}",
+                    tool_start_units + path_index,
+                    total_units,
+                    processed=path_index,
+                    total=len(transcript_list),
+                )
+                yield extract_tool_calls({path}, turn_ids_by_session)
 
-    replace_tool_call_rollups_from_batches(con, tool_call_batches())
+        replace_tool_call_rollups_from_batches(con, tool_call_batches())
 
-    task_start_units = tool_start_units + len(transcript_list)
-    rebuild_task_rollups(
-        con,
-        threads,
-        spawn_contexts,
-        turn_usage_by_key,
-        turn_ranges,
-        edges=edges,
-        progress_start_units=task_start_units,
-        progress_total_units=total_units,
-    )
+        task_start_units = tool_start_units + len(transcript_list)
+        rebuild_task_rollups(
+            con,
+            threads,
+            spawn_contexts,
+            turn_usage_by_key,
+            turn_ranges,
+            edges=edges,
+            progress_start_units=task_start_units,
+            progress_total_units=total_units,
+        )
 
-    metadata = db_metadata(con)
-    metadata.update({"analysis_mode": "full", "new_turn_rows": turn_row_count, **applied_offset_metadata()})
-    write_metadata(con, metadata)
-    cancel_control.check_cancelled("build", "publish-full")
-    write_build_work_progress("publish-full", total_units - 1, total_units)
-    con.commit()
-    con.close()
-    tmp_db.chmod(0o600)
-    tmp_db.replace(ANALYTICS_DB)
-    ANALYTICS_DB.chmod(0o600)
+        build_analytics_context.replace_snapshot(
+            con,
+            build_analytics_context.thread_projection(threads),
+            build_analytics_context.edge_projection(edges),
+        )
+
+        metadata = db_metadata(con)
+        metadata.update(
+            {
+                "analysis_mode": "full",
+                "new_turn_rows": turn_row_count,
+                "context_snapshot_version": build_analytics_context.CONTEXT_SNAPSHOT_VERSION,
+                "applied_retention_fingerprint": retention_input_fingerprint(),
+                **applied_offset_metadata(),
+            }
+        )
+        write_metadata(con, metadata)
+        cancel_control.check_cancelled("build", "publish-full")
+        write_build_work_progress("publish-full", total_units - 1, total_units)
+    metadata["retention_pruned_state"] = compact_retention_pruned_state()
     return {"output": str(ANALYTICS_DB), **metadata}
 
 
@@ -1088,7 +1342,6 @@ def main() -> int:
     args = parse_args()
     configure_paths(args)
     try:
-        service_paths.assert_migrated(CODEX_HOME)
         with service_lock.acquire_service_lock(reason="build"):
             if args.incremental:
                 result = incremental_build(args)

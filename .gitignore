@@ -1,0 +1,29 @@
+__pycache__/
+*.pyc
+*.bak.*
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+build/
+dist/
+*.egg-info/
+node_modules/
+
+# Local Codex usage data
+analytics/
+bad/
+normalized/
+raw/
+reports/
+state/
+tmp/
+reviews/tmp/
+/handoffs/
+*.jsonl
+*.sqlite
+*.sqlite-*
+
+# Local browser verification artifacts
+*.png
+*.log

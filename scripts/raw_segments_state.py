@@ -10,8 +10,11 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+import raw_segment_markers
+
 from raw_segments_common import (
     PROMPT_RAW_NAME,
+    PROMPT_TIME_BASIS,
     ManifestError,
     acquire_raw_segment_manifest_lock,
     current_pointer_path,
@@ -124,9 +127,14 @@ def validate_current_pointer_entries(base: pathlib.Path) -> list[dict[str, Any]]
     return entries
 
 
-def write_pending_rotation(base: pathlib.Path, marker: dict[str, Any]) -> None:
+def write_pending_rotation(base: pathlib.Path, marker: raw_segment_markers.RotationMarker | dict[str, Any]) -> None:
     path = pending_rotation_path(base)
-    payload = dict(marker)
+    try:
+        source = marker.to_payload() if isinstance(marker, (raw_segment_markers.SingleRotationMarker, raw_segment_markers.BatchRotationMarker)) else marker
+        typed = raw_segment_markers.parse_rotation_marker(source)
+    except raw_segment_markers.MarkerValidationError as exc:
+        raise ManifestError(str(exc)) from exc
+    payload = typed.to_payload()
     payload["schema_version"] = 1
     payload["base"] = str(pathlib.Path(base).expanduser().resolve())
     write_json_atomic(path, payload)
@@ -144,7 +152,21 @@ def read_pending_rotation(base: pathlib.Path) -> dict[str, Any] | None:
         raise ManifestError(f"unsupported pending raw segment rotation marker schema: {path}")
     if parsed.get("base", str(pathlib.Path(base).expanduser().resolve())) != str(pathlib.Path(base).expanduser().resolve()):
         raise ManifestError(f"pending raw segment rotation marker base mismatch: {path}")
+    try:
+        raw_segment_markers.parse_rotation_marker(parsed)
+    except raw_segment_markers.MarkerValidationError as exc:
+        raise ManifestError(str(exc)) from exc
     return parsed
+
+
+def load_pending_rotation(base: pathlib.Path) -> raw_segment_markers.RotationMarker | None:
+    payload = read_pending_rotation(base)
+    if payload is None:
+        return None
+    try:
+        return raw_segment_markers.parse_rotation_marker(payload)
+    except raw_segment_markers.MarkerValidationError as exc:
+        raise ManifestError(str(exc)) from exc
 
 
 def clear_pending_rotation(base: pathlib.Path) -> None:
@@ -234,11 +256,35 @@ def current_segment_paths(base: pathlib.Path, *, kind: str) -> list[pathlib.Path
     return [pathlib.Path(str(segment["path"]))]
 
 
+def _validate_apply_marker_payload(base: pathlib.Path, parsed: dict[str, Any], path: pathlib.Path) -> None:
+    if parsed.get("schema_version", 1) != 1:
+        raise ManifestError(f"unsupported pending raw segment apply marker schema: {path}")
+    if parsed.get("base", str(pathlib.Path(base).expanduser().resolve())) != str(pathlib.Path(base).expanduser().resolve()):
+        raise ManifestError(f"pending raw segment apply marker base mismatch: {path}")
+    try:
+        raw_segment_markers.apply_marker_status(parsed)
+    except raw_segment_markers.MarkerValidationError as exc:
+        raise ManifestError(str(exc)) from exc
+    for key in ("previous_manifest", "next_manifest", "source_segments", "retained_segments"):
+        if key not in parsed:
+            raise ManifestError(f"pending raw segment apply marker missing {key}")
+    for key in ("previous_manifest", "next_manifest"):
+        if not isinstance(parsed[key], dict):
+            raise ManifestError(f"pending raw segment apply marker {key} must be an object")
+    for key in ("source_segments", "retained_segments"):
+        if not isinstance(parsed[key], list) or any(not isinstance(item, dict) for item in parsed[key]):
+            raise ManifestError(f"pending raw segment apply marker {key} must be a list")
+    for key in ("retained_staging_paths", "unlink_pending_segments", "unlink_errors"):
+        if key in parsed and not isinstance(parsed[key], list):
+            raise ManifestError(f"pending raw segment apply marker {key} must be a list")
+
+
 def write_apply_marker(base: pathlib.Path, marker: dict[str, Any]) -> None:
     path = segment_apply_marker_path(base)
     payload = dict(marker)
     payload["schema_version"] = 1
     payload["base"] = str(pathlib.Path(base).expanduser().resolve())
+    _validate_apply_marker_payload(base, payload, path)
     write_json_atomic(path, payload)
 
 
@@ -250,16 +296,17 @@ def read_apply_marker(base: pathlib.Path) -> dict[str, Any] | None:
         return None
     except (OSError, json.JSONDecodeError) as exc:
         raise ManifestError(f"cannot read pending raw segment apply marker: {path}") from exc
-    if not isinstance(parsed, dict) or parsed.get("schema_version", 1) != 1:
+    if not isinstance(parsed, dict):
         raise ManifestError(f"unsupported pending raw segment apply marker schema: {path}")
-    if parsed.get("base", str(pathlib.Path(base).expanduser().resolve())) != str(pathlib.Path(base).expanduser().resolve()):
-        raise ManifestError(f"pending raw segment apply marker base mismatch: {path}")
-    if parsed.get("phase") not in {"manifest_pending", "unlink_pending"}:
-        raise ManifestError(f"unsupported pending raw segment apply phase: {parsed.get('phase')}")
-    for key in ("previous_manifest", "next_manifest", "source_segments", "retained_segments"):
-        if key not in parsed:
-            raise ManifestError(f"pending raw segment apply marker missing {key}")
+    _validate_apply_marker_payload(base, parsed, path)
     return parsed
+
+
+def read_apply_status(base: pathlib.Path) -> raw_segment_markers.ApplyMarkerStatus:
+    try:
+        return raw_segment_markers.apply_marker_status(read_apply_marker(base))
+    except raw_segment_markers.MarkerValidationError as exc:
+        raise ManifestError(str(exc)) from exc
 
 
 def clear_apply_marker(base: pathlib.Path) -> None:
@@ -536,6 +583,8 @@ def validate_retention_segment_metadata(segment: dict[str, Any]) -> None:
         raise ManifestError(f"raw segment status must be closed: {segment.get('path')}")
     if segment.get("format") not in {"jsonl", "jsonl.gz"}:
         raise ManifestError(f"raw segment format invalid: {segment.get('path')}")
+    if segment.get("time_basis") not in {None, PROMPT_TIME_BASIS}:
+        raise ManifestError(f"raw segment time basis invalid: {segment.get('path')}")
     rows = require_segment_int(segment, "rows")
     undated_rows = require_segment_int(segment, "undated_rows")
     corrupt_rows = require_segment_int(segment, "corrupt_rows")

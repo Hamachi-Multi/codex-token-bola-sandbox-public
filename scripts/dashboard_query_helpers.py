@@ -15,9 +15,9 @@ SUBAGENT_CONFIDENCE_ORDER = (
 )
 
 TURN_SORT_COLUMNS = {
-    "date": "captured_at_unix",
-    "time": "captured_at_unix",
-    "clock": "coalesce(substr(captured_at, 12, 8),'')",
+    "date": "started_at_unix",
+    "time": "started_at_unix",
+    "clock": "coalesce(substr(started_at, 12, 8), substr(captured_at, 12, 8), '')",
     "project": "coalesce(project,'') collate nocase",
     "session": (
         "coalesce(nullif(thread_name,''), "
@@ -56,6 +56,7 @@ def int_query(query, key: str, default: int, minimum: int, maximum: int) -> int:
 def empty_summary() -> dict[str, Any]:
     return {
         "turns": 0,
+        "unavailable_turns": 0,
         "total_tokens": 0,
         "input_tokens": 0,
         "cached_input_tokens": 0,
@@ -74,7 +75,7 @@ def empty_turns_payload(query) -> dict[str, Any]:
     return {
         "rows": [],
         "total": 0,
-        "page": 1 if focused else int_query(query, "page", 1, 1, 100000),
+        "page": 1,
         "per_page": int_query(query, "per_page", 25, 1, 100),
         "focused": focused,
     }

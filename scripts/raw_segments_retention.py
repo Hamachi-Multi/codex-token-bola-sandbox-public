@@ -9,11 +9,16 @@ import json
 import os
 import pathlib
 import time
+from collections.abc import Callable
+from enum import Enum
 from typing import Any
 
 from raw_segments_common import (
+    JsonlScanAccumulator,
     ManifestError,
+    PROMPT_TIME_BASIS,
     acquire_raw_segment_manifest_lock,
+    open_segment_payload,
     read_segment_payload,
     row_time,
     scan_jsonl_bytes,
@@ -23,6 +28,7 @@ from raw_segments_state import (
     format_for_path,
     is_utc_day_start,
     manifest_segments_match,
+    read_apply_marker,
     retained_staging_path,
     source_name_for_kind,
     strict_read_current_pointer,
@@ -33,14 +39,59 @@ from raw_segments_state import (
     validate_retention_manifest_segments,
     validate_retention_segment_days,
     validate_retention_segment_metadata,
+    validate_retained_staging_path,
     validate_segment_path,
     verify_retained_segments_for_marker,
     write_apply_marker,
     write_manifest,
 )
 
+
+class SegmentApplyState(str, Enum):
+    NOT_STARTED = "not_started"
+    RECOVERY_PENDING = "recovery_pending"
+    LOGICAL_DELETE_COMMITTED = "logical_delete_committed"
+    UNKNOWN = "unknown"
+
+
+def inspect_segment_apply_state(base: pathlib.Path, segment_plan: dict[str, Any]) -> SegmentApplyState:
+    previous_manifest = segment_plan.get("previous_manifest")
+    next_manifest = segment_plan.get("next_manifest")
+    if not isinstance(previous_manifest, dict) or not isinstance(next_manifest, dict):
+        return SegmentApplyState.UNKNOWN
+    try:
+        current_manifest = strict_read_manifest(base)
+        marker = read_apply_marker(base)
+    except (OSError, ManifestError):
+        return SegmentApplyState.UNKNOWN
+    if marker is not None:
+        marker_previous = marker.get("previous_manifest")
+        marker_next = marker.get("next_manifest")
+        if (
+            not isinstance(marker_previous, dict)
+            or not isinstance(marker_next, dict)
+            or not manifest_segments_match(marker_previous, previous_manifest)
+            or not manifest_segments_match(marker_next, next_manifest)
+            or marker.get("source_segments") != segment_plan.get("source_segments")
+            or marker.get("retained_segments") != segment_plan.get("retained_segments")
+        ):
+            return SegmentApplyState.UNKNOWN
+        if not (
+            manifest_segments_match(current_manifest, previous_manifest)
+            or manifest_segments_match(current_manifest, next_manifest)
+        ):
+            return SegmentApplyState.UNKNOWN
+        return SegmentApplyState.RECOVERY_PENDING
+    if manifest_segments_match(current_manifest, previous_manifest):
+        return SegmentApplyState.NOT_STARTED
+    if manifest_segments_match(current_manifest, next_manifest):
+        return SegmentApplyState.LOGICAL_DELETE_COMMITTED
+    return SegmentApplyState.UNKNOWN
+
 def classify_segment_for_cutoff(segment: dict[str, Any], cutoff_unix: float) -> str:
     validate_retention_segment_metadata(segment)
+    if segment.get("time_basis") != PROMPT_TIME_BASIS:
+        return "rewrite_mixed"
     min_time = segment.get("min_time_unix")
     max_time = segment.get("max_time_unix")
     undated_rows = int(segment["undated_rows"])
@@ -101,6 +152,8 @@ def verify_segment_payload(base: pathlib.Path, segment: dict[str, Any]) -> tuple
     for key in ("rows", "undated_rows", "corrupt_rows", "unknown_rows"):
         if int(scan[key]) != int(segment.get(key) or 0):
             raise ManifestError(f"raw segment {key} mismatch: {path}")
+    if segment.get("time_basis") != PROMPT_TIME_BASIS:
+        return path, payload, scan
     for key in ("min_time_unix", "max_time_unix"):
         expected = segment.get(key)
         actual = scan.get(key)
@@ -110,6 +163,47 @@ def verify_segment_payload(base: pathlib.Path, segment: dict[str, Any]) -> tuple
         elif abs(float(expected) - float(actual)) > 0.001:
             raise ManifestError(f"raw segment {key} mismatch: {path}")
     return path, payload, scan
+
+
+def segment_source_signature(path: pathlib.Path) -> dict[str, int]:
+    stat_result = path.stat()
+    return {
+        "device": int(stat_result.st_dev),
+        "inode": int(stat_result.st_ino),
+        "size": int(stat_result.st_size),
+        "mtime_ns": int(stat_result.st_mtime_ns),
+    }
+
+
+def verify_segment_source_signature(path: pathlib.Path, signature: dict[str, Any]) -> None:
+    if segment_source_signature(path) != {key: int(signature.get(key) or 0) for key in ("device", "inode", "size", "mtime_ns")}:
+        raise ManifestError(f"raw segment changed after retention planning: {path}")
+
+
+def sha256_path(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_segment_scan(path: pathlib.Path, segment: dict[str, Any], scan: dict[str, Any], payload_sha256: str) -> None:
+    if payload_sha256 != segment.get("sha256"):
+        raise ManifestError(f"raw segment checksum mismatch: {path}")
+    for key in ("rows", "undated_rows", "corrupt_rows", "unknown_rows"):
+        if int(scan[key]) != int(segment.get(key) or 0):
+            raise ManifestError(f"raw segment {key} mismatch: {path}")
+    if segment.get("time_basis") != PROMPT_TIME_BASIS:
+        return
+    for key in ("min_time_unix", "max_time_unix"):
+        expected = segment.get(key)
+        actual = scan.get(key)
+        if expected is None or actual is None:
+            if expected is not None or actual is not None:
+                raise ManifestError(f"raw segment {key} mismatch: {path}")
+        elif abs(float(expected) - float(actual)) > 0.001:
+            raise ManifestError(f"raw segment {key} mismatch: {path}")
 
 
 def planned_turn_from_row(row: dict[str, Any], row_time_value: float | None) -> dict[str, Any] | None:
@@ -146,6 +240,7 @@ def segment_from_payload(path: pathlib.Path, *, kind: str, payload: bytes, segme
         "path": str(path),
         "format": format_for_path(path),
         "source_name": source_name_for_kind(kind),
+        "time_basis": PROMPT_TIME_BASIS,
         "min_time_unix": scan["min_time_unix"],
         "max_time_unix": scan["max_time_unix"],
         "rows": scan["rows"],
@@ -179,47 +274,126 @@ def retained_payload_for_cutoff(payload: bytes, *, kind: str, cutoff_unix: float
     return b"".join(retained_lines)
 
 
+def segment_from_scan(
+    path: pathlib.Path,
+    *,
+    kind: str,
+    scan: dict[str, Any],
+    uncompressed_bytes: int,
+    payload_sha256: str,
+) -> dict[str, Any]:
+    return {
+        "id": path.name.removesuffix(".jsonl.gz").removesuffix(".jsonl"),
+        "kind": kind,
+        "path": str(path),
+        "format": format_for_path(path),
+        "source_name": source_name_for_kind(kind),
+        "time_basis": PROMPT_TIME_BASIS,
+        "min_time_unix": scan["min_time_unix"],
+        "max_time_unix": scan["max_time_unix"],
+        "rows": scan["rows"],
+        "undated_rows": scan["undated_rows"],
+        "corrupt_rows": scan["corrupt_rows"],
+        "unknown_rows": scan["unknown_rows"],
+        "days": scan["days"],
+        "bytes": 0,
+        "uncompressed_bytes": uncompressed_bytes,
+        "sha256": payload_sha256,
+        "status": "closed",
+    }
+
+
 def plan_segment_for_cutoff(
     base: pathlib.Path,
     segment: dict[str, Any],
     cutoff_unix: float,
     *,
     create_output_dirs: bool = True,
+    pruned_turn_sink: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any] | None:
     validate_retention_segment_metadata(segment)
-    source_path, payload, scan = verify_segment_payload(base, segment)
+    source_path = validate_segment_path(base, segment)
+    source_signature = segment_source_signature(source_path)
     kind = str(segment.get("kind") or "")
+    archive_dir = pathlib.Path(base).expanduser() / "raw" / "archive"
+    if create_output_dirs:
+        archive_dir.mkdir(parents=True, exist_ok=True)
+    temporary = archive_dir / f".retention-plan.{os.getpid()}.{time.time_ns()}.jsonl.gz.tmp"
+    source_digest = hashlib.sha256()
+    retained_digest = hashlib.sha256()
+    source_scan = JsonlScanAccumulator(kind=kind)
+    retained_scan = JsonlScanAccumulator(kind=kind)
     retained_line_count = 0
     deleted_turns: list[dict[str, Any]] = []
     deleted_rows = 0
     deleted_bytes = 0
     scanned_rows = 0
-    for raw_line in payload.splitlines():
-        line = raw_line + b"\n"
-        try:
-            parsed = json.loads(raw_line.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            retained_line_count += 1
-            continue
-        if not isinstance(parsed, dict):
-            retained_line_count += 1
-            continue
-        scanned_rows += 1
-        parsed_time = row_time(parsed, kind=kind)
-        if parsed_time is not None and float(parsed_time) < float(cutoff_unix):
-            deleted_rows += 1
-            deleted_bytes += len(line)
-            if kind == "prompt_usage":
-                pruned = planned_turn_from_row(parsed, parsed_time)
-            if pruned is not None:
-                deleted_turns.append(pruned)
-            continue
-        retained_line_count += 1
+    retained_uncompressed_bytes = 0
+    raw_target = None
+    gzip_target = None
+    try:
+        if create_output_dirs:
+            raw_target = temporary.open("xb")
+            gzip_target = gzip.GzipFile(fileobj=raw_target, mode="wb")
+        with open_segment_payload(source_path) as source:
+            for line in source:
+                source_digest.update(line)
+                source_scan.add(line)
+                raw_line = line.rstrip(b"\r\n")
+                try:
+                    parsed = json.loads(raw_line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    output_line = raw_line + b"\n"
+                    retained_line_count += 1
+                else:
+                    if not isinstance(parsed, dict):
+                        output_line = json.dumps(parsed, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
+                        retained_line_count += 1
+                    else:
+                        scanned_rows += 1
+                        parsed_time = row_time(parsed, kind=kind)
+                        if parsed_time is not None and float(parsed_time) < float(cutoff_unix):
+                            deleted_rows += 1
+                            deleted_bytes += len(raw_line) + 1
+                            pruned = planned_turn_from_row(parsed, parsed_time) if kind == "prompt_usage" else None
+                            if pruned is not None:
+                                if pruned_turn_sink is None:
+                                    deleted_turns.append(pruned)
+                                else:
+                                    pruned_turn_sink(pruned)
+                            continue
+                        output_line = json.dumps(parsed, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
+                        retained_line_count += 1
+                retained_digest.update(output_line)
+                retained_scan.add(output_line)
+                retained_uncompressed_bytes += len(output_line)
+                if gzip_target is not None:
+                    gzip_target.write(output_line)
+        if gzip_target is not None:
+            gzip_target.close()
+            gzip_target = None
+        if raw_target is not None:
+            raw_target.flush()
+            os.fsync(raw_target.fileno())
+            raw_target.close()
+            raw_target = None
+    except Exception:
+        if gzip_target is not None:
+            gzip_target.close()
+        if raw_target is not None:
+            raw_target.close()
+        temporary.unlink(missing_ok=True)
+        raise
+    scan = source_scan.result()
+    validate_segment_scan(source_path, segment, scan, source_digest.hexdigest())
+    verify_segment_source_signature(source_path, source_signature)
     if deleted_rows <= 0:
+        temporary.unlink(missing_ok=True)
         return None
     source_segment = dict(segment)
     source_size = int(segment.get("bytes") or source_path.stat().st_size)
     if retained_line_count <= 0:
+        temporary.unlink(missing_ok=True)
         return {
             "action": "delete_whole",
             "source_segment": source_segment,
@@ -230,10 +404,22 @@ def plan_segment_for_cutoff(
             "deleted_turns": deleted_turns,
             "source_bytes": source_size,
             "deleted_bytes": source_size,
+            "_source_signature": source_signature,
         }
-    retained_payload = retained_payload_for_cutoff(payload, kind=kind, cutoff_unix=cutoff_unix)
-    retained_path = retained_segment_path(base, segment, scan_jsonl_bytes(retained_payload, kind=kind), create_archive_dir=create_output_dirs)
-    retained_segment = segment_from_payload(retained_path, kind=kind, payload=retained_payload)
+    retained_scan_result = retained_scan.result()
+    retained_path = retained_segment_path(base, segment, retained_scan_result, create_archive_dir=create_output_dirs)
+    retained_segment = segment_from_scan(
+        retained_path,
+        kind=kind,
+        scan=retained_scan_result,
+        uncompressed_bytes=retained_uncompressed_bytes,
+        payload_sha256=retained_digest.hexdigest(),
+    )
+    staged_path = retained_staging_path(retained_path)
+    if create_output_dirs:
+        temporary.replace(staged_path)
+        staged_path.chmod(0o600)
+        retained_segment["bytes"] = staged_path.stat().st_size
     return {
         "action": "rewrite_mixed",
         "source_segment": source_segment,
@@ -246,15 +432,30 @@ def plan_segment_for_cutoff(
         "deleted_turns": deleted_turns,
         "source_bytes": source_size,
         "deleted_bytes": min(source_size, deleted_bytes),
+        "_source_signature": source_signature,
+        "_staged_retained_path": str(staged_path) if create_output_dirs else None,
+        "_staged_retained_sha256": sha256_path(staged_path) if create_output_dirs else None,
     }
 
 
-def plan_segments_older_than(base: pathlib.Path, cutoff_unix: float, *, create_output_dirs: bool = True) -> dict[str, Any]:
+def plan_segments_older_than(
+    base: pathlib.Path,
+    cutoff_unix: float,
+    *,
+    create_output_dirs: bool = True,
+    pruned_turn_sink: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     manifest = strict_read_manifest(base)
     segments = validate_retention_manifest_segments(manifest.get("segments", []), base=base, validate_paths=True)
     plans: list[dict[str, Any]] = []
     for segment in segments:
-        plan = plan_segment_for_cutoff(base, segment, cutoff_unix, create_output_dirs=create_output_dirs)
+        plan = plan_segment_for_cutoff(
+            base,
+            segment,
+            cutoff_unix,
+            create_output_dirs=create_output_dirs,
+            pruned_turn_sink=pruned_turn_sink,
+        )
         if plan is not None:
             plans.append(plan)
     validate_segment_plan_ids(plans)
@@ -283,7 +484,11 @@ def plan_segments_older_than(base: pathlib.Path, cutoff_unix: float, *, create_o
 
 
 def preflight_segments_older_than(base: pathlib.Path, cutoff_unix: float) -> dict[str, Any]:
-    return plan_segments_older_than(base, cutoff_unix, create_output_dirs=False)
+    manifest = strict_read_manifest(base)
+    segments = validate_retention_manifest_segments(manifest.get("segments", []), base=base, validate_paths=True)
+    for segment in segments:
+        validate_retention_segment_metadata(segment)
+    return {"cutoff_unix": float(cutoff_unix), "segments": len(segments)}
 
 
 def validate_segment_plans(base: pathlib.Path, segment_plan: dict[str, Any]) -> dict[str, Any]:
@@ -302,8 +507,31 @@ def validate_segment_plans(base: pathlib.Path, segment_plan: dict[str, Any]) -> 
         source_segment = plan.get("source_segment")
         if not isinstance(source_segment, dict):
             raise ManifestError("raw segment plan missing source segment")
-        verify_segment_payload(base, source_segment)
+        source_path = validate_segment_path(base, source_segment)
+        signature = plan.get("_source_signature")
+        if not isinstance(signature, dict):
+            raise ManifestError("raw segment plan missing source signature")
+        verify_segment_source_signature(source_path, signature)
+        retained_segment = plan.get("retained_segment")
+        if isinstance(retained_segment, dict):
+            stage_path = pathlib.Path(str(plan.get("_staged_retained_path") or ""))
+            validate_retained_staging_path(base, stage_path)
+            if not stage_path.is_file():
+                raise ManifestError(f"raw segment retained stage missing: {stage_path}")
+            if sha256_path(stage_path) != str(plan.get("_staged_retained_sha256") or ""):
+                raise ManifestError(f"raw segment retained stage checksum mismatch: {stage_path}")
     return {"plans": len(plans)}
+
+
+def discard_segment_plan_artifacts(segment_plan: dict[str, Any] | None) -> None:
+    if not isinstance(segment_plan, dict):
+        return
+    for plan in segment_plan.get("plans") or []:
+        if not isinstance(plan, dict):
+            continue
+        path_text = plan.get("_staged_retained_path")
+        if path_text:
+            pathlib.Path(str(path_text)).unlink(missing_ok=True)
 
 
 def apply_segment_plans(base: pathlib.Path, segment_plan: dict[str, Any]) -> dict[str, Any]:
@@ -319,33 +547,25 @@ def apply_segment_plans(base: pathlib.Path, segment_plan: dict[str, Any]) -> dic
     validate_apply_marker_delta(base, previous_manifest, source_segments, retained_segments, next_manifest, source_must_exist=True)
     staged_retained: list[tuple[str, pathlib.Path, pathlib.Path]] = []
     for plan in plans:
-        retained_segment = plan.get("retained_segment")
-        if not isinstance(retained_segment, dict):
-            continue
         source_segment = plan.get("source_segment")
         if not isinstance(source_segment, dict):
             raise ManifestError("raw segment rewrite plan missing source segment")
+        source_path = validate_segment_path(base, source_segment)
+        signature = plan.get("_source_signature")
+        if not isinstance(signature, dict):
+            raise ManifestError("raw segment plan missing source signature")
+        verify_segment_source_signature(source_path, signature)
+        retained_segment = plan.get("retained_segment")
+        if not isinstance(retained_segment, dict):
+            continue
         retained_path = validate_segment_path(base, retained_segment, path_must_exist=False)
         retained_path.parent.mkdir(parents=True, exist_ok=True)
-        payload_text = plan.get("retained_payload")
-        if isinstance(payload_text, str):
-            payload = payload_text.encode("utf-8")
-        else:
-            _source_path, source_payload, _scan = verify_segment_payload(base, source_segment)
-            payload = retained_payload_for_cutoff(
-                source_payload,
-                kind=str(source_segment.get("kind") or ""),
-                cutoff_unix=float(plan.get("_cutoff_unix") or segment_plan.get("cutoff_unix") or 0.0),
-            )
-        stage_path = retained_staging_path(retained_path)
-        tmp = stage_path.with_name(f".{stage_path.name}.{os.getpid()}.{time.time_ns()}.tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "wb") as raw_handle:
-            with gzip.GzipFile(fileobj=raw_handle, mode="wb") as handle:
-                handle.write(payload)
-        tmp.replace(stage_path)
-        stage_path.chmod(0o600)
-        retained_segment["bytes"] = stage_path.stat().st_size
+        stage_path = pathlib.Path(str(plan.get("_staged_retained_path") or ""))
+        validate_retained_staging_path(base, stage_path)
+        if not stage_path.is_file():
+            raise ManifestError(f"raw segment retained stage missing: {stage_path}")
+        if sha256_path(stage_path) != str(plan.get("_staged_retained_sha256") or ""):
+            raise ManifestError(f"raw segment retained stage checksum mismatch: {stage_path}")
         staged_retained.append((str(retained_segment["id"]), stage_path, retained_path))
     marker = {
         "phase": "manifest_pending",
@@ -434,7 +654,7 @@ def retention_preview_from_manifest(base: pathlib.Path, cutoff_unix: float) -> d
         deletable_rows = rows if action == "delete_whole" else 0
         deletable_bytes = bytes_count if action == "delete_whole" else 0
         if action == "rewrite_mixed":
-            if not is_utc_day_start(cutoff_unix):
+            if segment.get("time_basis") != PROMPT_TIME_BASIS or not is_utc_day_start(cutoff_unix):
                 exact = exact_preview_for_segment(base, segment, cutoff_unix)
                 rows = exact["scanned_rows"]
                 deletable_rows = exact["deletable_rows"]

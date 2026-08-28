@@ -1,12 +1,38 @@
 from __future__ import annotations
 
 try:
-    from tests.support import ROOT, _turn_raw, json, load_module, mock, pathlib, stat, tempfile, unittest
+    from tests.support import ROOT, _turn_raw, json, load_module, mock, os, pathlib, stat, tempfile, unittest
 except ModuleNotFoundError:
-    from support import ROOT, _turn_raw, json, load_module, mock, pathlib, stat, tempfile, unittest
+    from support import ROOT, _turn_raw, json, load_module, mock, os, pathlib, stat, tempfile, unittest
 
 
 class NormalizeTests(unittest.TestCase):
+    def test_pending_resolution_stays_pending_until_transcript_has_terminal_event(self) -> None:
+        normalize = load_module("normalize_pending_terminal_test", ROOT / "scripts" / "normalize.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = pathlib.Path(tmp) / "rollout.jsonl"
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "timestamp": "2026-05-31T10:00:00.000Z",
+                        "type": "event_msg",
+                        "payload": {"type": "task_started", "turn_id": "t-pending"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            row = _turn_raw("s-pending", "t-pending", total=0) | {
+                "transcript_path": str(transcript),
+                "token_resolution_status": "pending",
+                "token_resolution_reason": "turn_end_not_found",
+            }
+
+            normalized = normalize.normalize_row(row)
+
+        self.assertEqual(normalized["token_resolution_status"], "pending")
+        self.assertTrue(normalize.unresolved_zero_estimate(normalized))
+
     def test_complete_jsonl_offset_scans_back_to_last_complete_row(self) -> None:
         normalize = load_module("normalize_complete_offset_test", ROOT / "scripts" / "normalize.py")
         with tempfile.TemporaryDirectory() as tmp:
@@ -92,7 +118,7 @@ class NormalizeTests(unittest.TestCase):
         raw["_source_priority"] = 2
         self.assertGreater(normalize.rank(raw), normalize.rank(lower_priority))
 
-    def test_full_normalize_skips_unresolved_zero_estimate_rows(self) -> None:
+    def test_full_normalize_keeps_unavailable_rows_for_audit(self) -> None:
         normalize = load_module("normalize_unresolved_zero_estimate_test", ROOT / "scripts" / "normalize.py")
         with tempfile.TemporaryDirectory() as tmp:
             base = pathlib.Path(tmp) / "token-usage"
@@ -155,11 +181,11 @@ class NormalizeTests(unittest.TestCase):
             rows = [json.loads(line) for line in normalize.NORMALIZED_LOG.read_text(encoding="utf-8").splitlines()]
 
         self.assertEqual(
-            [(row["session_id"], row["turn_id"], row["usage"]["total_tokens"]) for row in rows],
-            [("s-good", "t-good", 123)],
+            [(row["session_id"], row["turn_id"], row["usage"]["total_tokens"], row.get("token_resolution_status", "resolved")) for row in rows],
+            [("s-missing", "t-missing", 0, "unavailable"), ("s-side", "t-side", 0, "unavailable"), ("s-good", "t-good", 123, "resolved")],
         )
 
-    def test_incremental_normalize_skips_unresolved_zero_estimate_rows(self) -> None:
+    def test_incremental_normalize_keeps_unavailable_rows_for_audit(self) -> None:
         normalize = load_module("normalize_incremental_unresolved_zero_estimate_test", ROOT / "scripts" / "normalize.py")
         with tempfile.TemporaryDirectory() as tmp:
             base = pathlib.Path(tmp) / "token-usage"
@@ -200,8 +226,8 @@ class NormalizeTests(unittest.TestCase):
 
         self.assertEqual(result["mode"], "incremental")
         self.assertEqual(
-            [(row["session_id"], row["turn_id"], row["usage"]["total_tokens"]) for row in rows],
-            [("s-good", "t-good", 123)],
+            [(row["session_id"], row["turn_id"], row["usage"]["total_tokens"], row.get("token_resolution_status", "resolved")) for row in rows],
+            [("s-side", "t-side", 0, "unavailable"), ("s-good", "t-good", 123, "resolved")],
         )
 
     def test_missing_start_state_row_recovers_goal_auto_task_lifecycle(self) -> None:
@@ -322,6 +348,135 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual([row["usage"]["total_tokens"] for row in normalized], [10, 20])
         self.assertEqual(load_count, 6)
 
+    def test_lifecycle_recovery_skips_non_object_json_and_payloads(self) -> None:
+        normalize = load_module("normalize_lifecycle_non_object_test", ROOT / "scripts" / "normalize.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = pathlib.Path(tmp) / "rollout.jsonl"
+            transcript.write_text(
+                "\n".join(
+                    json.dumps(row)
+                    for row in [
+                        [],
+                        None,
+                        "text",
+                        123,
+                        {"timestamp": "2026-05-31T10:00:00.000Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": "t1"}},
+                        {"timestamp": "2026-05-31T10:00:01.000Z", "type": "event_msg", "payload": []},
+                        {"timestamp": "2026-05-31T10:00:02.000Z", "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "t1"}},
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            snapshot = normalize.task_lifecycle_token_usage(str(transcript), "t1")
+
+        self.assertTrue(snapshot["found"])
+        self.assertEqual(snapshot["turn_status"], "completed")
+        self.assertTrue(snapshot["parse_error_seen"])
+
+    def test_lifecycle_cache_refreshes_after_transcript_append(self) -> None:
+        normalize = load_module("normalize_lifecycle_append_cache_test", ROOT / "scripts" / "normalize.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = pathlib.Path(tmp) / "rollout.jsonl"
+            transcript.write_text(
+                json.dumps({"timestamp": "2026-05-31T10:00:00.000Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": "t1"}}) + "\n",
+                encoding="utf-8",
+            )
+
+            before = normalize.task_lifecycle_token_usage(str(transcript), "t1")
+            with transcript.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"timestamp": "2026-05-31T10:00:01.000Z", "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "t1"}}) + "\n")
+            after = normalize.task_lifecycle_token_usage(str(transcript), "t1")
+
+        self.assertFalse(before["found"])
+        self.assertEqual(before["reason"], "task_terminal_missing")
+        self.assertTrue(after["found"])
+        self.assertEqual(after["turn_status"], "completed")
+
+    def test_lifecycle_missing_result_is_not_cached(self) -> None:
+        normalize = load_module("normalize_lifecycle_missing_cache_test", ROOT / "scripts" / "normalize.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = pathlib.Path(tmp) / "rollout.jsonl"
+
+            before = normalize.task_lifecycle_token_usage(str(transcript), "t1")
+            transcript.write_text(
+                "\n".join(
+                    json.dumps(row)
+                    for row in [
+                        {"timestamp": "2026-05-31T10:00:00.000Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": "t1"}},
+                        {"timestamp": "2026-05-31T10:00:01.000Z", "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "t1"}},
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            after = normalize.task_lifecycle_token_usage(str(transcript), "t1")
+
+        self.assertEqual(before["reason"], "transcript_missing")
+        self.assertTrue(after["found"])
+
+    def test_lifecycle_cache_detects_same_size_rewrite(self) -> None:
+        normalize = load_module("normalize_lifecycle_rewrite_cache_test", ROOT / "scripts" / "normalize.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = pathlib.Path(tmp) / "rollout.jsonl"
+
+            def lifecycle_text(turn_id: str) -> str:
+                return (
+                    "\n".join(
+                        json.dumps(row, separators=(",", ":"))
+                        for row in [
+                            {"timestamp": "2026-05-31T10:00:00.000Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": turn_id}},
+                            {"timestamp": "2026-05-31T10:00:01.000Z", "type": "event_msg", "payload": {"type": "task_complete", "turn_id": turn_id}},
+                        ]
+                    )
+                    + "\n"
+                )
+
+            transcript.write_text(lifecycle_text("t1"), encoding="utf-8")
+            first_stat = transcript.stat()
+            first = normalize.task_lifecycle_token_usage(str(transcript), "t1")
+            transcript.write_text(lifecycle_text("t2"), encoding="utf-8")
+            rewritten_stat = transcript.stat()
+            os.utime(
+                transcript,
+                ns=(rewritten_stat.st_atime_ns, max(rewritten_stat.st_mtime_ns, first_stat.st_mtime_ns + 1_000_000_000)),
+            )
+            old_turn = normalize.task_lifecycle_token_usage(str(transcript), "t1")
+            new_turn = normalize.task_lifecycle_token_usage(str(transcript), "t2")
+
+        self.assertTrue(first["found"])
+        self.assertEqual(len(lifecycle_text("t1")), len(lifecycle_text("t2")))
+        self.assertFalse(old_turn["found"])
+        self.assertTrue(new_turn["found"])
+
+    def test_lifecycle_scan_uses_starting_size_snapshot(self) -> None:
+        normalize = load_module("normalize_lifecycle_snapshot_cache_test", ROOT / "scripts" / "normalize.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = pathlib.Path(tmp) / "rollout.jsonl"
+            transcript.write_text(
+                json.dumps({"timestamp": "2026-05-31T10:00:00.000Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": "t1"}}) + "\n",
+                encoding="utf-8",
+            )
+            real_parse = normalize.transcript_parser.parse_transcript_object
+            appended = False
+
+            def append_during_parse(line: str | bytes):
+                nonlocal appended
+                result = real_parse(line)
+                if not appended:
+                    appended = True
+                    with transcript.open("a", encoding="utf-8") as handle:
+                        handle.write(json.dumps({"timestamp": "2026-05-31T10:00:01.000Z", "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "t1"}}) + "\n")
+                return result
+
+            with mock.patch.object(normalize.transcript_parser, "parse_transcript_object", side_effect=append_during_parse):
+                before = normalize.task_lifecycle_token_usage(str(transcript), "t1")
+            after = normalize.task_lifecycle_token_usage(str(transcript), "t1")
+
+        self.assertEqual(before["reason"], "task_terminal_missing")
+        self.assertTrue(after["found"])
+
     def test_goal_auto_lifecycle_recovery_cache_does_not_evict_many_transcripts(self) -> None:
         normalize = load_module("normalize_goal_auto_recovery_many_cache_test", ROOT / "scripts" / "normalize.py")
         with tempfile.TemporaryDirectory() as tmp:
@@ -370,6 +525,23 @@ class NormalizeTests(unittest.TestCase):
                     normalize.normalize_row(row)
 
         self.assertEqual(load_count, 258)
+
+    def test_lifecycle_cache_has_a_fixed_entry_limit(self) -> None:
+        normalize = load_module("normalize_lifecycle_cache_limit_test", ROOT / "scripts" / "normalize.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp)
+            for index in range(normalize.TRANSCRIPT_LIFECYCLE_CACHE_MAXSIZE + 44):
+                transcript = base / f"rollout-{index}.jsonl"
+                transcript.write_text(
+                    json.dumps({"timestamp": "2026-05-31T10:00:00.000Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": f"t-{index}"}}) + "\n",
+                    encoding="utf-8",
+                )
+                normalize.transcript_lifecycle_index(str(transcript))
+
+            cache_info = normalize.cached_transcript_lifecycle_index.cache_info()
+
+        self.assertEqual(cache_info.maxsize, normalize.TRANSCRIPT_LIFECYCLE_CACHE_MAXSIZE)
+        self.assertLessEqual(cache_info.currsize, normalize.TRANSCRIPT_LIFECYCLE_CACHE_MAXSIZE)
 
     def test_lifecycle_recovery_scan_checks_cancel_during_transcript_read(self) -> None:
         normalize = load_module("normalize_goal_auto_recovery_cancel_test", ROOT / "scripts" / "normalize.py")

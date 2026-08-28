@@ -5,6 +5,7 @@ try:
         Any,
         DashboardFixtureMixin,
         ROOT,
+        datetime,
         load_module,
         mock,
         pathlib,
@@ -17,6 +18,7 @@ except ModuleNotFoundError:
         Any,
         DashboardFixtureMixin,
         ROOT,
+        datetime,
         load_module,
         mock,
         pathlib,
@@ -24,6 +26,7 @@ except ModuleNotFoundError:
         types,
         unittest,
     )
+
 
 class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
     LEGACY_CLEANUP_ROW_FIELDS = {
@@ -39,6 +42,38 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn("display", row)
         self.assertIn("delete_all_display", row)
 
+    def test_cleanup_selection_deletes_through_local_calendar_date(self) -> None:
+        serve = load_module("serve_dashboard_cleanup_local_date_test", ROOT / "scripts" / "serve_dashboard.py")
+        handler = serve.Handler.__new__(serve.Handler)
+
+        selection = handler.required_cleanup_selection("2026-08-24", "Asia/Seoul")
+
+        self.assertEqual(selection["cutoff_date"], "2026-08-24")
+        self.assertEqual(selection["timezone"], "Asia/Seoul")
+        self.assertEqual(
+            selection["cutoff_unix"],
+            datetime.fromisoformat("2026-08-24T15:00:00+00:00").timestamp(),
+        )
+
+    def test_cleanup_selection_uses_selected_date_dst_offset(self) -> None:
+        serve = load_module("serve_dashboard_cleanup_dst_test", ROOT / "scripts" / "serve_dashboard.py")
+        handler = serve.Handler.__new__(serve.Handler)
+
+        before_transition = handler.required_cleanup_selection("2026-03-07", "America/New_York")
+        after_transition = handler.required_cleanup_selection("2026-03-08", "America/New_York")
+
+        self.assertEqual(before_transition["cutoff_unix"], datetime.fromisoformat("2026-03-08T05:00:00+00:00").timestamp())
+        self.assertEqual(after_transition["cutoff_unix"], datetime.fromisoformat("2026-03-09T04:00:00+00:00").timestamp())
+
+    def test_cleanup_selection_requires_valid_iana_timezone(self) -> None:
+        serve = load_module("serve_dashboard_cleanup_timezone_validation_test", ROOT / "scripts" / "serve_dashboard.py")
+        handler = serve.Handler.__new__(serve.Handler)
+
+        with self.assertRaisesRegex(ValueError, "cutoff_timezone_required"):
+            handler.required_cleanup_selection("2026-08-24", "")
+        with self.assertRaisesRegex(ValueError, "cutoff_timezone_invalid"):
+            handler.required_cleanup_selection("2026-08-24", "Not/A-Timezone")
+
     def test_log_cleanup_api_does_not_open_dashboard_database(self) -> None:
         serve = load_module("serve_dashboard_cleanup_api_db_test", ROOT / "scripts" / "serve_dashboard.py")
         handler = serve.Handler.__new__(serve.Handler)
@@ -49,10 +84,14 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
 
         handler.db = fail_db
         handler.cleanup_payload = lambda **kwargs: kwargs
-        handler.cleanup_cutoff_unix = lambda value=None: 123.0
+        handler.cleanup_preview_selection = lambda value=None, timezone_value=None: {
+            "cutoff_date": "2026-05-20",
+            "timezone": "Asia/Seoul",
+            "cutoff_unix": 123.0,
+        }
         handler.send_json = lambda payload, status=200: sent.append((payload, status))
 
-        handler.handle_api("/api/log-cleanup", {})
+        handler.handle_api("/api/log-cleanup", {"timezone": ["Asia/Seoul"]})
 
         self.assertEqual(sent, [({"retention_cutoff_unix": 123.0, "refresh_retention_index": False}, 200)])
 
@@ -68,9 +107,13 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
             return {"summary": {}, "rows": []}
 
         handler.cleanup_payload = fake_cleanup_payload
-        handler.cleanup_preview_cutoff_unix = lambda value=None: 123.0
+        handler.cleanup_preview_selection = lambda value=None, timezone_value=None: {
+            "cutoff_date": "2026-05-20",
+            "timezone": "Asia/Seoul",
+            "cutoff_unix": 123.0,
+        }
 
-        handler.handle_api("/api/log-cleanup", {})
+        handler.handle_api("/api/log-cleanup", {"timezone": ["Asia/Seoul"]})
 
         self.assertEqual(sent, [({"summary": {}, "rows": []}, 200)])
         self.assertEqual(calls, [{"retention_cutoff_unix": 123.0, "refresh_retention_index": False}])
@@ -86,12 +129,33 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
 
         self.assertEqual(sent, [({"error": "cutoff_date_invalid"}, 400)])
 
+    def test_log_cleanup_preview_requires_valid_timezone_before_payload(self) -> None:
+        serve = load_module("serve_dashboard_cleanup_preview_timezone_test", ROOT / "scripts" / "serve_dashboard.py")
+        handler = serve.Handler.__new__(serve.Handler)
+        sent: list[tuple[dict[str, object], int]] = []
+        handler.cleanup_payload = lambda **_kwargs: (_ for _ in ()).throw(AssertionError("cleanup payload must not run"))
+        handler.send_json = lambda payload, status=200: sent.append((payload, status))
+
+        handler.handle_api("/api/log-cleanup", {"cutoff_date": ["2026-08-24"]})
+        handler.handle_api(
+            "/api/log-cleanup",
+            {"cutoff_date": ["2026-08-24"], "timezone": ["Not/A-Timezone"]},
+        )
+
+        self.assertEqual(
+            sent,
+            [
+                ({"error": "cutoff_timezone_required"}, 400),
+                ({"error": "cutoff_timezone_invalid"}, 400),
+            ],
+        )
+
     def test_log_cleanup_compact_ignores_removed_model_scope_options(self) -> None:
         serve = load_module("serve_dashboard_compact_removed_scope_test", ROOT / "scripts" / "serve_dashboard.py")
         handler = serve.Handler.__new__(serve.Handler)
         sent: list[tuple[dict[str, object], int]] = []
         calls: list[tuple[pathlib.Path, int]] = []
-        handler.server = types.SimpleNamespace(db_path="/tmp/token-usage.sqlite")
+        handler.server = types.SimpleNamespace(db_path="/tmp/bola.sqlite")
         handler.read_json_body = lambda: {"min_bytes": 2048, "include_prompt": False, "include_model": False}
         handler.send_json = lambda payload, status=200: sent.append((payload, status))
         handler.cleanup_payload = lambda db_path=None: {"rows": []}
@@ -105,7 +169,7 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
             handler.handle_cleanup_compact()
 
         self.assertEqual(sent[0][1], 200)
-        self.assertEqual(calls, [(pathlib.Path("/tmp/token-usage.sqlite"), 2048)])
+        self.assertEqual(calls, [(pathlib.Path("/tmp/bola.sqlite"), 2048)])
 
     def test_log_cleanup_detail_api_does_not_open_dashboard_database(self) -> None:
         serve = load_module("serve_dashboard_cleanup_detail_api_db_test", ROOT / "scripts" / "serve_dashboard.py")
@@ -116,13 +180,94 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
             raise AssertionError("cleanup detail API should not open dashboard DB")
 
         handler.db = fail_db
-        handler.cleanup_detail_payload = lambda group_id, retention_cutoff_unix=None, preview_signature=None: {"group_id": group_id, "retention_cutoff_unix": retention_cutoff_unix, "preview_signature": preview_signature}
-        handler.cleanup_cutoff_unix = lambda value=None: 456.0
+        handler.cleanup_detail_payload = lambda group_id, retention_cutoff_unix=None, preview_signature=None: {
+            "group_id": group_id,
+            "retention_cutoff_unix": retention_cutoff_unix,
+            "preview_signature": preview_signature,
+        }
+        handler.cleanup_preview_selection = lambda value=None, timezone_value=None: {
+            "cutoff_date": "2026-05-20",
+            "timezone": "Asia/Seoul",
+            "cutoff_unix": 456.0,
+        }
         handler.send_json = lambda payload, status=200: sent.append((payload, status))
 
-        handler.handle_api("/api/log-cleanup/detail", {"group_id": ["state_files"], "preview_signature": ["fresh"]})
+        handler.handle_api(
+            "/api/log-cleanup/detail",
+            {"group_id": ["state_files"], "preview_signature": ["fresh"], "timezone": ["Asia/Seoul"]},
+        )
 
-        self.assertEqual(sent, [({"group_id": "state_files", "retention_cutoff_unix": 456.0, "preview_signature": "fresh"}, 200)])
+        self.assertEqual(
+            sent,
+            [
+                (
+                    {
+                        "group_id": "state_files",
+                        "retention_cutoff_unix": 456.0,
+                        "preview_signature": "fresh",
+                        "cutoff_date": "2026-05-20",
+                        "timezone": "Asia/Seoul",
+                        "cutoff_unix": 456.0,
+                    },
+                    200,
+                )
+            ],
+        )
+
+    def test_log_cleanup_detail_api_passes_bounded_pagination(self) -> None:
+        serve = load_module("serve_dashboard_cleanup_detail_pagination_test", ROOT / "scripts" / "serve_dashboard.py")
+        handler = serve.Handler.__new__(serve.Handler)
+        sent: list[tuple[dict[str, object], int]] = []
+        calls: list[dict[str, object]] = []
+
+        def detail(group_id: str, **kwargs: object) -> dict[str, object]:
+            calls.append({"group_id": group_id, **kwargs})
+            return {"row": {"group_id": group_id}}
+
+        handler.cleanup_detail_payload = detail
+        handler.cleanup_preview_selection = lambda value=None, timezone_value=None: {
+            "cutoff_date": "2026-05-20",
+            "timezone": "Asia/Seoul",
+            "cutoff_unix": 456.0,
+        }
+        handler.send_json = lambda payload, status=200: sent.append((payload, status))
+
+        handler.handle_api(
+            "/api/log-cleanup/detail",
+            {
+                "group_id": ["state_files"],
+                "preview_signature": ["fresh"],
+                "page": ["2"],
+                "page_size": ["100"],
+            },
+        )
+
+        self.assertEqual(calls[0]["page"], 2)
+        self.assertEqual(calls[0]["page_size"], 100)
+        self.assertEqual(sent[0][1], 200)
+
+    def test_log_cleanup_detail_api_rejects_unbounded_pagination(self) -> None:
+        serve = load_module("serve_dashboard_cleanup_detail_pagination_invalid_test", ROOT / "scripts" / "serve_dashboard.py")
+        handler = serve.Handler.__new__(serve.Handler)
+        sent: list[tuple[dict[str, object], int]] = []
+        handler.cleanup_detail_payload = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("detail payload must not run"))
+        handler.send_json = lambda payload, status=200: sent.append((payload, status))
+
+        for page, page_size in (("0", "25"), ("1", "101"), ("x", "25")):
+            handler.handle_api(
+                "/api/log-cleanup/detail",
+                {
+                    "group_id": ["state_files"],
+                    "preview_signature": ["fresh"],
+                    "page": [page],
+                    "page_size": [page_size],
+                },
+            )
+
+        self.assertEqual(
+            sent,
+            [({"error": "cleanup_detail_pagination_invalid"}, 400)] * 3,
+        )
 
     def test_log_cleanup_detail_preview_rejects_invalid_cutoff_date(self) -> None:
         serve = load_module("serve_dashboard_cleanup_detail_invalid_cutoff_test", ROOT / "scripts" / "serve_dashboard.py")
@@ -161,11 +306,13 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
         serve = load_module("serve_dashboard_cleanup_detail_stale_signature_test", ROOT / "scripts" / "serve_dashboard.py")
         handler = serve.Handler.__new__(serve.Handler)
         sent: list[tuple[dict[str, object], int]] = []
-        handler.cleanup_cutoff_unix = lambda value=None: 1779235200.0
         handler.cleanup_detail_payload = lambda group_id, retention_cutoff_unix=None, preview_signature=None: {"error": "cleanup_preview_stale"}
         handler.send_json = lambda payload, status=200: sent.append((payload, status))
 
-        handler.handle_api("/api/log-cleanup/detail", {"group_id": ["state_files"], "preview_signature": ["old"], "cutoff_date": ["2026-05-20"]})
+        handler.handle_api(
+            "/api/log-cleanup/detail",
+            {"group_id": ["state_files"], "preview_signature": ["old"], "cutoff_date": ["2026-05-20"], "timezone": ["Asia/Seoul"]},
+        )
 
         self.assertEqual(sent, [({"error": "cleanup_preview_stale"}, 409)])
 
@@ -173,36 +320,41 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
         serve = load_module("serve_dashboard_cleanup_detail_unknown_group_test", ROOT / "scripts" / "serve_dashboard.py")
         handler = serve.Handler.__new__(serve.Handler)
         sent: list[tuple[dict[str, object], int]] = []
-        handler.cleanup_cutoff_unix = lambda value=None: 1779235200.0
-        handler.cleanup_detail_payload = lambda group_id, retention_cutoff_unix=None, preview_signature=None: {"error": "cleanup_row_not_found", "message": f"Unknown cleanup row group: {group_id}"}
+        handler.cleanup_detail_payload = lambda group_id, retention_cutoff_unix=None, preview_signature=None: {
+            "error": "cleanup_row_not_found",
+            "message": f"Unknown cleanup row group: {group_id}",
+        }
         handler.send_json = lambda payload, status=200: sent.append((payload, status))
 
-        handler.handle_api("/api/log-cleanup/detail", {"group_id": ["unknown"], "preview_signature": ["fresh"]})
+        handler.handle_api(
+            "/api/log-cleanup/detail",
+            {"group_id": ["unknown"], "preview_signature": ["fresh"], "timezone": ["Asia/Seoul"]},
+        )
 
         self.assertEqual(sent, [({"error": "cleanup_row_not_found", "message": "Unknown cleanup row group: unknown"}, 404)])
 
     def test_log_cleanup_detail_api_revalidates_real_preview_signature(self) -> None:
         serve = load_module("serve_dashboard_cleanup_detail_real_signature_test", ROOT / "scripts" / "serve_dashboard.py")
         fixture = load_module("dashboard_fixture_data_cleanup_detail_signature_test", ROOT / "scripts" / "dashboard_fixture_data.py")
-        raw_segments = serve.dashboard_cleanup.raw_segments
+        raw_segments = serve.raw_segments
         with tempfile.TemporaryDirectory() as tmp_dir:
-            codex_home = pathlib.Path(tmp_dir) / "codex-home"
-            db_path = fixture.write_dashboard_fixture(codex_home, now_unix=1_782_000_000.0)
-            base = codex_home / "codex-token-bola"
+            codex_dir = pathlib.Path(tmp_dir) / "codex-dir"
+            base = codex_dir / "bola"
+            db_path = fixture.write_dashboard_fixture(base, now_unix=1_782_000_000.0)
             handler = serve.Handler.__new__(serve.Handler)
             handler.server = types.SimpleNamespace(db_path=db_path)
             sent: list[tuple[dict[str, object], int]] = []
             handler.send_json = lambda payload, status=200: sent.append((payload, status))
 
-            with mock.patch.object(serve, "TOKEN_USAGE_ROOT", base), mock.patch.object(serve, "CODEX_HOME", codex_home):
-                handler.handle_api("/api/log-cleanup", {})
+            with mock.patch.object(serve, "OUTPUT_DIR", base), mock.patch.object(serve, "CODEX_DIR", codex_dir):
+                handler.handle_api("/api/log-cleanup", {"timezone": ["Asia/Seoul"]})
                 preview = sent.pop()[0]
                 preview_signature = str(((preview.get("retention") or {}).get("selected") or {}).get("preview_signature") or "")
                 self.assertTrue(preview_signature)
 
                 handler.handle_api(
                     "/api/log-cleanup/detail",
-                    {"group_id": ["raw_current_segments"], "preview_signature": [preview_signature]},
+                    {"group_id": ["raw_current_segments"], "preview_signature": [preview_signature], "timezone": ["Asia/Seoul"]},
                 )
                 fresh_payload, fresh_status = sent.pop()
                 self.assertEqual(fresh_status, 200)
@@ -212,7 +364,7 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
                 pathlib.Path(current["path"]).write_text('{"record_type":"turn_usage_raw"}\n', encoding="utf-8")
                 handler.handle_api(
                     "/api/log-cleanup/detail",
-                    {"group_id": ["raw_current_segments"], "preview_signature": [preview_signature]},
+                    {"group_id": ["raw_current_segments"], "preview_signature": [preview_signature], "timezone": ["Asia/Seoul"]},
                 )
                 stale_payload, stale_status = sent.pop()
 
@@ -223,7 +375,7 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
         serve = load_module("serve_dashboard_retention_cutoff_required_test", ROOT / "scripts" / "serve_dashboard.py")
         handler = serve.Handler.__new__(serve.Handler)
         sent: list[tuple[dict[str, object], int]] = []
-        handler.server = types.SimpleNamespace(db_path="/tmp/token-usage.sqlite")
+        handler.server = types.SimpleNamespace(db_path="/tmp/bola.sqlite")
         handler.read_json_body = lambda: {}
         handler.run_retention_prune_command = lambda _db_path, _cutoff: (_ for _ in ()).throw(AssertionError("prune must not run"))
         handler.send_json = lambda payload, status=200: sent.append((payload, status))
@@ -237,7 +389,7 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
         serve = load_module("serve_dashboard_retention_cutoff_invalid_test", ROOT / "scripts" / "serve_dashboard.py")
         handler = serve.Handler.__new__(serve.Handler)
         sent: list[tuple[dict[str, object], int]] = []
-        handler.server = types.SimpleNamespace(db_path="/tmp/token-usage.sqlite")
+        handler.server = types.SimpleNamespace(db_path="/tmp/bola.sqlite")
         handler.read_json_body = lambda: {"cutoff_date": "not-a-date"}
         handler.run_retention_prune_command = lambda _db_path, _cutoff: (_ for _ in ()).throw(AssertionError("prune must not run"))
         handler.send_json = lambda payload, status=200: sent.append((payload, status))
@@ -247,13 +399,29 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertEqual(sent[0][1], 400)
         self.assertEqual(sent[0][0]["error"], "cutoff_date_invalid")
 
+    def test_log_cleanup_retention_requires_timezone_before_preview_or_prune(self) -> None:
+        serve = load_module("serve_dashboard_retention_timezone_required_test", ROOT / "scripts" / "serve_dashboard.py")
+        handler = serve.Handler.__new__(serve.Handler)
+        sent: list[tuple[dict[str, object], int]] = []
+        handler.server = types.SimpleNamespace(db_path="/tmp/bola.sqlite")
+        handler.read_json_body = lambda: {"cutoff_date": "2026-08-24", "preview_signature": "fresh"}
+        handler.cleanup_payload = lambda **_kwargs: (_ for _ in ()).throw(AssertionError("preview must not run"))
+        handler.run_retention_prune_command = lambda *_args: (_ for _ in ()).throw(AssertionError("prune must not run"))
+        handler.send_json = lambda payload, status=200: sent.append((payload, status))
+
+        handler.handle_cleanup_retention()
+
+        self.assertEqual(sent, [({"error": "cutoff_timezone_required"}, 400)])
+
     def test_log_cleanup_retention_rejects_stale_preview_signature(self) -> None:
         serve = load_module("serve_dashboard_retention_stale_preview_test", ROOT / "scripts" / "serve_dashboard.py")
         handler = serve.Handler.__new__(serve.Handler)
         sent: list[tuple[dict[str, object], int]] = []
-        handler.server = types.SimpleNamespace(db_path="/tmp/token-usage.sqlite")
-        handler.read_json_body = lambda: {"cutoff_date": "2026-05-20", "preview_signature": "old"}
-        handler.cleanup_payload = lambda db_path=None, retention_cutoff_unix=None: {"retention": {"selected": {"preview_signature": "fresh", "deletable_rows": 1}}}
+        handler.server = types.SimpleNamespace(db_path="/tmp/bola.sqlite")
+        handler.read_json_body = lambda: {"cutoff_date": "2026-05-20", "timezone": "Asia/Seoul", "preview_signature": "old"}
+        handler.cleanup_payload = lambda db_path=None, retention_cutoff_unix=None: {
+            "retention": {"selected": {"preview_signature": "fresh", "deletable_rows": 1}}
+        }
         handler.run_retention_prune_command = lambda _db_path, _cutoff: (_ for _ in ()).throw(AssertionError("prune must not run"))
         handler.send_json = lambda payload, status=200: sent.append((payload, status))
 
@@ -277,9 +445,8 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
                 }
             },
         }
-        handler.server = types.SimpleNamespace(db_path="/tmp/token-usage.sqlite")
-        handler.read_json_body = lambda: {"cutoff_date": "2026-05-20", "preview_signature": "fresh"}
-        handler.cleanup_cutoff_unix = lambda value=None: 1779235200.0
+        handler.server = types.SimpleNamespace(db_path="/tmp/bola.sqlite")
+        handler.read_json_body = lambda: {"cutoff_date": "2026-05-20", "timezone": "Asia/Seoul", "preview_signature": "fresh"}
         handler.cleanup_payload = lambda db_path=None, retention_cutoff_unix=None: cleanup_payload | {"retention_cutoff_unix": retention_cutoff_unix}
         handler.run_retention_prune_command = lambda _db_path, _cutoff: (_ for _ in ()).throw(AssertionError("prune must not run for empty preview"))
         handler.send_json = lambda payload, status=200: sent.append((payload, status))
@@ -292,10 +459,10 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertEqual(sent[0][0]["retention"]["scanned_rows"], 12)
         self.assertIs(sent[0][0]["cleanup"]["retention"], cleanup_payload["retention"])
 
-    def test_log_cleanup_retention_runs_when_pending_state_files_are_selected(self) -> None:
+    def test_log_cleanup_retention_noops_when_only_pending_state_files_exist(self) -> None:
         serve = load_module("serve_dashboard_retention_pending_state_api_test", ROOT / "scripts" / "serve_dashboard.py")
         handler = serve.Handler.__new__(serve.Handler)
-        output = pathlib.Path("/tmp/token-usage.sqlite")
+        output = pathlib.Path("/tmp/bola.sqlite")
         sent: list[tuple[dict[str, object], int]] = []
         calls: list[tuple[pathlib.Path, float, str]] = []
         cleanup_payload = {
@@ -306,38 +473,40 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
                     "preview_signature": "fresh",
                     "scanned_rows": 12,
                     "deletable_rows": 0,
-                    "pending_turn_state_deletable_files": 1,
+                    "pending_turn_state_deletable_files": 0,
+                    "pending_turn_state_protected_files": 1,
                 }
             },
         }
         handler.server = types.SimpleNamespace(db_path=str(output))
-        handler.read_json_body = lambda: {"cutoff_date": "2026-05-20", "preview_signature": "fresh"}
-        handler.cleanup_cutoff_unix = lambda value=None: 1779235200.0
+        handler.read_json_body = lambda: {"cutoff_date": "2026-05-20", "timezone": "Asia/Seoul", "preview_signature": "fresh"}
         handler.cleanup_payload = lambda db_path=None, retention_cutoff_unix=None: cleanup_payload | {"retention_cutoff_unix": retention_cutoff_unix}
-        handler.run_retention_prune_command = lambda db_path, cutoff, preview_signature: calls.append((db_path, cutoff, preview_signature)) or {
-            "returncode": 0,
-            "stdout": '{"deleted_rows":0,"deleted_state_files":1}',
-            "stderr": "",
-            "metadata": {"delete": {"deleted_rows": 0, "deleted_state_files": 1}},
-        }
+        handler.run_retention_prune_command = lambda db_path, cutoff, preview_signature: (
+            calls.append((db_path, cutoff, preview_signature))
+            or {
+                "returncode": 0,
+                "stdout": '{"deleted_rows":0,"deleted_state_files":1}',
+                "stderr": "",
+                "metadata": {"delete": {"deleted_rows": 0, "deleted_state_files": 1}},
+            }
+        )
         handler.send_json = lambda payload, status=200: sent.append((payload, status))
 
         handler.handle_cleanup_retention()
 
-        self.assertEqual(calls, [(output, 1779235200.0, "fresh")])
+        self.assertEqual(calls, [])
         self.assertEqual(sent[0][1], 200)
-        self.assertNotIn("noop", sent[0][0])
-        self.assertEqual(sent[0][0]["retention"]["deleted_state_files"], 1)
+        self.assertTrue(sent[0][0]["noop"])
+        self.assertEqual(sent[0][0]["retention"]["deleted_state_files"], 0)
 
     def test_log_cleanup_retention_reports_preview_manifest_failure(self) -> None:
         serve = load_module("serve_dashboard_retention_manifest_failure_test", ROOT / "scripts" / "serve_dashboard.py")
         handler = serve.Handler.__new__(serve.Handler)
         sent: list[tuple[dict[str, object], int]] = []
-        handler.server = types.SimpleNamespace(db_path="/tmp/token-usage.sqlite")
-        handler.read_json_body = lambda: {"cutoff_date": "2026-05-20", "preview_signature": "fresh"}
-        handler.cleanup_cutoff_unix = lambda value=None: 1779235200.0
+        handler.server = types.SimpleNamespace(db_path="/tmp/bola.sqlite")
+        handler.read_json_body = lambda: {"cutoff_date": "2026-05-20", "timezone": "Asia/Seoul", "preview_signature": "fresh"}
         handler.cleanup_payload = lambda db_path=None, retention_cutoff_unix=None: (_ for _ in ()).throw(
-            serve.dashboard_cleanup.raw_segments.ManifestError("pending rotation must be resolved")
+            serve.raw_segments.ManifestError("pending rotation must be resolved")
         )
         handler.run_retention_prune_command = lambda _db_path, _cutoff: (_ for _ in ()).throw(AssertionError("prune must not run"))
         handler.send_json = lambda payload, status=200: sent.append((payload, status))
@@ -352,8 +521,8 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
         serve = load_module("serve_dashboard_retention_cli_stale_preview_test", ROOT / "scripts" / "serve_dashboard.py")
         handler = serve.Handler.__new__(serve.Handler)
         sent: list[tuple[dict[str, object], int]] = []
-        handler.server = types.SimpleNamespace(db_path="/tmp/token-usage.sqlite")
-        handler.read_json_body = lambda: {"cutoff_date": "2026-05-20", "preview_signature": "fresh"}
+        handler.server = types.SimpleNamespace(db_path="/tmp/bola.sqlite")
+        handler.read_json_body = lambda: {"cutoff_date": "2026-05-20", "timezone": "Asia/Seoul", "preview_signature": "fresh"}
         handler.cleanup_payload = lambda db_path=None, retention_cutoff_unix=None: {
             "summary": {},
             "rows": [],
@@ -376,9 +545,11 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
         serve = load_module("serve_dashboard_retention_partial_failure_test", ROOT / "scripts" / "serve_dashboard.py")
         handler = serve.Handler.__new__(serve.Handler)
         sent: list[tuple[dict[str, object], int]] = []
-        handler.server = types.SimpleNamespace(db_path="/tmp/token-usage.sqlite")
-        handler.read_json_body = lambda: {"cutoff_date": "2026-05-20", "preview_signature": "fresh"}
-        handler.cleanup_payload = lambda db_path=None, retention_cutoff_unix=None: {"retention": {"selected": {"preview_signature": "fresh", "deletable_rows": 1}}}
+        handler.server = types.SimpleNamespace(db_path="/tmp/bola.sqlite")
+        handler.read_json_body = lambda: {"cutoff_date": "2026-05-20", "timezone": "Asia/Seoul", "preview_signature": "fresh"}
+        handler.cleanup_payload = lambda db_path=None, retention_cutoff_unix=None: {
+            "retention": {"selected": {"preview_signature": "fresh", "deletable_rows": 1}}
+        }
         handler.run_retention_prune_command = lambda _db_path, _cutoff, _preview_signature: {
             "returncode": 1,
             "stdout": '{"partial_mutation":true,"stage":"build","deleted_rows":3}',
@@ -407,6 +578,34 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertEqual(sent[0][0]["stage"], "build")
         self.assertEqual(sent[0][0]["deleted_rows"], 3)
 
+    def test_log_cleanup_retention_returns_completed_degraded_result(self) -> None:
+        serve = load_module("serve_dashboard_retention_degraded_test", ROOT / "scripts" / "serve_dashboard.py")
+        handler = serve.Handler.__new__(serve.Handler)
+        sent: list[tuple[dict[str, object], int]] = []
+        cleanup_payload = {"retention": {"selected": {"preview_signature": "fresh", "deletable_rows": 1}}}
+        handler.server = types.SimpleNamespace(db_path="/tmp/bola.sqlite")
+        handler.read_json_body = lambda: {"cutoff_date": "2026-05-20", "timezone": "Asia/Seoul", "preview_signature": "fresh"}
+        handler.cleanup_payload = lambda db_path=None, retention_cutoff_unix=None: cleanup_payload
+        handler.run_retention_prune_command = lambda _db_path, _cutoff, _preview_signature: {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": "",
+            "metadata": {
+                "status": "degraded",
+                "quarantine": {"unacknowledged_events": 1},
+                "delete": {"deleted_rows": 3},
+            },
+        }
+        handler.send_json = lambda payload, status=200: sent.append((payload, status))
+
+        handler.handle_cleanup_retention()
+
+        self.assertEqual(sent[0][1], 200)
+        self.assertTrue(sent[0][0]["ok"])
+        self.assertEqual(sent[0][0]["status"], "degraded")
+        self.assertEqual(sent[0][0]["data_health"], "degraded")
+        self.assertEqual(sent[0][0]["quarantine"]["unacknowledged_events"], 1)
+
     def test_log_cleanup_delete_all_removes_generated_service_data(self) -> None:
         cleanup = load_module("dashboard_cleanup_delete_all_test", ROOT / "scripts" / "dashboard_cleanup.py")
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -428,8 +627,9 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
                 raw_current / "prompt-usage.raw.jsonl.current.1.jsonl",
                 raw_archive / "prompt-usage.raw.jsonl.20260101.gz",
                 normalized / "prompt-usage.normalized.jsonl",
-                analytics / "token-usage.sqlite",
+                analytics / "bola.sqlite",
                 state / "current-raw-segments.json",
+                state / ("a" * 32 + ".json"),
                 tmp / "work.tmp",
                 bad / "bad.jsonl",
                 base / "prompt-usage.jsonl",
@@ -443,7 +643,7 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
             outside = pathlib.Path(tmp_dir) / "outside.txt"
             outside.write_text("keep", encoding="utf-8")
 
-            result = cleanup.delete_all_logs(base, analytics / "token-usage.sqlite")
+            result = cleanup.delete_all_logs(base, analytics / "bola.sqlite")
 
             self.assertGreater(result["deleted_bytes"], 0)
             for path in files:
@@ -463,7 +663,7 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
         serve = load_module("serve_dashboard_delete_all_confirm_test", ROOT / "scripts" / "serve_dashboard.py")
         handler = serve.Handler.__new__(serve.Handler)
         sent: list[tuple[dict[str, object], int]] = []
-        handler.server = types.SimpleNamespace(db_path="/tmp/token-usage.sqlite")
+        handler.server = types.SimpleNamespace(db_path="/tmp/bola.sqlite")
         handler.read_json_body = lambda: {}
         handler.send_json = lambda payload, status=200: sent.append((payload, status))
         handler.delete_all_logs = lambda _base, _db_path: (_ for _ in ()).throw(AssertionError("delete all must not run"))
@@ -477,7 +677,7 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
         serve = load_module("serve_dashboard_delete_all_api_test", ROOT / "scripts" / "serve_dashboard.py")
         handler = serve.Handler.__new__(serve.Handler)
         sent: list[tuple[dict[str, object], int]] = []
-        db_path = pathlib.Path("/tmp/token-usage.sqlite")
+        db_path = pathlib.Path("/tmp/bola.sqlite")
         handler.server = types.SimpleNamespace(db_path=db_path)
         handler.read_json_body = lambda: {"confirm_all_logs": True}
         handler.delete_all_logs = lambda base, output: {"deleted_bytes": 12, "deleted": [{"path": str(base), "deleted_bytes": 12}]}
@@ -495,7 +695,7 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
         serve = load_module("serve_dashboard_delete_all_partial_failed_test", ROOT / "scripts" / "serve_dashboard.py")
         handler = serve.Handler.__new__(serve.Handler)
         sent: list[tuple[dict[str, object], int]] = []
-        db_path = pathlib.Path("/tmp/token-usage.sqlite")
+        db_path = pathlib.Path("/tmp/bola.sqlite")
         handler.server = types.SimpleNamespace(db_path=db_path)
         handler.read_json_body = lambda: {"confirm_all_logs": True}
         handler.delete_all_logs = lambda base, output: {
@@ -521,10 +721,12 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
         serve = load_module("serve_dashboard_delete_all_busy_test", ROOT / "scripts" / "serve_dashboard.py")
         handler = serve.Handler.__new__(serve.Handler)
         sent: list[tuple[dict[str, object], int]] = []
-        db_path = pathlib.Path("/tmp/token-usage.sqlite")
+        db_path = pathlib.Path("/tmp/bola.sqlite")
         handler.server = types.SimpleNamespace(db_path=db_path)
         handler.read_json_body = lambda: {"confirm_all_logs": True}
-        handler.delete_all_logs = lambda _base, _output: (_ for _ in ()).throw(serve.service_lock.ServiceLockBusy(pathlib.Path("/tmp/service.lock")))
+        handler.delete_all_logs = lambda _base, _output: (_ for _ in ()).throw(
+            serve.dashboard_cleanup_api.service_lock.ServiceLockBusy(pathlib.Path("/tmp/service.lock"))
+        )
         handler.send_json = lambda payload, status=200: sent.append((payload, status))
 
         handler.handle_cleanup_delete_all()
@@ -535,19 +737,26 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
     def test_log_cleanup_retention_api_uses_full_prune_command(self) -> None:
         serve = load_module("serve_dashboard_retention_prune_command_test", ROOT / "scripts" / "serve_dashboard.py")
         handler = serve.Handler.__new__(serve.Handler)
-        output = pathlib.Path("/tmp/token-usage.sqlite")
+        output = pathlib.Path("/tmp/bola.sqlite")
         sent: list[tuple[dict[str, object], int]] = []
         calls: list[tuple[pathlib.Path, float, str]] = []
         handler.server = types.SimpleNamespace(db_path=str(output))
-        handler.read_json_body = lambda: {"cutoff_date": "2026-05-20", "preview_signature": "fresh"}
-        handler.cleanup_cutoff_unix = lambda value=None: 1779235200.0
-        handler.run_retention_prune_command = lambda db_path, cutoff, preview_signature: calls.append((db_path, cutoff, preview_signature)) or {"returncode": 0, "stdout": '{"deleted_rows":1}', "stderr": "", "metadata": {"deleted_rows": 1, "delete": {"deleted_rows": 1}}}
-        handler.cleanup_payload = lambda db_path=None, retention_cutoff_unix=None: {"summary": {}, "rows": [], "retention_cutoff_unix": retention_cutoff_unix, "retention": {"selected": {"preview_signature": "fresh", "deletable_rows": 1}}}
+        handler.read_json_body = lambda: {"cutoff_date": "2026-05-20", "timezone": "Asia/Seoul", "preview_signature": "fresh"}
+        handler.run_retention_prune_command = lambda db_path, cutoff, preview_signature: (
+            calls.append((db_path, cutoff, preview_signature))
+            or {"returncode": 0, "stdout": '{"deleted_rows":1}', "stderr": "", "metadata": {"deleted_rows": 1, "delete": {"deleted_rows": 1}}}
+        )
+        handler.cleanup_payload = lambda db_path=None, retention_cutoff_unix=None: {
+            "summary": {},
+            "rows": [],
+            "retention_cutoff_unix": retention_cutoff_unix,
+            "retention": {"selected": {"preview_signature": "fresh", "deletable_rows": 1}},
+        }
         handler.send_json = lambda payload, status=200: sent.append((payload, status))
 
         handler.handle_cleanup_retention()
 
-        self.assertEqual(calls, [(output, 1779235200.0, "fresh")])
+        self.assertEqual(calls, [(output, 1779289200.0, "fresh")])
         self.assertEqual(sent[0][1], 200)
         self.assertEqual(sent[0][0]["retention"]["deleted_rows"], 1)
         self.assertIn("cleanup", sent[0][0])
@@ -558,7 +767,9 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
         sent: list[tuple[dict[str, object], int]] = []
         with tempfile.TemporaryDirectory() as tmp_dir:
             progress_path = pathlib.Path(tmp_dir) / "cleanup-progress.json"
-            serve.progress_control.write_progress_to_path(
+            cleanup_api = serve.dashboard_cleanup_api
+            state = serve.dashboard_operation_state
+            cleanup_api.progress_control.write_progress_to_path(
                 progress_path,
                 status="running",
                 phase="cleanup-delete",
@@ -568,18 +779,15 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
                 processed=3,
                 total=8,
             )
-            with serve.CLEANUP_PROGRESS_LOCK:
-                previous_path = serve.CLEANUP_PROGRESS_FILE
-                previous_running = serve.CLEANUP_RUNNING
-                serve.CLEANUP_PROGRESS_FILE = progress_path
-                serve.CLEANUP_RUNNING = True
+            manager = state.DashboardOperationManager()
+            lease = manager.begin("cleanup", pathlib.Path(tmp_dir))
+            manager.set_files(lease.operation_id, progress_file=progress_path)
+            handler.server = types.SimpleNamespace(operation_manager=manager)
             try:
                 handler.send_json = lambda payload, status=200: sent.append((payload, status))
                 handler.handle_cleanup_progress()
             finally:
-                with serve.CLEANUP_PROGRESS_LOCK:
-                    serve.CLEANUP_PROGRESS_FILE = previous_path
-                    serve.CLEANUP_RUNNING = previous_running
+                lease.close()
 
         self.assertEqual(sent[0][1], 200)
         self.assertEqual(sent[0][0]["phase"], "cleanup-delete")
@@ -592,25 +800,19 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
         handler = serve.Handler.__new__(serve.Handler)
         with tempfile.TemporaryDirectory() as tmp_dir:
             progress_path = pathlib.Path(tmp_dir) / "cleanup-progress.1.2.json"
-            serve.progress_control.write_progress_to_path(progress_path, status="completed", phase="cleanup-refresh", checkpoint="completed")
-            with serve.CLEANUP_PROGRESS_LOCK:
-                previous_path = serve.CLEANUP_PROGRESS_FILE
-                previous_running = serve.CLEANUP_RUNNING
-                serve.CLEANUP_PROGRESS_FILE = progress_path
-                serve.CLEANUP_RUNNING = True
+            cleanup_api = serve.dashboard_cleanup_api
+            state = serve.dashboard_operation_state
+            cleanup_api.progress_control.write_progress_to_path(progress_path, status="completed", phase="cleanup-refresh", checkpoint="completed")
+            manager = state.DashboardOperationManager()
+            lease = manager.begin("cleanup", pathlib.Path(tmp_dir))
+            manager.set_files(lease.operation_id, progress_file=progress_path)
+            handler.server = types.SimpleNamespace(operation_manager=manager)
             try:
                 handler.close_cleanup_progress(progress_path)
-                with serve.CLEANUP_PROGRESS_LOCK:
-                    current_path = serve.CLEANUP_PROGRESS_FILE
-                    current_running = serve.CLEANUP_RUNNING
             finally:
-                with serve.CLEANUP_PROGRESS_LOCK:
-                    serve.CLEANUP_PROGRESS_FILE = previous_path
-                    serve.CLEANUP_RUNNING = previous_running
+                lease.close()
 
         self.assertFalse(progress_path.exists())
-        self.assertIsNone(current_path)
-        self.assertFalse(current_running)
 
     def test_transient_progress_sweep_removes_stale_progress_files_only(self) -> None:
         serve = load_module("serve_dashboard_progress_sweep_test", ROOT / "scripts" / "serve_dashboard.py")
@@ -641,6 +843,6 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertTrue(kept_present)
 
     def test_log_cleanup_post_analyze_refreshes_retention_index_incrementally(self) -> None:
-        source = (ROOT / "scripts" / "serve_dashboard.py").read_text(encoding="utf-8")
-        self.assertIn("dashboard_cleanup.refresh_retention_index_for_current_sources(TOKEN_USAGE_ROOT)", source)
-        self.assertNotIn("dashboard_cleanup.rebuild_retention_index(TOKEN_USAGE_ROOT)", source)
+        source = (ROOT / "scripts" / "dashboard_rebuild_api.py").read_text(encoding="utf-8")
+        self.assertIn("dashboard_cleanup.refresh_retention_index_for_current_sources(self.dashboard_output_dir())", source)
+        self.assertNotIn("dashboard_cleanup.rebuild_retention_index(OUTPUT_DIR)", source)

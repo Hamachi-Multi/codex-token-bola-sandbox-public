@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import pathlib
 import sys
 import time
@@ -19,8 +18,9 @@ import service_lock
 import service_paths
 import raw_segments
 
-CODEX_HOME = pathlib.Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
-BASE_DIR = service_paths.service_root(CODEX_HOME)
+RUNTIME_PATHS = service_paths.resolve_runtime_paths()
+CODEX_DIR = RUNTIME_PATHS.codex_dir
+BASE_DIR = RUNTIME_PATHS.output_dir
 
 def rotate_current_logs(base: pathlib.Path = BASE_DIR) -> dict[str, object]:
     prompt_base = pathlib.Path(base).expanduser()
@@ -48,7 +48,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    service_paths.assert_migrated(CODEX_HOME)
     with service_lock.acquire_service_lock(reason="compact"):
         result = compact(parse_args())
     print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))

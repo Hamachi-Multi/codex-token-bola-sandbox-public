@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 import pathlib
 import sqlite3
 import sys
+import threading
+from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any
 
@@ -15,11 +18,14 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import transcript_parser
+import turn_lifecycle
 
 NORMALIZE_LOGIC_VERSION = 5
 RECOVERY_RECORD_TYPES = {"turn_start", "turn_stop_missing_start"}
 TURN_START_RECOVERY_AGE_SECONDS = 60
-TERMINAL_TURN_EVENT_TYPES = {"task_complete", "task_aborted", "turn_aborted"}
+RECOVERY_TRANSCRIPT_CACHE_LIMIT = 128
+_RECOVERY_TRANSCRIPT_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
+_RECOVERY_TRANSCRIPT_CACHE_LOCK = threading.RLock()
 
 
 def _json_state(path: pathlib.Path, label: str) -> tuple[dict[str, Any], dict[str, str] | None]:
@@ -89,11 +95,29 @@ def _validate_manifest_segment(base: pathlib.Path, segment: dict[str, Any], mani
     return None
 
 
-def _file_size(path: pathlib.Path) -> int:
+def _source_warning(warnings: list[dict[str, str]] | None, code: str, path: pathlib.Path) -> None:
+    if warnings is None:
+        return
+    warning = {"code": code, "path": str(path)}
+    if warning not in warnings:
+        warnings.append(warning)
+
+
+def _file_size(
+    path: pathlib.Path,
+    warnings: list[dict[str, str]] | None = None,
+    *,
+    missing_is_warning: bool = True,
+) -> int | None:
     try:
         return path.stat().st_size
+    except FileNotFoundError:
+        if missing_is_warning:
+            _source_warning(warnings, "freshness_source_stat_error", path)
+        return None
     except OSError:
-        return 0
+        _source_warning(warnings, "freshness_source_stat_error", path)
+        return None
 
 
 def _mtime_unix(path: pathlib.Path) -> float | None:
@@ -117,19 +141,25 @@ def _safe_offset(value: Any, size: int) -> int:
     return max(0, min(offset, size))
 
 
-def _count_jsonl_rows_after(path: pathlib.Path, offset: int) -> int:
+def _count_jsonl_rows_after(
+    path: pathlib.Path,
+    offset: int,
+    warnings: list[dict[str, str]] | None = None,
+) -> int | None:
     if path.suffix == ".gz":
         try:
             with gzip.open(path, "rt", encoding="utf-8") as handle:
                 return sum(1 for line in handle if line.strip())
         except OSError:
-            return 0
+            _source_warning(warnings, "freshness_source_read_error", path)
+            return None
     try:
         with path.open("rb") as handle:
             handle.seek(offset)
             return sum(1 for line in handle if line.strip())
     except OSError:
-        return 0
+        _source_warning(warnings, "freshness_source_read_error", path)
+        return None
 
 
 def _closed_manifest_segments(base: pathlib.Path, manifest: dict[str, Any], warnings: list[dict[str, str]], manifest_path: pathlib.Path) -> dict[str, dict[str, Any]]:
@@ -252,12 +282,15 @@ def _read_freshness_state(base: pathlib.Path) -> dict[str, Any]:
 
 def _pending_sources(base: pathlib.Path, state: dict[str, Any] | None = None) -> tuple[int, int]:
     state = state or _read_freshness_state(base)
+    warnings = state["warnings"]
     sources = state["sources"]
     processed_segments = state["processed_segments"]
     candidates: dict[str, int] = {}
     for path_text, offset in sources.items():
         path = pathlib.Path(str(path_text)).expanduser()
-        candidates[str(path)] = _safe_offset(offset, _file_size(path))
+        size = _file_size(path, warnings)
+        if size is not None:
+            candidates[str(path)] = _safe_offset(offset, size)
     for path in state["current_paths"]:
         candidates.setdefault(str(path), 0)
     for path in state["fallback_paths"]:
@@ -273,10 +306,8 @@ def _pending_sources(base: pathlib.Path, state: dict[str, Any] | None = None) ->
     pending_files = 0
     for path_text, offset in candidates.items():
         path = pathlib.Path(path_text).expanduser()
-        if not path.is_file():
-            continue
-        rows = _count_jsonl_rows_after(path, offset)
-        if rows <= 0:
+        rows = _count_jsonl_rows_after(path, offset, warnings)
+        if rows is None or rows <= 0:
             continue
         pending_rows += rows
         pending_files += 1
@@ -304,16 +335,17 @@ def _run_metadata(db_path: pathlib.Path) -> dict[str, Any]:
     return metadata
 
 
-def _pending_normalized_rows(base: pathlib.Path, db_path: pathlib.Path) -> int:
+def _pending_normalized_rows(base: pathlib.Path, db_path: pathlib.Path, warnings: list[dict[str, str]] | None = None) -> int:
     normalized = base / "normalized" / "prompt-usage.normalized.jsonl"
-    size = _file_size(normalized)
-    if size <= 0:
+    size = _file_size(normalized, warnings, missing_is_warning=False)
+    if size is None or size <= 0:
         return 0
     metadata = _run_metadata(db_path)
     offset = _safe_offset(metadata.get("applied_normalized_turns_size"), size)
     if size <= offset:
         return 0
-    return _count_jsonl_rows_after(normalized, offset)
+    rows = _count_jsonl_rows_after(normalized, offset, warnings)
+    return rows if rows is not None else 0
 
 
 def _turn_start_ready_for_recovery(payload: dict[str, Any], now: datetime) -> bool:
@@ -333,45 +365,145 @@ def _turn_start_ready_for_recovery(payload: dict[str, Any], now: datetime) -> bo
     return True
 
 
-def _terminal_turn_ids_for_transcript(transcript_path: str | pathlib.Path, cache: dict[str, set[str]]) -> set[str]:
-    path = pathlib.Path(transcript_path).expanduser()
-    cache_key = str(path.resolve(strict=False))
-    cached = cache.get(cache_key)
-    if cached is not None:
-        return cached
-    terminal_turn_ids: set[str] = set()
-    stream, error = transcript_parser.transcript_event_stream(path, 0)
+def _complete_jsonl_state(path: pathlib.Path, size: int) -> tuple[int, str]:
+    if size <= 0:
+        return 0, hashlib.blake2b(b"", digest_size=16).hexdigest()
+    try:
+        with path.open("rb") as handle:
+            digest = hashlib.blake2b(digest_size=16)
+            sample_positions = sorted({0, max(0, size // 2 - 2048), max(0, size - 4096)})
+            for position in sample_positions:
+                handle.seek(position)
+                digest.update(position.to_bytes(8, "big"))
+                digest.update(handle.read(min(4096, size - position)))
+            handle.seek(size - 1)
+            if handle.read(1) == b"\n":
+                return size, digest.hexdigest()
+            cursor = size
+            while cursor > 0:
+                chunk_start = max(0, cursor - 64 * 1024)
+                handle.seek(chunk_start)
+                chunk = handle.read(cursor - chunk_start)
+                newline = chunk.rfind(b"\n")
+                if newline >= 0:
+                    return chunk_start + newline + 1, digest.hexdigest()
+                cursor = chunk_start
+    except OSError:
+        return 0, ""
+    return 0, digest.hexdigest()
+
+
+def _scan_terminal_turn_ids(path: pathlib.Path, start: int, end: int) -> tuple[dict[str, int], bool]:
+    if end <= start:
+        return {}, True
+    stream, error = transcript_parser.transcript_event_stream(path, start, end)
     if error is not None or stream is None:
-        cache[cache_key] = terminal_turn_ids
-        return terminal_turn_ids
+        return {}, False
+    terminal_turn_offsets: dict[str, int] = {}
     try:
         for item in stream:
-            event_item = item["item"]
-            if not isinstance(event_item, dict) or event_item.get("type") != "event_msg":
-                continue
-            event = event_item.get("payload") if isinstance(event_item.get("payload"), dict) else {}
-            turn_id = str(event.get("turn_id") or "")
-            if turn_id and event.get("type") in TERMINAL_TURN_EVENT_TYPES:
-                terminal_turn_ids.add(turn_id)
+            terminal = turn_lifecycle.terminal_turn_event(item)
+            if terminal is not None:
+                turn_id = terminal["turn_id"]
+                terminal_turn_offsets[turn_id] = max(
+                    terminal_turn_offsets.get(turn_id, -1),
+                    terminal["event_offset"],
+                )
     except OSError:
-        terminal_turn_ids = set()
-    cache[cache_key] = terminal_turn_ids
-    return terminal_turn_ids
+        return {}, False
+    return terminal_turn_offsets, True
 
 
-def _turn_start_has_terminal_event(payload: dict[str, Any], terminal_cache: dict[str, set[str]]) -> bool:
-    turn_id = str(payload.get("turn_id") or "")
-    transcript_path = payload.get("transcript_path")
-    if not turn_id or not transcript_path:
-        return False
-    return turn_id in _terminal_turn_ids_for_transcript(str(transcript_path), terminal_cache)
+def _pending_start_offset(payload: dict[str, Any], complete_size: int) -> int:
+    value = payload.get("start_file_size")
+    if not isinstance(value, int) or value < 0 or value > complete_size:
+        return 0
+    return value
+
+
+def _terminal_turn_ids_for_pending_states(path: pathlib.Path, states: list[dict[str, Any]]) -> set[str]:
+    try:
+        stat_result = path.stat()
+    except OSError:
+        return set()
+    complete_size, content_signature = _complete_jsonl_state(path, stat_result.st_size)
+    minimum_start = min((_pending_start_offset(state, complete_size) for state in states), default=complete_size)
+    cache_key = str(path.resolve(strict=False))
+    identity = (int(stat_result.st_dev), int(stat_result.st_ino))
+
+    with _RECOVERY_TRANSCRIPT_CACHE_LOCK:
+        cached = _RECOVERY_TRANSCRIPT_CACHE.get(cache_key)
+        same_size_rewrite = (
+            cached is not None
+            and int(cached.get("observed_size") or 0) == int(stat_result.st_size)
+            and int(cached.get("scanned_to") or 0) == complete_size
+            and (
+                int(cached.get("mtime_ns") or 0) != int(stat_result.st_mtime_ns)
+                or int(cached.get("ctime_ns") or 0) != int(stat_result.st_ctime_ns)
+                or cached.get("content_signature") != content_signature
+            )
+        )
+        if (
+            cached is None
+            or cached.get("identity") != identity
+            or int(cached.get("scanned_to") or 0) > complete_size
+            or same_size_rewrite
+        ):
+            cached = {
+                "identity": identity,
+                "scanned_from": minimum_start,
+                "scanned_to": minimum_start,
+                "terminal_turn_offsets": {},
+            }
+
+        scanned_from = int(cached.get("scanned_from") or 0)
+        scanned_to = int(cached.get("scanned_to") or 0)
+        terminal_turn_offsets = dict(cached.get("terminal_turn_offsets") or {})
+
+        if minimum_start < scanned_from:
+            found, ok = _scan_terminal_turn_ids(path, minimum_start, scanned_from)
+            if not ok:
+                return set()
+            for turn_id, offset in found.items():
+                terminal_turn_offsets[turn_id] = max(terminal_turn_offsets.get(turn_id, -1), offset)
+            scanned_from = minimum_start
+        if complete_size > scanned_to:
+            found, ok = _scan_terminal_turn_ids(path, scanned_to, complete_size)
+            if not ok:
+                return set()
+            for turn_id, offset in found.items():
+                terminal_turn_offsets[turn_id] = max(terminal_turn_offsets.get(turn_id, -1), offset)
+            scanned_to = complete_size
+
+        cached.update(
+            {
+                "identity": identity,
+                "scanned_from": scanned_from,
+                "scanned_to": scanned_to,
+                "observed_size": int(stat_result.st_size),
+                "mtime_ns": int(stat_result.st_mtime_ns),
+                "ctime_ns": int(stat_result.st_ctime_ns),
+                "content_signature": content_signature,
+                "terminal_turn_offsets": terminal_turn_offsets,
+            }
+        )
+        _RECOVERY_TRANSCRIPT_CACHE[cache_key] = cached
+        _RECOVERY_TRANSCRIPT_CACHE.move_to_end(cache_key)
+        while len(_RECOVERY_TRANSCRIPT_CACHE) > RECOVERY_TRANSCRIPT_CACHE_LIMIT:
+            _RECOVERY_TRANSCRIPT_CACHE.popitem(last=False)
+        return {
+            turn_id
+            for state in states
+            if (turn_id := str(state.get("turn_id") or ""))
+            and terminal_turn_offsets.get(turn_id, -1) >= _pending_start_offset(state, complete_size)
+        }
 
 
 def _pending_recovery_files(base: pathlib.Path) -> int:
     state_dir = base / "state"
     count = 0
     now = datetime.now(timezone.utc)
-    terminal_cache: dict[str, set[str]] = {}
+    pending_by_transcript: dict[str, list[dict[str, Any]]] = {}
     try:
         candidates = sorted(state_dir.glob("*.json"))
     except OSError:
@@ -386,8 +518,14 @@ def _pending_recovery_files(base: pathlib.Path) -> int:
         record_type = payload.get("record_type")
         if record_type == "turn_stop_missing_start":
             count += 1
-        elif record_type == "turn_start" and _turn_start_ready_for_recovery(payload, now) and _turn_start_has_terminal_event(payload, terminal_cache):
-            count += 1
+        elif record_type == "turn_start" and _turn_start_ready_for_recovery(payload, now):
+            transcript_path = str(payload.get("transcript_path") or "")
+            turn_id = str(payload.get("turn_id") or "")
+            if transcript_path and turn_id:
+                pending_by_transcript.setdefault(transcript_path, []).append(payload)
+    for transcript_path, states in pending_by_transcript.items():
+        terminal_turn_ids = _terminal_turn_ids_for_pending_states(pathlib.Path(transcript_path).expanduser(), states)
+        count += sum(1 for state in states if str(state.get("turn_id") or "") in terminal_turn_ids)
     return count
 
 
@@ -408,7 +546,7 @@ def freshness_payload(token_usage_root: pathlib.Path | str, db_path: pathlib.Pat
     db_mtime = _mtime_unix(db)
     latest_raw = _latest_raw_mtime(base, state)
     pending_rows, pending_files = _pending_sources(base, state)
-    pending_normalized_rows = _pending_normalized_rows(base, db)
+    pending_normalized_rows = _pending_normalized_rows(base, db, state["warnings"])
     pending_recovery_files = _pending_recovery_files(base)
     pending_analysis_rows = pending_rows + pending_normalized_rows
     has_db = db.is_file()

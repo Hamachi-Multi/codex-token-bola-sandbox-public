@@ -9,7 +9,7 @@ import time
 from typing import Any
 
 
-PROGRESS_ENV = "CODEX_TOKEN_USAGE_PROGRESS_FILE"
+PROGRESS_ENV = "BOLA_PROGRESS_FILE"
 DEFAULT_PHASE_COUNT = 3
 DEFAULT_WRITE_THROTTLE_SECONDS = 0.25
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
@@ -36,6 +36,7 @@ def clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
 
 def progress_payload(
     *,
+    operation_id: str | None = None,
     status: str = "running",
     phase: str = "",
     phase_index: int = 0,
@@ -57,6 +58,7 @@ def progress_payload(
             start, end = PHASE_RANGES.get(phase, (0.0, 100.0))
             overall_progress = start + (end - start) * phase_progress
     return {
+        **({"operation_id": operation_id} if operation_id else {}),
         "status": status,
         "running": status == "running",
         "phase": phase,
@@ -106,6 +108,10 @@ def write_progress(**kwargs: Any) -> dict[str, Any] | None:
     if path is None:
         return None
     return write_progress_to_path(path, **kwargs)
+
+
+def forget_progress(path: pathlib.Path | str) -> None:
+    _LAST_WRITE_BY_PATH.pop(str(pathlib.Path(path)), None)
 
 
 def read_progress(path: pathlib.Path | None) -> dict[str, Any]:

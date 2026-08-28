@@ -2,16 +2,83 @@
 
 from __future__ import annotations
 
-from playwright_dashboard_helpers import assert_true, fetch_json, scroll_bottom_state
+from playwright_dashboard_helpers import (
+    assert_true,
+    fetch_json,
+    scroll_bottom_state,
+    wait_for_python_condition,
+    wait_for_view_content,
+)
+
+
+def check_subagent_focus_refresh(page) -> None:
+    pending_routes = []
+
+    def hold_subagents(route) -> None:
+        pending_routes.append(route)
+
+    def wait_for_held_subagents() -> None:
+        wait_for_python_condition(
+            page,
+            lambda: bool(pending_routes),
+            description="a held subagents refresh request",
+        )
+
+    page.route("**/api/subagents?*", hold_subagents)
+    try:
+        page.locator("#refresh").click()
+        wait_for_held_subagents()
+        focused_row = page.locator("#subagent-rollups tr[data-confidence] .row-select-button").first
+        old_button = focused_row.element_handle()
+        focused_row.focus()
+        pending_routes.pop(0).continue_()
+        page.wait_for_function(
+            """
+            oldButton => {
+              const active = document.activeElement;
+              return !oldButton.isConnected
+                && active?.isConnected
+                && Boolean(active.closest('#subagent-rollups tr[data-confidence]'));
+            }
+            """,
+            arg=old_button,
+            timeout=10_000,
+        )
+
+        page.locator("#refresh").click()
+        wait_for_held_subagents()
+        old_button = page.locator("#subagent-rollups tr[data-confidence] .row-select-button").first.element_handle()
+        page.locator("#days").focus()
+        pending_routes.pop(0).continue_()
+        page.wait_for_function(
+            """
+            oldButton => !oldButton.isConnected && document.activeElement === document.querySelector('#days')
+            """,
+            arg=old_button,
+            timeout=10_000,
+        )
+    finally:
+        for route in pending_routes:
+            route.continue_()
+        page.unroute("**/api/subagents?*", hold_subagents)
 
 
 def check_tools_and_subagents(page, base_url: str) -> None:
     page.locator('button[data-view-target="overview"]').click()
-    page.wait_for_selector("#projects tr[data-session-id], #projects .empty", timeout=10_000)
+    wait_for_view_content(
+        page,
+        view="overview",
+        container="#projects",
+        row="tr[data-session-id]",
+        empty=".empty",
+    )
     if page.locator("#projects tr[data-session-id]").count() > 0:
         page.locator('#projects [data-list-sort="raw"]').click()
-        page.wait_for_load_state("networkidle")
         page.wait_for_selector('#projects th[aria-sort="descending"] [data-list-sort="raw"]', timeout=10_000)
+        overview_sort_focus_restored = page.locator('#projects [data-list-sort="raw"]').evaluate(
+            "button => document.activeElement === button"
+        )
+        assert_true(overview_sort_focus_restored, "overview sort should restore focus to the replacement header button")
         sessions = fetch_json(f"{base_url}/api/sessions?days=7&sessions_page=1&per_page=25&session_sort=raw&session_sort_dir=desc")
         first_session = page.locator("#projects tr[data-session-id]").first.get_attribute("data-session-id")
         assert_true(
@@ -20,14 +87,21 @@ def check_tools_and_subagents(page, base_url: str) -> None:
         )
 
     page.locator('button[data-view-target="subagents"]').click()
-    page.wait_for_selector("#subagent-rollups tr[data-confidence], #subagent-rollups .empty", timeout=10_000)
+    wait_for_view_content(
+        page,
+        view="subagents",
+        container="#subagent-rollups",
+        row="tr[data-confidence]",
+        empty=".empty",
+        require_focus=True,
+    )
     if page.locator("#subagent-rollups tr[data-confidence]").count() > 0:
         subagent_focus_index = page.locator("#subagent-rollups").evaluate(
-            "() => Array.from(document.querySelectorAll('#subagent-rollups tr[data-confidence]')).indexOf(document.activeElement)"
+            "() => Array.from(document.querySelectorAll('#subagent-rollups tr[data-confidence] .row-select-button')).indexOf(document.activeElement)"
         )
         assert_true(subagent_focus_index >= 0, f"subagents view should focus an attribution row on entry: {subagent_focus_index}")
+        check_subagent_focus_refresh(page)
         page.locator('#subagent-rollups [data-list-sort="child_raw"]').click()
-        page.wait_for_load_state("networkidle")
         page.wait_for_selector('#subagent-rollups th[aria-sort="descending"] [data-list-sort="child_raw"]', timeout=10_000)
         subagents = fetch_json(f"{base_url}/api/subagents?days=7&subagent_sort=child_raw&subagent_sort_dir=desc")
         first_confidence = page.locator("#subagent-rollups tr[data-confidence]").first.get_attribute("data-confidence")
@@ -73,14 +147,20 @@ def check_tools_and_subagents(page, base_url: str) -> None:
             )
 
     page.locator('button[data-view-target="tools"]').click()
-    page.wait_for_selector("#tool-output tr[data-tool], #tool-output .empty", timeout=10_000)
+    wait_for_view_content(
+        page,
+        view="tools",
+        container="#tool-output",
+        row="tr[data-tool]",
+        empty=".empty",
+        require_focus=True,
+    )
     if page.locator("#tool-output table").count() > 0:
         tool_focus_index = page.locator("#tool-output").evaluate(
-            "() => Array.from(document.querySelectorAll('#tool-output tr[data-tool]')).indexOf(document.activeElement)"
+            "() => Array.from(document.querySelectorAll('#tool-output tr[data-tool] .row-select-button')).indexOf(document.activeElement)"
         )
         assert_true(tool_focus_index >= 0, f"tools view should focus a tool row on entry: {tool_focus_index}")
         page.locator('#tool-output [data-list-sort="calls"]').click()
-        page.wait_for_load_state("networkidle")
         page.wait_for_selector('#tool-output th[aria-sort="descending"] [data-list-sort="calls"]', timeout=10_000)
         tools = fetch_json(f"{base_url}/api/tools?days=7&tools_page=1&per_page=25&tool_sort=calls&tool_sort_dir=desc")
         first_tool = page.locator("#tool-output tr[data-tool]").first.get_attribute("data-tool")

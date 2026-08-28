@@ -15,8 +15,8 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
 
         self.assertIn('<link rel="stylesheet" href="/assets/dashboard.css">', serve.HTML)
         self.assertIn('<script type="module" src="/assets/dashboard.js"></script>', serve.HTML)
-        self.assertIn('<html lang="ko">', serve.HTML)
-        self.assertNotIn('<html lang="ko" data-theme="light">', serve.HTML)
+        self.assertIn('<html lang="en">', serve.HTML)
+        self.assertNotIn('<html lang="en" data-theme="light">', serve.HTML)
         self.assertNotIn("<style>", serve.HTML)
         self.assertEqual(serve.HTML.count("<script>"), 1)
         self.assertIn("import { initDashboard } from './dashboard/app.js';", serve.DASHBOARD_JS)
@@ -31,9 +31,9 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
     def test_saved_theme_is_bootstrapped_before_stylesheet_without_transitions(self) -> None:
         serve = load_module("serve_dashboard_saved_theme_bootstrap_test", ROOT / "scripts" / "serve_dashboard.py")
 
-        self.assertIn("codex-token-usage-dashboard-settings", serve.HTML)
+        self.assertIn("bola-dashboard-settings", serve.HTML)
         self.assertLess(
-            serve.HTML.index("codex-token-usage-dashboard-settings"),
+            serve.HTML.index("bola-dashboard-settings"),
             serve.HTML.index('<link rel="stylesheet" href="/assets/dashboard.css">'),
         )
         self.assertIn("const storedTheme = settings.themeMode === 'dark' || settings.themeMode === 'light' ? settings.themeMode : '';", serve.HTML)
@@ -47,7 +47,7 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
 
     def test_theme_mode_control_uses_header_icon_buttons(self) -> None:
         self.assertIn('<div class="theme-toggle" role="group" aria-label="Theme mode">', DASHBOARD_ASSET_BUNDLE)
-        self.assertIn('<div class="theme-switcher">\n    <div class="theme-toggle" role="group" aria-label="Theme mode">', DASHBOARD_ASSET_BUNDLE)
+        self.assertIn('<div class="theme-switcher">\n        <div class="theme-toggle" role="group" aria-label="Theme mode">', DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("theme-toggle-label", DASHBOARD_ASSET_BUNDLE)
         self.assertIn('<button id="theme-light" class="theme-toggle-button active" type="button" data-theme-mode="light" aria-pressed="true" title="Light mode" aria-label="Light mode">', DASHBOARD_ASSET_BUNDLE)
         self.assertIn('<button id="theme-dark" class="theme-toggle-button" type="button" data-theme-mode="dark" aria-pressed="false" title="Dark mode" aria-label="Dark mode">', DASHBOARD_ASSET_BUNDLE)
@@ -64,10 +64,10 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertNotIn('<select id="theme-mode"', DASHBOARD_ASSET_BUNDLE)
         self.assertLess(
             DASHBOARD_ASSET_BUNDLE.index('<div class="toolbar">'),
-            DASHBOARD_ASSET_BUNDLE.index('</header>\n  <div class="theme-switcher">'),
+            DASHBOARD_ASSET_BUNDLE.index('</header>\n  <div id="query-status"'),
         )
         self.assertLess(
-            DASHBOARD_ASSET_BUNDLE.index('</header>\n  <div class="theme-switcher">'),
+            DASHBOARD_ASSET_BUNDLE.index('</header>\n  <div id="query-status"'),
             DASHBOARD_ASSET_BUNDLE.index('<main>'),
         )
         self.assertIn("grid-template-rows: auto minmax(0, 1fr);", DASHBOARD_ASSET_BUNDLE)
@@ -75,8 +75,9 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn(".appbar {\n      display: flex;\n      align-items: center;", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn(".appbar::after", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn(".appbar-subrow", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn(".theme-switcher {\n      position: fixed;\n      right: 22px;\n      bottom: 20px;", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("z-index: 4;\n      display: flex;\n      align-items: center;\n      height: 30px;", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn(".theme-switcher {\n      display: flex;\n      align-items: center;\n      height: 30px;", DASHBOARD_ASSET_BUNDLE)
+        self.assertNotIn("position: fixed;\n      right: 22px;\n      bottom: 20px;", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn(".brand-nav {\n      display: grid;\n      grid-template-columns: auto minmax(0, 1fr) auto;", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("min-height: 72px;", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("padding: 12px 24px 14px;", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("padding: 18px 24px 28px;", DASHBOARD_ASSET_BUNDLE)
@@ -91,7 +92,7 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertNotIn(".theme-toggle-button[aria-pressed=\"true\"] {\n      background: var(--control-selected);", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("box-shadow: inset 0 0 0 1px var(--control-selected-border);", DASHBOARD_ASSET_BUNDLE)
         self.assertIn(".theme-toggle-text {\n      display: none;", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn(".theme-switcher { right: 14px; bottom: 14px; height: 30px; }", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn(".theme-switcher { grid-column: 2; grid-row: 1; }", DASHBOARD_ASSET_BUNDLE)
         self.assertIn(".theme-toggle-text { display: none; }", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("right: calc(24px - (100vw - 100%));", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("themeMode: 'light'", DASHBOARD_ASSET_BUNDLE)
@@ -211,7 +212,6 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertEqual(calls[0]["cwd"], "/example/.codex/codex-token-bola")
         self.assertNotIn("project", calls[0])
     def test_turns_page_defaults_to_latest_prompt_first(self) -> None:
-        serve = load_module("serve_dashboard_latest_turns_test", ROOT / "scripts" / "serve_dashboard.py")
         queries = load_module("dashboard_queries_latest_turns_test", ROOT / "scripts" / "dashboard_queries.py")
         build_source = (
             (ROOT / "scripts" / "build_analytics.py").read_text(encoding="utf-8")
@@ -298,13 +298,14 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn("const sortAttribute = sortState ? sortState.attribute : 'data-turn-sort';", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("function compactDateTime(value)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("function compactDate(value)", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("${esc(compactDateTime(r.captured_at))}", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("const promptAt = r.started_at || r.captured_at || '';", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("${esc(compactDateTime(promptAt))}", DASHBOARD_ASSET_BUNDLE)
         self.assertIn('class="datetime-cell"', DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn('class="date-cell"', DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn('class="time-cell"', DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("<h2>Expensive Turns</h2>", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("coalesce(captured_at_unix, 0) desc", (ROOT / "scripts" / "serve_dashboard.py").read_text(encoding="utf-8"))
-        self.assertIn("idx_turns_project_captured_at_unix", build_source)
+        self.assertIn("idx_turns_project_started_at_unix", build_source)
         self.assertIn("idx_turns_latest_order", build_source)
         self.assertIn("idx_turns_project_latest_order", build_source)
 
@@ -331,7 +332,6 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertEqual(scoped_search["rows"], [])
 
     def test_turns_numeric_columns_are_compact_after_unit_suffixes(self) -> None:
-        serve = load_module("serve_dashboard_turn_numeric_width_test", ROOT / "scripts" / "serve_dashboard.py")
         self.assertIn("#turn-list th:nth-child(1), #turn-list td:nth-child(1) { width: 21%; }", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("#turn-list th:nth-child(2), #turn-list td:nth-child(2) { width: 18%; }", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("#turn-list th:nth-child(3), #turn-list td:nth-child(3) { width: 41%; }", DASHBOARD_ASSET_BUNDLE)
@@ -340,7 +340,6 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn("<td class=\"num\">${compactNumberSpan(r.credits, 'money')}</td>", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("<td class=\"num\">${compactNumberSpan(r.raw)}</td>", DASHBOARD_ASSET_BUNDLE)
     def test_tool_prompt_navigation_uses_modal_not_turns_view(self) -> None:
-        serve = load_module("serve_dashboard_modal_contract_test", ROOT / "scripts" / "serve_dashboard.py")
         self.assertIn('id="turn-modal"', DASHBOARD_ASSET_BUNDLE)
         self.assertIn("function openTurnModalFromToolLink", DASHBOARD_ASSET_BUNDLE)
         self.assertIn('data-open-turn-modal="1"', DASHBOARD_ASSET_BUNDLE)
@@ -348,11 +347,9 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn("line-height: inherit;\n      text-align: left;", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("function focusTurnFromToolLink", DASHBOARD_ASSET_BUNDLE)
     def test_tool_prompt_modal_uses_readable_width(self) -> None:
-        serve = load_module("serve_dashboard_modal_width_test", ROOT / "scripts" / "serve_dashboard.py")
         self.assertIn(".turn-modal-dialog {\n      width: min(880px, calc(100vw - 56px));", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn(".turn-modal-dialog {\n      width: min(1040px, calc(100vw - 56px));", DASHBOARD_ASSET_BUNDLE)
     def test_tool_prompt_modal_reuses_selected_turn_summary(self) -> None:
-        serve = load_module("serve_dashboard_modal_section_order_test", ROOT / "scripts" / "serve_dashboard.py")
         modal_idx = DASHBOARD_ASSET_BUNDLE.index("function renderTurnModal(data)")
         shared_idx = DASHBOARD_ASSET_BUNDLE.index("return selectedTurnDetailMarkup(data, {", modal_idx)
         self.assertGreater(shared_idx, modal_idx)
@@ -360,7 +357,6 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn('<div class="selected-turn-section-title">Call Summary</div>', DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("Model Call Summary", DASHBOARD_ASSET_BUNDLE)
     def test_modal_fetch_uses_summary_payload_and_restores_focus(self) -> None:
-        serve = load_module("serve_dashboard_modal_focus_limit_test", ROOT / "scripts" / "serve_dashboard.py")
         self.assertNotIn("const DETAIL_DEFAULT_LIMIT", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("const MODAL_DETAIL_LIMIT", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("q.set('detail_limit'", DASHBOARD_ASSET_BUNDLE)
@@ -370,7 +366,6 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn("function trapModalFocus(event, rootId = 'turn-modal')", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("document.querySelector('header')?.setAttribute('inert', '')", DASHBOARD_ASSET_BUNDLE)
     def test_page_rows_control_is_global_for_turn_and_detail_lists(self) -> None:
-        serve = load_module("serve_dashboard_page_rows_scope_test", ROOT / "scripts" / "serve_dashboard.py")
         page_rows_idx = DASHBOARD_ASSET_BUNDLE.index('<select id="turn-page-size" aria-label="Rows per page for Turns, Overview, and Tools" title="Rows per page for Turns, Overview, and Tools">')
         session_idx = DASHBOARD_ASSET_BUNDLE.index('<div class="session-picker" id="session-picker">')
         turn_head_idx = DASHBOARD_ASSET_BUNDLE.index('<div class="turn-head-controls">')
@@ -390,11 +385,14 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertNotIn('<select id="turn-page-size"', DASHBOARD_ASSET_BUNDLE[turn_head_idx:turn_list_idx])
         self.assertNotIn('<select id="project" aria-label="Project filter">', DASHBOARD_ASSET_BUNDLE)
     def test_page_rows_control_paginates_first_column_lists(self) -> None:
-        serve = load_module("serve_dashboard_first_column_pagination_test", ROOT / "scripts" / "serve_dashboard.py")
 
         self.assertIn('listPages: { projects: 1, tools: 1 }', DASHBOARD_ASSET_BUNDLE)
         self.assertIn("listSorts: {", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("function setListSort(kind, key)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("function setListSort(kind, key, trigger = null)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("export function restoreReplacedControlFocus(trigger, selector)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("if (![document.body, document.documentElement].includes(document.activeElement)) return false;", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("setListSort(key, button.dataset.listSort, button);", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("setTurnSort(button.dataset.turnSort, button);", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("function listTableSortState(kind)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("q.set('session_sort', state.listSorts.projects.key);", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("q.set('tool_sort', state.listSorts.tools.key);", DASHBOARD_ASSET_BUNDLE)
@@ -413,54 +411,66 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn("function listIsServerPaged(payload)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("function paginateListRows(key, payload)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("function renderListPager(key, total)", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("renderSessionList(sessions);", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("renderToolList(tools);", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("renderSubagentList((subagents || {}).rows || [])", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("renderSessionList(sessions, prepared);", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("renderToolList(tools, prepared);", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("renderSubagentList((subagents || {}).rows || [], prepared)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("renderListPager('projects', payload)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("renderListPager('tools', payload)", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("paginateListRows('subagents'", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("renderListPager('subagents'", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("resetListPages();", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("state.listPages[key] = nextPage;", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("safeLoad();", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("requestListPage(key, nextPage);", DASHBOARD_ASSET_BUNDLE)
+        self.assertNotIn("state.listPages[key] = nextPage;\n      if (serverPaged)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn(".pager button {\n      min-width: 56px;\n      height: 26px;\n      padding: 0 10px;\n      border-color: var(--border-strong);\n      background: var(--surface-2);", DASHBOARD_ASSET_BUNDLE)
         self.assertIn(".pager .page-status {\n      inline-size: 92px;", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("font-variant-numeric: tabular-nums;\n      font-feature-settings: \"tnum\" 1, \"zero\" 1;\n      text-align: center;", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("button:disabled { cursor: default;", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("not-allowed", DASHBOARD_ASSET_BUNDLE)
     def test_first_column_pagination_reselects_visible_detail_row(self) -> None:
-        serve = load_module("serve_dashboard_first_column_reselect_test", ROOT / "scripts" / "serve_dashboard.py")
 
-        self.assertIn("selectFirstVisibleSessionRow(firstSession);", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("selectFirstVisibleToolRow(firstTool);", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("selectFirstVisibleSubagentRow(firstSubagent);", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("selectFirstVisibleSessionRow(target);", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("selectFirstVisibleToolRow(target);", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("selectFirstVisibleSubagentRow(target);", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("setPanelContent('subagent-mix', 'No rows for the current filter.', 'empty');", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("setPanelContent('subagent-detail',", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("else if (firstSession && !state.selectedSession)", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("else if (firstTool && !state.selectedTool)", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("else if (firstSubagent && !state.selectedSubagentConfidence)", DASHBOARD_ASSET_BUNDLE)
 
+    def test_dashboard_query_cache_is_bounded_and_invalidated_by_mutations(self) -> None:
+        self.assertIn("export const QUERY_CACHE_MAX_ENTRIES = 100;", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("export const QUERY_CACHE_MAX_BYTES = 20 * 1024 * 1024;", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("export const QUERY_CACHE_TTL_MS = 10 * 60 * 1000;", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("export function canonicalQueryKey(path)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("if (inFlight.has(key)) return inFlight.get(key);", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("if (requestEpoch === epoch) prime(path, data);", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("while (entries.size > maxEntries || totalBytes > maxBytes)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("setAnalyticsCacheGeneration((dashboard.freshness || {}).analytics_db_mtime_unix ?? 'missing');", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("const coldStart = state.requestSeq === 0;", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("if (coldStart) setLoading();", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("function prepareAnalyticsReload()", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("invalidateAnalyticsQueries();\n  resetAllPages();\n  setLoading();", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("prefetchNextPage(turns, turnsPath", DASHBOARD_ASSET_BUNDLE)
+        self.assertNotIn("rollupCache:", DASHBOARD_ASSET_BUNDLE)
+
     def test_session_detail_ui_uses_session_identifiers(self) -> None:
-        serve = load_module("serve_dashboard_session_detail_naming_test", ROOT / "scripts" / "serve_dashboard.py")
 
         self.assertIn('id="session-detail-status"', DASHBOARD_ASSET_BUNDLE)
         self.assertIn('id="session-detail"', DASHBOARD_ASSET_BUNDLE)
         self.assertIn("function renderSessionDetail(data)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("setPanelContent('session-detail', renderSessionDetail(detail))", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("await getJSON('/api/session-detail?' + q)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("return prepareDetail(key, sessionDetailPath(key));", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("project-detail", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("renderProjectDetail", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("/api/project-detail", DASHBOARD_ASSET_BUNDLE)
 
     def test_detail_error_handlers_ignore_stale_selected_rows(self) -> None:
-        serve = load_module("serve_dashboard_detail_stale_error_test", ROOT / "scripts" / "serve_dashboard.py")
 
-        self.assertIn("if (seq === state.sessionSeq && state.selectedSession === (row.dataset.sessionId || '')) {", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("if (seq === state.toolSeq && state.selectedTool === toolName) {", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("if (seq === state.subagentSeq && state.selectedSubagentConfidence === confidence) {", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("if (seq === state.sessionSeq && row.isConnected) {", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("if (seq === state.toolSeq && row.isConnected) {", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("if (seq === state.subagentSeq && row.isConnected) {", DASHBOARD_ASSET_BUNDLE)
 
     def test_time_range_uses_presets_all_and_custom_days(self) -> None:
-        serve = load_module("serve_dashboard_time_range_custom_test", ROOT / "scripts" / "serve_dashboard.py")
 
         self.assertIn('<select id="days" aria-label="Time range">', DASHBOARD_ASSET_BUNDLE)
         self.assertIn('<option value="1">1 Day</option>', DASHBOARD_ASSET_BUNDLE)
@@ -488,6 +498,8 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn("openToolbarCustomPopover('days');", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("document.getElementById('custom-days').value = String(nextDays);", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("document.getElementById('custom-days-apply').addEventListener('click', commitToolbarCustomDays);", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("document.getElementById('days').focus({ preventScroll: true });", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("closeToolbarCustomPopover(kind, true, {restoreFocus: true});", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("armToolbarCustomReselect('days', 'custom', 'custom-reselect')", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("restoreToolbarCustomReselect('days', 'custom', 'custom-reselect')", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("handleToolbarCustomReselectKeydown(event, 'days', 'days', 'custom')", DASHBOARD_ASSET_BUNDLE)
@@ -507,10 +519,9 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn("restoreNumericInput('custom-days', settings.customDays, 7, 1, 3650);", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("restoreNumericInput('custom-percent'", DASHBOARD_ASSET_BUNDLE)
     def test_header_filter_uses_session_options(self) -> None:
-        serve = load_module("serve_dashboard_session_filter_test", ROOT / "scripts" / "serve_dashboard.py")
         self.assertIn('<input id="session" type="hidden" value="">', DASHBOARD_ASSET_BUNDLE)
         self.assertIn('<button id="session-picker-button" class="session-picker-button" type="button" aria-haspopup="listbox" aria-expanded="false" aria-controls="session-options">', DASHBOARD_ASSET_BUNDLE)
-        self.assertIn('<input id="session-search" class="session-search" type="search" autocomplete="off" aria-label="Search sessions" placeholder="Search sessions">', DASHBOARD_ASSET_BUNDLE)
+        self.assertIn('<input id="session-search" class="session-search" type="search" autocomplete="off" role="combobox" aria-autocomplete="list" aria-controls="session-options" aria-expanded="false" aria-activedescendant="" aria-label="Search sessions" placeholder="Search sessions">', DASHBOARD_ASSET_BUNDLE)
         self.assertIn('<div id="session-options" class="session-options" role="listbox"></div>', DASHBOARD_ASSET_BUNDLE)
         self.assertIn("async function loadSessionOptions()", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("let sessionOptionsSeq = 0;", DASHBOARD_ASSET_BUNDLE)
@@ -534,19 +545,24 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn(".session-option-main {\n      display: grid;", DASHBOARD_ASSET_BUNDLE)
         self.assertIn(".session-option-id {\n      color: var(--muted);", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("function chooseSessionFilter(sessionId)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("function invalidatePendingSessionOptionLoads()", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("clearTimeout(sessionOptionsTimer);", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("sessionOptionsSeq += 1;", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("function chooseSessionFilter(sessionId) {\n  invalidatePendingSessionOptionLoads();", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("document.getElementById('session-picker-button').addEventListener('click'", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("document.getElementById('session-search').addEventListener('input'", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("role=\"option\"", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn('role="option" tabindex="-1"', DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("document.getElementById('session-search').setAttribute('aria-activedescendant'", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("event.key === 'Tab' && state.sessionFilterOpen", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("loadSessionOptions().then(() => safeLoad());", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn('<select id="session" aria-label="Session filter">', DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("async function loadProjectOptions()", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("await getJSON('/api/project-options')", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("q.set('project', project);", DASHBOARD_ASSET_BUNDLE)
     def test_subagent_detail_does_not_repeat_attribution_method_label(self) -> None:
-        serve = load_module("serve_dashboard_subagent_label_test", ROOT / "scripts" / "serve_dashboard.py")
         self.assertNotIn('<div class="label">Attribution method</div>', DASHBOARD_ASSET_BUNDLE)
     def test_tool_detail_section_titles_match_overview_style(self) -> None:
-        serve = load_module("serve_dashboard_tool_title_style_test", ROOT / "scripts" / "serve_dashboard.py")
         self.assertIn(".session-detail-section-title,\n    .tool-detail-section-title,\n    .selected-turn-section-title {", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("font-size: 13px;", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("font-weight: 760;", DASHBOARD_ASSET_BUNDLE)
@@ -574,7 +590,6 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertNotIn(".table-scroll + .tool-detail-section-title", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn(".tool-detail-section-title::after", DASHBOARD_ASSET_BUNDLE)
     def test_selected_turn_labels_and_tool_toggle_contract(self) -> None:
-        serve = load_module("serve_dashboard_tool_call_labels_test", ROOT / "scripts" / "serve_dashboard.py")
         self.assertIn("function sessionDetailLabel(row)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("const compact = compactSessionId(id);", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("if (compact && name) return `${name} · ${compact}`;", DASHBOARD_ASSET_BUNDLE)
@@ -615,22 +630,26 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn("if (activate) next.click();", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("pendingViewFocus: false", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("function focusTargetForView(view = state.view)", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("overview: ['#projects tr.selected', '#projects tr[data-session-id]']", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("turns: ['#turn-list tr.selected', '#turn-list tr[data-turn]']", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("tools: ['#tool-output tr.selected', '#tool-output tr[data-tool]']", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("subagents: ['#subagent-rollups tr.selected', '#subagent-rollups tr[data-confidence]']", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("cleanup: ['#cleanup-files tr.selected', '#cleanup-files tr[data-cleanup-file]']", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("function focusActiveViewRow({ force = false } = {})", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("state.pendingViewFocus = true;", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("if (view !== 'cleanup') focusActiveViewRow();", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("if (view !== 'cleanup') requestAnimationFrame(() => focusActiveViewRow());", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("handleListArrowFocus(event, '#turn-list tr[data-turn]', true)", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("handleListArrowFocus(event, '#projects tr[data-session-id]', true)", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("handleListArrowFocus(event, '#tool-output tr[data-tool]', true)", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("handleListArrowFocus(event, '#subagent-rollups tr[data-confidence]', true)", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("handleListArrowFocus(event, '#cleanup-files tr[data-cleanup-file]', true)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("overview: ['#projects tr.selected .row-select-button', '#projects tr[data-session-id] .row-select-button']", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("turns: ['#turn-list tr.selected .row-select-button', '#turn-list tr[data-turn] .row-select-button']", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("tools: ['#tool-output tr.selected .row-select-button', '#tool-output tr[data-tool] .row-select-button']", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("subagents: ['#subagent-rollups tr.selected .row-select-button', '#subagent-rollups tr[data-confidence] .row-select-button']", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("cleanup: ['#cleanup-files tr.selected .row-select-button', '#cleanup-files tr[data-cleanup-file] .row-select-button']", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("pendingViewFocusOwner: null", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("function focusActiveViewRow({ force = false, replacedControl = null } = {})", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("const replacingFocusedControl = replacedControl instanceof HTMLElement", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("focusActiveViewRow({replacedControl});", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("state.pendingViewFocus = Boolean(focusContent);", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("if (view !== 'cleanup' && focusContent) focusActiveViewRow();", DASHBOARD_ASSET_BUNDLE)
+        self.assertNotIn("requestAnimationFrame(() => focusActiveViewRow({force: true}))", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("setView(views.has(hashView) ? hashView : restoredView, false, {focusContent: false});", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("handleListArrowFocus(event, '#turn-list tr[data-turn] .row-select-button', true)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("handleListArrowFocus(event, '#projects tr[data-session-id] .row-select-button', true)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("handleListArrowFocus(event, '#tool-output tr[data-tool] .row-select-button', true)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("handleListArrowFocus(event, '#subagent-rollups tr[data-confidence] .row-select-button', true)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("handleListArrowFocus(event, '#cleanup-files tr[data-cleanup-file] .row-select-button')", DASHBOARD_ASSET_BUNDLE)
+        self.assertNotIn('<tr tabindex="0" role="button"', DASHBOARD_ASSET_BUNDLE)
     def test_selected_turn_prompt_toggle_is_bound_to_meta_not_prompt_text(self) -> None:
-        serve = load_module("serve_dashboard_prompt_toggle_target_test", ROOT / "scripts" / "serve_dashboard.py")
         self.assertIn('<div class="${identityClass}">', DASHBOARD_ASSET_BUNDLE)
         self.assertIn("const metaAttrs = promptToggle", DASHBOARD_ASSET_BUNDLE)
         self.assertIn('` data-toggle-prompt role="button" tabindex="0" aria-expanded="${promptExpanded}" title="Click to ${promptExpanded ? \'collapse\' : \'expand\'} prompt"`', DASHBOARD_ASSET_BUNDLE)
@@ -670,7 +689,6 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertNotIn("min-height: 24px;\n      padding: 3px 4px;", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn('data-toggle-prompt role="button" tabindex="0" aria-expanded="${state.promptExpanded}" title="Click to ${state.promptExpanded ? \'collapse\' : \'expand\'} prompt">\n          <div class="value attribution-method-value"', DASHBOARD_ASSET_BUNDLE)
     def test_selected_turn_uses_summary_sections_not_detail_tabs(self) -> None:
-        serve = load_module("serve_dashboard_detail_segmented_test", ROOT / "scripts" / "serve_dashboard.py")
         self.assertNotIn('class="detail-tabs" aria-label="Selected turn detail"', DASHBOARD_ASSET_BUNDLE)
         self.assertIn("Call Summary", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("Tool Calls", DASHBOARD_ASSET_BUNDLE)
@@ -680,10 +698,11 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertNotIn('aria-pressed="${state.detailTab === \'ai_steps\'}"', DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn('aria-pressed="${state.detailTab === \'tool_calls\'}"', DASHBOARD_ASSET_BUNDLE)
     def test_selected_turn_shows_context_and_token_breakdown(self) -> None:
-        serve = load_module("serve_dashboard_selected_turn_context_test", ROOT / "scripts" / "serve_dashboard.py")
         self.assertIn("function elapsedMs(start, stop)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("function turnTokenBreakdownMetrics(turn)", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("function selectedTurnActivityMetrics(modelSummary, toolRows)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("function selectedTurnActivityMetrics(turn, modelSummary, toolRows)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("function tokenDataAvailable(turn)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("Token data unavailable", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("function selectedTurnMetric(label, valueHtml, kind = '', title = '')", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("function selectedTurnMetricGrid(items, extraClass = '')", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("toolSummaryExpanded: false", DASHBOARD_ASSET_BUNDLE)
@@ -707,11 +726,11 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertNotIn('class="detail-grid selected-turn-core-metrics"', DASHBOARD_ASSET_BUNDLE)
         self.assertIn('<div class="selected-turn-section-title">Token Summary</div>', DASHBOARD_ASSET_BUNDLE)
         self.assertIn('<div class="selected-turn-section-title">Call Summary</div>', DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("selectedTurnMetric('Model Calls', compactNumberSpan(modelSummary.calls || 0)", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("selectedTurnMetric('Tool Calls', compactNumberSpan(toolCallCount)", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("selectedTurnMetric('Tool Failures', compactNumberSpan(toolFailures)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("selectedTurnMetric('Model Calls', tokenMetric(turn, modelSummary.calls)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("selectedTurnMetric('Tool Calls', tokenMetric(turn, toolCallCount)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("selectedTurnMetric('Tool Failures', tokenMetric(turn, toolFailures)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("const maxToolDuration = toolRows.reduce((max, row) => Math.max(max, Number(row.max_duration_ms || 0)), 0);", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("selectedTurnMetric('Max Tool Duration', esc(durationLabel(maxToolDuration)))", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("selectedTurnMetric('Max Tool Duration', tokenDataAvailable(turn) ? esc(durationLabel(maxToolDuration))", DASHBOARD_ASSET_BUNDLE)
         self.assertIn('<div class="selected-turn-section"><div class="selected-turn-section-title">Tool Calls</div>${toolSummaryList(toolRows, { expanded: toolExpanded })}</div>', DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("toolRows.length ? `<div class=\"selected-turn-section\"><div class=\"selected-turn-section-title\">Tool Calls</div>${toolSummaryList(toolRows)}</div>` : ''", DASHBOARD_ASSET_BUNDLE)
         self.assertIn(".selected-turn-metric-grid {\n      grid-template-columns: repeat(4, minmax(0, 1fr));", DASHBOARD_ASSET_BUNDLE)
@@ -730,17 +749,13 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertNotIn("handleListArrowFocus(event, '#detail .selected-turn-tool-row, #detail [data-toggle-tools]')", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn(".selected-turn-tool-row:focus-visible", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn(".selected-turn-tool-row:focus {", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("tbody tr[data-turn]:focus,\n    tbody tr[data-tool]:focus,\n    tbody tr[data-confidence]:focus,\n    tbody tr[data-cleanup-file]:focus {\n      outline: 0;", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("tbody tr[data-cleanup-file]:focus-visible td { background: var(--row-hover); outline: 0; }", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("#cleanup-files tr[data-cleanup-file]:focus-visible td:first-child {\n      box-shadow: inset 3px 0 0 var(--accent-2);", DASHBOARD_ASSET_BUNDLE)
-        self.assertNotIn("tbody tr[data-confidence]:focus-visible td:first-child,\n    tbody tr[data-cleanup-file]:focus-visible td:first-child", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("tbody tr.selected:hover td,\n    tbody tr.selected:focus-visible td,\n    tbody tr[aria-selected=\"true\"]:hover td,\n    tbody tr[aria-selected=\"true\"]:focus-visible td {\n      background: var(--row-selected);", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("tbody tr[data-turn].selected td:first-child,\n    tbody tr[data-tool].selected td:first-child,\n    tbody tr[data-confidence].selected td:first-child,\n    tbody tr[data-turn][aria-selected=\"true\"] td:first-child,\n    tbody tr[data-tool][aria-selected=\"true\"] td:first-child,\n    tbody tr[data-confidence][aria-selected=\"true\"] td:first-child {\n      box-shadow: inset 3px 0 0 var(--accent-2);", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("#projects tr[data-session-id]:focus {\n      outline: 0;", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("#projects tr[data-session-id]:focus-visible td {\n      background: var(--row-hover);\n      outline: 0;", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("#projects tr[data-session-id]:focus-visible td:first-child {\n      box-shadow: inset 3px 0 0 var(--accent-2);", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("#projects tr.selected:hover td,\n    #projects tr.selected:focus-visible td,\n    #projects tr[aria-selected=\"true\"]:hover td,\n    #projects tr[aria-selected=\"true\"]:focus-visible td {\n      background: var(--row-selected);", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("#projects tr.selected td:first-child,\n    #projects tr[aria-selected=\"true\"] td:first-child {\n      box-shadow: inset 3px 0 0 var(--accent-2);", DASHBOARD_ASSET_BUNDLE)
+        self.assertNotIn("tbody tr[data-turn]:focus", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("tbody tr.selected:hover td {\n      background: var(--row-selected);", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("tbody tr[data-turn].selected td:first-child,\n    tbody tr[data-tool].selected td:first-child,\n    tbody tr[data-confidence].selected td:first-child {\n      box-shadow: inset 3px 0 0 var(--accent-2);", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("button.row-select-button {\n      display: block;\n      width: 100%;", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("#projects tr.selected:hover td {\n      background: var(--row-selected);", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("#projects tr.selected td:first-child {\n      box-shadow: inset 3px 0 0 var(--accent-2);", DASHBOARD_ASSET_BUNDLE)
+        self.assertNotIn('tr[aria-selected="true"]', DASHBOARD_ASSET_BUNDLE)
         self.assertIn(".selected-turn-tool-stats {\n      display: grid;\n      grid-template-columns: repeat(4, minmax(0, 1fr));", DASHBOARD_ASSET_BUNDLE)
         self.assertIn(".selected-turn-tool-stat:last-child {\n      padding-right: 0;\n      border-right: 0;", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("const limit = 16;", DASHBOARD_ASSET_BUNDLE)
@@ -753,10 +768,10 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn("bindTurnModalControls();", DASHBOARD_ASSET_BUNDLE)
         self.assertIn(".selected-turn-tool-toggle {", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("font-family: var(--font);", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("const turnLabel = ['Turn', status, compactDateTime(r.captured_at), label, promptLabel].filter(Boolean).join(' · ');", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("const turnLabel = ['Turn', status, compactDateTime(promptAt), label, promptLabel].filter(Boolean).join(' · ');", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("aria-label=\"${esc('Turn status '", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("const detailOpen = document.getElementById('cleanup-detail-modal')?.classList.contains('open');", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("setPageInert(Boolean(detailOpen));", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("setActiveModal(detailOpen ? 'cleanup-detail-modal' : '');", DASHBOARD_ASSET_BUNDLE)
         self.assertIn('class="selected-turn-section"', DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn('class="detail-grid selected-turn-grid"', DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn('<div class="tool-detail-section-title">Turn Context</div>', DASHBOARD_ASSET_BUNDLE)
@@ -774,10 +789,10 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertNotIn('<div class="detail-cell selected-turn-status-cell"><div class="label">Status</div>', DASHBOARD_ASSET_BUNDLE)
         self.assertIn("selectedTurnMetric('Model', esc(turn.model || '-')", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("selectedTurnMetric('Reasoning', esc(turn.reasoning_effort || '-'))", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("selectedTurnMetric('Cost Units', compactNumberSpan(turn.weighted_credits || 0, 'money')", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("selectedTurnMetric('Cost Units', compactNumberSpan(turn.weighted_credits || 0, 'money'), '', exactNumber(turn.weighted_credits || 0, 'money'))", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("selectedTurnMetric('Cost Units', tokenMetric(turn, turn.weighted_credits, 'money')", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("tokenDataAvailable(turn) ? exactNumber(turn.weighted_credits || 0, 'money') : 'Token data unavailable'", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn(".selected-turn-metric.cost .value", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("selectedTurnMetric('Input Tokens', compactNumberSpan(turn.input_tokens || 0)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("selectedTurnMetric('Input Tokens', tokenMetric(turn, turn.input_tokens)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn(".selected-turn-context-grid,\n    .selected-turn-metric-grid {", DASHBOARD_ASSET_BUNDLE)
         self.assertIn(".selected-turn-context-grid {\n      grid-template-columns: repeat(3, minmax(0, 1fr));", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("#detail .selected-turn-status-cell {", DASHBOARD_ASSET_BUNDLE)
@@ -802,11 +817,10 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertNotIn("#detail .selected-turn-status-cell {\n        grid-column: 1 / -1;", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("selectedTurnMetric('Model', esc(turn.model || '-'), 'selected-turn-model', turn.model || '')", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("esc(turn.reasoning_effort || '-')", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("selectedTurnMetric('Non-Cached Input', compactNumberSpan(turn.non_cached_input_tokens || 0)", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("compactNumberSpan(turn.non_cached_input_tokens || 0)", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("compactNumberSpan(toolFailures)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("selectedTurnMetric('Non-Cached Input', tokenMetric(turn, turn.non_cached_input_tokens)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("tokenMetric(turn, turn.non_cached_input_tokens)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("tokenMetric(turn, toolFailures)", DASHBOARD_ASSET_BUNDLE)
     def test_rebuild_button_uses_analyze_label(self) -> None:
-        serve = load_module("serve_dashboard_analyze_label_test", ROOT / "scripts" / "serve_dashboard.py")
         self.assertIn('<button id="rebuild" class="secondary analyze-button" data-analyze-state="idle" type="button">', DASHBOARD_ASSET_BUNDLE)
         self.assertIn('<span class="analyze-button-label">Analyze</span>', DASHBOARD_ASSET_BUNDLE)
         self.assertIn('<span class="analyze-button-progress" aria-hidden="true"></span>', DASHBOARD_ASSET_BUNDLE)
@@ -842,7 +856,10 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn("const archivedBytes = promptBytes;", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("archive failed", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("archived ${formatBytes(archivedBytes)}", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("finishAnalyzeStatus(`analyzed ${compactNumber(result.new_turn_rows ?? result.turn_rows ?? 0)} new turns${compactNote}`);", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("const quarantined = Number((((result || {}).quarantine || {}).unacknowledged_events) || 0);", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("${compactNumber(quarantined)} quarantined", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("setAnalyzeButtonState('warning', message);", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn('button.analyze-button[data-analyze-state="warning"]', DASHBOARD_ASSET_BUNDLE)
         self.assertIn("function currentAnalyzePhaseLabel()", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("const failedPhase = currentAnalyzePhaseLabel();", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("finishAnalyzeStatus(`analysis failed · ${failedPhase}`", DASHBOARD_ASSET_BUNDLE)
@@ -862,14 +879,15 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn("button.style.setProperty('--analyze-progress', `${progress}%`);", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("if (stage) stage.textContent = phaseIndex >= 0 ? `${Math.round(progress)}%` : '';", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("['running', 'cancelling'].includes(stateName)", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("const visibleLabel = ['running', 'cancelling'].includes(stateName) ? 'Cancel' : 'Analyze';", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("const activeStates = ['running', 'cancelling', 'observing'];", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("stateName === 'observing' ? 'Analyzing' : 'Analyze'", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("if (label) label.textContent = visibleLabel;", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("`Cancel analysis, ${Math.round(progress)}%, ${labelText}`", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("button.setAttribute('aria-label', actionLabel);", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("button.title = actionLabel;", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("const visibleLabels = {", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("cancelling: 'Cancelling'", DASHBOARD_ASSET_BUNDLE)
-        self.assertNotIn("'Analyzing'", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("`Observing analysis, ${Math.round(progress)}%, ${labelText}`", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("function lockAnalyzeStatusWidth", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("function releaseAnalyzeStatusWidth", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("status.style.width", DASHBOARD_ASSET_BUNDLE)
@@ -886,7 +904,8 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertNotIn("analysis-freshness", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("function freshnessIndicator(freshness)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("dashboard.freshness", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("metric('Analyzed Turns', compactNumber(summary.turns || 0), '', exactNumber(summary.turns || 0), freshnessIndicator(dashboard.freshness))", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("`${exactNumber(summary.turns || 0)} eligible · ${exactNumber(summary.unavailable_turns || 0)} unavailable`", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("freshnessIndicator(dashboard.freshness)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn('data-freshness-state="${esc(status)}"', DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn('<span class="metric-freshness-dot" title=', DASHBOARD_ASSET_BUNDLE)
         self.assertIn("`global pending · ${compactNumber(pendingAnalysisRows)} rows`", DASHBOARD_ASSET_BUNDLE)
@@ -911,7 +930,6 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertNotIn(">Reanalyze</button>", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn(">Analyze needed</button>", DASHBOARD_ASSET_BUNDLE)
     def test_analyze_button_can_cancel_running_rebuild(self) -> None:
-        serve = load_module("serve_dashboard_analyze_cancel_test", ROOT / "scripts" / "serve_dashboard.py")
         self.assertIn("let analyzeRequest = null;", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("function isAnalyzeRunning()", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("async function cancelAnalyze()", DASHBOARD_ASSET_BUNDLE)
@@ -919,27 +937,77 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn("if (isAnalyzeRunning()) {\n    cancelAnalyze();\n    return;\n  }", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("analyzeRequest = request;", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("request.cancelRequested = true;", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("operationId: crypto.randomUUID()", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("{operation_id: request.operationId, reason: 'user'}", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("{operation_id: request.operationId}", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("(progress || {}).operation_id !== request.operationId", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("setAnalyzeButtonState('cancelling', 'cancel requested', phaseIndex);", DASHBOARD_ASSET_BUNDLE)
+        cancel_source = DASHBOARD_ASSET_BUNDLE.split("async function cancelAnalyze()", 1)[1].split("async function rebuildAndRefresh()", 1)[0]
+        self.assertIn("request.cancelRequested = false;", cancel_source)
+        self.assertIn("setAnalyzeButtonState('running', 'cancel failed · analysis continues', phaseIndex);", cancel_source)
+        self.assertIn("showQueryError(`Cancel failed: ${String(err.message || err)}`);", cancel_source)
+        self.assertNotIn("setGlobalError(", cancel_source)
         self.assertIn("if ((result || {}).cancelled)", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("|| request.cancelRequested", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("finishAnalyzeStatus('analysis cancelled', 2500);", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("button.disabled = true;\n  const started = startAnalyzeProgress();", DASHBOARD_ASSET_BUNDLE)
     def test_analyze_cancel_state_is_not_overwritten_by_running_progress_poll(self) -> None:
-        serve = load_module("serve_dashboard_analyze_cancel_poll_test", ROOT / "scripts" / "serve_dashboard.py")
 
-        self.assertIn("const stateName = request && request.cancelRequested ? 'cancelling' : 'running';", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("const stateName = request && request.observer ? 'observing' : (request && request.cancelRequested ? 'cancelling' : 'running');", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("setAnalyzeButtonState(stateName, detail, phaseIndex", DASHBOARD_ASSET_BUNDLE)
 
     def test_analyze_refreshes_cleanup_view_after_rebuild(self) -> None:
-        serve = load_module("serve_dashboard_analyze_cleanup_refresh_test", ROOT / "scripts" / "serve_dashboard.py")
 
-        self.assertIn("export function createAnalyzeController({ load, loadCleanup, loadSessionOptions, resetAllPages, setGlobalError, refreshScrollFades })", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("export function createAnalyzeController({ load, loadCleanup, loadSessionOptions, prepareAnalyticsReload, setGlobalError, showQueryError, refreshScrollFades })", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("async function refreshAnalyticsAfterAnalyze()", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("prepareAnalyticsReload();", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("if (state.view === 'cleanup') await loadCleanup({keepStatus: true});", DASHBOARD_ASSET_BUNDLE)
         self.assertLess(
             DASHBOARD_ASSET_BUNDLE.index("const cleanupController = createCleanupController({"),
             DASHBOARD_ASSET_BUNDLE.index("const analyzeController = createAnalyzeController({"),
         )
         self.assertIn("loadCleanup,", DASHBOARD_ASSET_BUNDLE)
+
+    def test_analyze_busy_contract_observes_only_same_server_analysis(self) -> None:
+        serve = load_module("serve_dashboard_analyze_busy_contract_test", ROOT / "scripts" / "serve_dashboard.py")
+        handler = serve.Handler.__new__(serve.Handler)
+        sent: list[tuple[dict[str, object], int]] = []
+        handler.send_json = lambda payload, status=200: sent.append((payload, status))
+        state = serve.dashboard_operation_state
+        manager = state.DashboardOperationManager()
+        operation_id = "11111111-1111-4111-8111-111111111111"
+        handler.server = types.SimpleNamespace(operation_manager=manager)
+        handler.read_json_body = lambda: {"operation_id": "22222222-2222-4222-8222-222222222222"}
+        lease = manager.begin("analysis", pathlib.Path("/tmp"), operation_id=operation_id)
+        try:
+            manager.set_files(operation_id, progress_file=pathlib.Path("/tmp/rebuild-progress.test.json"))
+            handler.handle_rebuild()
+        finally:
+            lease.close()
+
+        self.assertEqual(sent, [({
+            "error": "analysis_or_cleanup_running",
+            "operation": "analysis",
+            "progress_available": True,
+            "operation_id": operation_id,
+        }, 409)])
+        self.assertIn("async function observeActiveAnalysis(request, started)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("if ((err || {}).operation === 'analysis' && (err || {}).progress_available === true)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("consecutiveErrors >= 3", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("!(progress || {}).process_running && String((progress || {}).status || '') !== 'running'", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("showQueryError('Analysis or cleanup is already running');", DASHBOARD_ASSET_BUNDLE)
+
+    def test_external_busy_lock_reports_operation_without_local_progress(self) -> None:
+        serve = load_module("serve_dashboard_external_busy_contract_test", ROOT / "scripts" / "serve_dashboard.py")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            lock_path = pathlib.Path(tmp_dir) / "service.lock"
+            lock_path.write_text('{"pid":42,"reason":"retention-prune"}\n', encoding="utf-8")
+
+            payload = serve.service_busy_payload(lock_path=lock_path)
+
+        self.assertEqual(payload["error"], "analysis_or_cleanup_running")
+        self.assertEqual(payload["operation"], "cleanup")
+        self.assertFalse(payload["progress_available"])
     def test_analyze_cancel_endpoint_requests_graceful_cancel_without_terminating_process(self) -> None:
         serve = load_module("serve_dashboard_analyze_cancel_endpoint_test", ROOT / "scripts" / "serve_dashboard.py")
         handler = serve.Handler.__new__(serve.Handler)
@@ -956,22 +1024,21 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
                 self.terminated = True
 
         fake = FakeProcess()
+        state = serve.dashboard_operation_state
         with tempfile.TemporaryDirectory() as tmp_dir:
             cancel_path = pathlib.Path(tmp_dir) / "cancel.json"
+            manager = state.DashboardOperationManager()
+            operation_id = "11111111-1111-4111-8111-111111111111"
+            lease = manager.begin("analysis", pathlib.Path(tmp_dir), operation_id=operation_id)
+            manager.set_files(operation_id, cancel_file=cancel_path)
+            manager.attach_process(operation_id, fake)
+            handler.server = types.SimpleNamespace(operation_manager=manager)
+            handler.read_json_body = lambda: {"operation_id": operation_id}
             handler.send_json = lambda payload, status=200: sent.append((payload, status))
-            serve.REBUILD_CANCEL_EVENT.clear()
-            with serve.REBUILD_PROCESS_LOCK:
-                previous_process = serve.REBUILD_PROCESS
-                previous_cancel = serve.REBUILD_CANCEL_FILE
-                serve.REBUILD_PROCESS = fake
-                serve.REBUILD_CANCEL_FILE = cancel_path
             try:
                 handler.handle_rebuild_cancel()
             finally:
-                with serve.REBUILD_PROCESS_LOCK:
-                    serve.REBUILD_PROCESS = previous_process
-                    serve.REBUILD_CANCEL_FILE = previous_cancel
-                serve.REBUILD_CANCEL_EVENT.clear()
+                lease.close()
             self.assertTrue(cancel_path.exists())
 
         self.assertEqual(sent[0][1], 200)
@@ -980,7 +1047,6 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertTrue(sent[0][0]["graceful"])
         self.assertFalse(fake.terminated)
     def test_panel_content_updates_clear_empty_loading_error_state(self) -> None:
-        serve = load_module("serve_dashboard_panel_state_test", ROOT / "scripts" / "serve_dashboard.py")
         self.assertIn("function setPanelContent(id, html, mode = '')", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("if (!el) return false;", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("el.classList.remove('empty', 'loading', 'error')", DASHBOARD_ASSET_BUNDLE)
@@ -1007,7 +1073,7 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn("setPanelContent('session-detail', sessionDetailLoadingPanel('Loading session detail.'), 'loading')", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("setPanelContent('tool-detail', detailGridLoadingPanel('Loading tool detail.'), 'loading')", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("setPanelContent('subagent-mix', detailGridLoadingPanel('Loading attribution detail.', 6, 4, 4, 4), 'loading')", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("setPanelContent('detail', selectedTurnLoadingPanel(), 'loading');", DASHBOARD_ASSET_BUNDLE)
+        self.assertNotIn("setPanelContent('detail', selectedTurnLoadingPanel(), 'loading');", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("document.getElementById('turn-modal-body').innerHTML = selectedTurnLoadingPanel();", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("tableSkeleton(6, 4)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("tableSkeleton(distributionRows, distributionColumns)", DASHBOARD_ASSET_BUNDLE)
@@ -1042,8 +1108,7 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertNotIn("Select an attribution method to inspect child usage.", DASHBOARD_ASSET_BUNDLE)
 
     def test_overview_metric_strip_does_not_shrink_and_clip_content(self) -> None:
-        serve = load_module("serve_dashboard_metric_strip_test", ROOT / "scripts" / "serve_dashboard.py")
-        overview_source = (ROOT / "assets" / "dashboard" / "overview-render.js").read_text(encoding="utf-8")
+        overview_source = (ROOT / "scripts" / "assets" / "dashboard" / "overview-render.js").read_text(encoding="utf-8")
         self.assertIn("import { fmt, money, state } from './core.js';", overview_source)
         self.assertIn(".metric-strip {\n      display: grid;\n      flex: 0 0 auto;", DASHBOARD_ASSET_BUNDLE)
         self.assertLess(DASHBOARD_ASSET_BUNDLE.index("metric('Analyzed Turns'"), DASHBOARD_ASSET_BUNDLE.index("metric('Cost Units'"))
@@ -1074,8 +1139,11 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertNotIn("new context", DASHBOARD_ASSET_BUNDLE)
     def test_playwright_subagent_detail_requires_tables_for_non_empty_payload(self) -> None:
         check = (ROOT / "scripts" / "playwright_dashboard_tools.py").read_text(encoding="utf-8")
-        self.assertIn('#subagent-rollups tr[data-confidence], #subagent-rollups .empty', check)
-        self.assertIn('#tool-output tr[data-tool], #tool-output .empty', check)
+        self.assertIn('container="#subagent-rollups"', check)
+        self.assertIn('row="tr[data-confidence]"', check)
+        self.assertIn('container="#tool-output"', check)
+        self.assertIn('row="tr[data-tool]"', check)
+        self.assertIn("def check_subagent_focus_refresh", check)
         self.assertNotIn('#tool-output table, #tool-output .empty', check)
         self.assertIn("subagent_detail = fetch_json", check)
         self.assertIn("subagent_detail_has_rows", check)
@@ -1086,7 +1154,6 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn('#tool-detail .tool-session-distribution', check)
         self.assertNotIn('#tool-detail .tool-project-distribution', check)
     def test_scroll_fade_effect_is_subtle(self) -> None:
-        serve = load_module("serve_dashboard_scroll_fade_test", ROOT / "scripts" / "serve_dashboard.py")
         self.assertIn("--scroll-edge-safe-space: 8px;", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("padding-bottom: 1px;\n      scroll-padding-bottom: var(--scroll-edge-safe-space);", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("scroll-padding-bottom: var(--scroll-edge-safe-space);", DASHBOARD_ASSET_BUNDLE)
@@ -1128,15 +1195,13 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertNotIn("rgba(31, 33, 31, 0.52)", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("rgba(31, 33, 31, 0.48)", DASHBOARD_ASSET_BUNDLE)
     def test_scroll_regions_hide_internal_scrollbars(self) -> None:
-        serve = load_module("serve_dashboard_scrollbar_hidden_test", ROOT / "scripts" / "serve_dashboard.py")
         self.assertIn("scrollbar-width: none;", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("#turn-list::-webkit-scrollbar,\n    .inspector #detail::-webkit-scrollbar {\n      display: none;", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("scrollbar-width: thin;", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("scrollbar-color: var(--border-strong) transparent;", DASHBOARD_ASSET_BUNDLE)
     def test_mobile_toolbar_is_compact_and_buttons_do_not_global_fill_width(self) -> None:
-        serve = load_module("serve_dashboard_mobile_toolbar_test", ROOT / "scripts" / "serve_dashboard.py")
-        self.assertIn("@media (min-width: 721px) and (max-width: 1320px) {", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn(".toolbar {\n        gap: 6px;\n        flex: 0 1 auto;\n        flex-wrap: nowrap;\n        min-width: 0;", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("@media (max-width: 84rem) {", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn(".toolbar {\n        gap: 6px;\n        width: 100%;\n        flex-wrap: nowrap;\n        min-width: 0;", DASHBOARD_ASSET_BUNDLE)
         self.assertIn(".session-picker {\n        width: 164px;\n        min-width: 0;", DASHBOARD_ASSET_BUNDLE)
         self.assertIn(".custom-filter-control {\n        width: 108px;", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("#refresh,\n      #rebuild {\n        width: 84px;\n        min-width: 84px;", DASHBOARD_ASSET_BUNDLE)
@@ -1147,13 +1212,26 @@ class DashboardUiContractTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertIn("#refresh,\n      #rebuild {\n        min-width: 0;\n      }", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("input, select, button { width: 100%; }", DASHBOARD_ASSET_BUNDLE)
     def test_global_load_errors_update_all_dashboard_panels(self) -> None:
-        serve = load_module("serve_dashboard_global_error_test", ROOT / "scripts" / "serve_dashboard.py")
         self.assertIn("function setGlobalError(message)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("['projects', 'session-detail', 'turn-list', 'tool-output', 'tool-detail', 'subagent-rollups', 'subagent-mix', 'cleanup-files'].forEach", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("setTextIfPresent('session-detail-status', 'error');", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("setGlobalError(err.message || err)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("showQueryError(message || 'Dashboard data could not be loaded.', 0);", DASHBOARD_ASSET_BUNDLE)
+
+    def test_frontend_review_regressions_remain_guarded(self) -> None:
+        self.assertIn("container: cleanup-workbench / inline-size;", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("@container cleanup-workbench (max-width: 66rem) {", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("if (seq !== state.requestSeq) return;\n    throw error;", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("export function setActiveModal(activeModalId = '')", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn('role="status" aria-live="polite" tabindex="-1"', DASHBOARD_ASSET_BUNDLE)
+        self.assertIn('role="progressbar" aria-label="Cleanup progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"', DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("const exactTrigger = cleanupConfirmTrigger;", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn(".cleanup-detail-meta {", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn(".cleanup-affected-file-path {", DASHBOARD_ASSET_BUNDLE)
+        self.assertNotIn(".cleanup-affected-file-path {\n      display: -webkit-box;\n      flex: 1 1 auto;\n      min-width: 0;\n      color: var(--quiet);", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("export function setInteractiveRowSelected(row, selected)", DASHBOARD_ASSET_BUNDLE)
+        self.assertNotIn('<tr tabindex="0" role="button"', DASHBOARD_ASSET_BUNDLE)
     def test_sticky_table_headers_paint_above_scrolling_rows(self) -> None:
-        serve = load_module("serve_dashboard_sticky_header_test", ROOT / "scripts" / "serve_dashboard.py")
         self.assertIn("table { width: 100%; border-collapse: separate; border-spacing: 0; }", DASHBOARD_ASSET_BUNDLE)
         self.assertIn(".panel-head {\n      position: relative;\n      z-index: 5;", DASHBOARD_ASSET_BUNDLE)
         self.assertIn(".two-col-layout > .panel > .panel-head {\n      min-height: 52px;", DASHBOARD_ASSET_BUNDLE)

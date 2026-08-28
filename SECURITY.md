@@ -12,13 +12,13 @@ Default behavior for new captures stores bounded local text previews:
 Disable text previews before capturing sensitive prompts:
 
 ```bash
-CODEX_TOKEN_USAGE_STORE_TEXT=0
+BOLA_STORE_TEXT=0
 ```
 
 Do not publish generated `raw/`, `normalized/`, `analytics/`, or
 `state/` files.
 
-`CODEX_TOKEN_USAGE_STORE_TEXT=0` affects new hook captures only. It does not
+`BOLA_STORE_TEXT=0` affects new hook captures only. It does not
 scrub prompt previews, instruction excerpts, tool output previews, paths, or
 project names that were already written to `raw/`, `normalized/`, `analytics/`,
 or `state/` artifacts.
@@ -33,7 +33,7 @@ To check whether the analytics database still contains stored text previews:
 ```bash
 python3 - <<'PY'
 import sqlite3
-con = sqlite3.connect('analytics/token-usage.sqlite')
+con = sqlite3.connect('analytics/bola.sqlite')
 for table, column in [
     ("turns", "prompt_preview"),
     ("tool_call_samples", "output_preview"),

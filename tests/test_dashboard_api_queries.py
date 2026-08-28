@@ -1,15 +1,32 @@
 from __future__ import annotations
 
 try:
-    from tests.support import DashboardFixtureMixin, ROOT, _raw_segment, dashboard_asset_bundle, io, json, load_module, mock, pathlib, sqlite3, tempfile, types, unittest
+    from tests.support import DashboardFixtureMixin, ROOT, _raw_segment, concurrent, dashboard_asset_bundle, io, json, load_module, mock, pathlib, sqlite3, tempfile, time, types, unittest
 except ModuleNotFoundError:
-    from support import DashboardFixtureMixin, ROOT, _raw_segment, dashboard_asset_bundle, io, json, load_module, mock, pathlib, sqlite3, tempfile, types, unittest
+    from support import DashboardFixtureMixin, ROOT, _raw_segment, concurrent, dashboard_asset_bundle, io, json, load_module, mock, pathlib, sqlite3, tempfile, time, types, unittest
 
 
 DASHBOARD_ASSET_BUNDLE = dashboard_asset_bundle()
 
 
 class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
+    def secure_post_handler(self, serve, body: bytes = b"{}"):
+        handler = serve.Handler.__new__(serve.Handler)
+        handler.server = types.SimpleNamespace(
+            allowed_authority="127.0.0.1:8766",
+            allowed_origin="http://127.0.0.1:8766",
+        )
+        handler.path = "/api/rebuild"
+        handler.headers = {
+            "Host": "127.0.0.1:8766",
+            "Origin": "http://127.0.0.1:8766",
+            "Sec-Fetch-Site": "same-origin",
+            "Content-Type": "application/json",
+            "Content-Length": str(len(body)),
+        }
+        handler.rfile = io.BytesIO(body)
+        return handler
+
     def write_empty_freshness_fixture(self, base: pathlib.Path) -> pathlib.Path:
         state_dir = base / "state"
         normalized_dir = base / "normalized"
@@ -29,7 +46,7 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
             json.dumps({"schema_version": 1, "base": str(base.resolve()), "segments": []}),
             encoding="utf-8",
         )
-        db_path = analytics_dir / "token-usage.sqlite"
+        db_path = analytics_dir / "bola.sqlite"
         db_path.write_text("", encoding="utf-8")
         return db_path
 
@@ -39,7 +56,65 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertEqual(queries.int_query({"page": ["-2"]}, "page", 1, 1, 100), 1)
         self.assertEqual(queries.int_query({"per_page": ["500"]}, "per_page", 25, 1, 100), 100)
 
-    def test_server_rejects_non_loopback_host_without_allow_network(self) -> None:
+    def test_turn_date_scope_and_order_use_prompt_start_not_recovery_capture(self) -> None:
+        queries = load_module("dashboard_queries_prompt_time_test", ROOT / "scripts" / "dashboard_queries.py")
+        schema = load_module("dashboard_schema_prompt_time_test", ROOT / "scripts" / "build_analytics_schema.py")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = pathlib.Path(tmp_dir) / "analytics.sqlite"
+            con = sqlite3.connect(db_path)
+            schema.setup_db(con)
+            now = int(time.time())
+            con.executemany(
+                """
+                insert into turns (
+                  session_id, turn_id, captured_at, captured_at_unix, started_at, started_at_unix,
+                  turn_status, estimated, prompt_preview, weighted_credits, total_tokens, model_call_count
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    ("old", "recovered", "2026-08-23T07:57:02+00:00", now, "2026-07-19T17:39:06+00:00", now - 35 * 86400, "completed", 1, "old recovered prompt", 1.0, 100, 1),
+                    ("new", "normal", "2026-08-20T00:00:00+00:00", now - 3 * 86400, "2026-08-23T06:57:02+00:00", now - 3600, "completed", 0, "recent prompt", 2.0, 200, 1),
+                ],
+            )
+            con.commit()
+            con.row_factory = sqlite3.Row
+            scoped = queries.DashboardQueries(con, {"days": ["1"], "page": ["1"], "per_page": ["25"]}).turns_payload()
+            ordered = queries.DashboardQueries(con, {"days": ["0"], "page": ["1"], "per_page": ["25"]}).turns_payload()
+            con.close()
+
+        self.assertEqual([row["turn_id"] for row in scoped["rows"]], ["normal"])
+        self.assertEqual([row["turn_id"] for row in ordered["rows"]], ["normal", "recovered"])
+        self.assertEqual(ordered["rows"][0]["started_at"], "2026-08-23T06:57:02+00:00")
+
+    def test_turn_page_is_clamped_after_filter_count(self) -> None:
+        queries = load_module("dashboard_queries_turn_page_clamp_test", ROOT / "scripts" / "dashboard_queries.py")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = pathlib.Path(tmp_dir) / "analytics.sqlite"
+            self._write_dashboard_fixture(db_path)
+            con = sqlite3.connect(db_path)
+            con.row_factory = sqlite3.Row
+            session_id, filtered_total = con.execute(
+                "select session_id, count(*) from turns group by session_id order by count(*) asc limit 1"
+            ).fetchone()
+            payload = queries.DashboardQueries(
+                con,
+                {
+                    "days": ["0"],
+                    "session_id": [session_id],
+                    "page": ["999"],
+                    "per_page": ["1"],
+                    "sort": ["date"],
+                    "sort_dir": ["desc"],
+                },
+            ).turns_payload()
+            con.close()
+
+        self.assertEqual(payload["total"], filtered_total)
+        self.assertEqual(payload["page"], filtered_total)
+        self.assertEqual(payload["per_page"], 1)
+        self.assertEqual(len(payload["rows"]), 1)
+
+    def test_server_rejects_non_loopback_host(self) -> None:
         serve = load_module("serve_dashboard_network_guard_test", ROOT / "scripts" / "serve_dashboard.py")
 
         def fail_server(*_args, **_kwargs):
@@ -47,44 +122,53 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
 
         with (
             mock.patch.object(serve.sys, "argv", ["serve_dashboard.py", "--host", "0.0.0.0"]),
-            mock.patch.object(serve.service_paths, "assert_migrated", return_value=None),
             mock.patch.object(serve, "ThreadingHTTPServer", side_effect=fail_server),
         ):
             result = serve.main()
 
         self.assertEqual(result, 2)
 
-    def test_server_allows_non_loopback_host_with_explicit_allow_network(self) -> None:
-        serve = load_module("serve_dashboard_network_allow_test", ROOT / "scripts" / "serve_dashboard.py")
-        started: dict[str, object] = {}
+    def test_server_rejects_ipv6_loopback_before_bind(self) -> None:
+        serve = load_module("serve_dashboard_ipv6_guard_test", ROOT / "scripts" / "serve_dashboard.py")
 
-        class FakeServer:
-            def __init__(self, address, handler):
-                started["address"] = address
-                started["handler"] = handler
+        def fail_server(*_args, **_kwargs):
+            raise AssertionError("server must not bind before IPv4 loopback policy check")
 
-            def serve_forever(self):
-                started["served"] = True
-
+        stderr = io.StringIO()
         with (
-            mock.patch.object(serve.sys, "argv", ["serve_dashboard.py", "--host", "0.0.0.0", "--allow-network"]),
-            mock.patch.object(serve.service_paths, "assert_migrated", return_value=None),
-            mock.patch.object(serve, "sweep_transient_progress_files", return_value=None),
-            mock.patch.object(serve, "ThreadingHTTPServer", side_effect=FakeServer),
+            mock.patch.object(serve.sys, "argv", ["serve_dashboard.py", "--host", "::1"]),
+            mock.patch.object(serve, "ThreadingHTTPServer", side_effect=fail_server),
+            mock.patch.object(serve.sys, "stderr", stderr),
         ):
             result = serve.main()
 
-        self.assertEqual(result, 0)
-        self.assertEqual(started["address"], ("0.0.0.0", 8766))
-        self.assertTrue(started["served"])
+        self.assertEqual(result, 2)
+        self.assertIn("use localhost or an IPv4 loopback address", stderr.getvalue())
+
+    def test_server_accepts_only_supported_ipv4_loopback_hosts(self) -> None:
+        serve = load_module("serve_dashboard_loopback_policy_test", ROOT / "scripts" / "serve_dashboard.py")
+
+        self.assertTrue(serve.is_loopback_host("127.0.0.1"))
+        self.assertTrue(serve.is_loopback_host("127.1.2.3"))
+        self.assertTrue(serve.is_loopback_host("localhost"))
+        self.assertFalse(serve.is_loopback_host("::1"))
+        self.assertFalse(serve.is_loopback_host("0.0.0.0"))
+
+    def test_server_rejects_removed_allow_network_option(self) -> None:
+        serve = load_module("serve_dashboard_network_option_test", ROOT / "scripts" / "serve_dashboard.py")
+        with (
+            mock.patch.object(serve.sys, "argv", ["serve_dashboard.py", "--host", "0.0.0.0", "--allow-network"]),
+            self.assertRaises(SystemExit),
+        ):
+            serve.main()
 
     def test_server_rejects_external_analytics_db_before_bind(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
-            codex_home = pathlib.Path(tmp_dir) / ".codex"
+            codex_dir = pathlib.Path(tmp_dir) / ".codex"
             external_db = pathlib.Path(tmp_dir) / "outside.sqlite"
             with mock.patch.dict(
                 "os.environ",
-                {"CODEX_HOME": str(codex_home), "CODEX_TOKEN_USAGE_ANALYTICS_DB": str(external_db)},
+                {"CODEX_HOME": str(codex_dir), "BOLA_ANALYTICS_DB": str(external_db)},
                 clear=False,
             ):
                 serve = load_module("serve_dashboard_external_db_guard_test", ROOT / "scripts" / "serve_dashboard.py")
@@ -94,7 +178,6 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
 
         with (
             mock.patch.object(serve.sys, "argv", ["serve_dashboard.py"]),
-            mock.patch.object(serve.service_paths, "assert_migrated", return_value=None),
             mock.patch.object(serve, "ThreadingHTTPServer", side_effect=fail_server),
         ):
             result = serve.main()
@@ -114,7 +197,7 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
 
             def wait(self, timeout=None):
                 calls.append(f"wait:{timeout}")
-                raise serve.subprocess.TimeoutExpired("cmd", timeout)
+                raise serve.dashboard_rebuild_api.subprocess.TimeoutExpired("cmd", timeout)
 
             def kill(self):
                 calls.append("kill")
@@ -127,8 +210,8 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
     def test_missing_analytics_db_serves_empty_initial_dashboard_payload(self) -> None:
         serve = load_module("serve_dashboard_missing_db_test", ROOT / "scripts" / "serve_dashboard.py")
         with tempfile.TemporaryDirectory() as tmp_dir:
-            db_path = pathlib.Path(tmp_dir) / "analytics" / "token-usage.sqlite"
-            serve.TOKEN_USAGE_ROOT = pathlib.Path(tmp_dir)
+            db_path = pathlib.Path(tmp_dir) / "analytics" / "bola.sqlite"
+            serve.OUTPUT_DIR = pathlib.Path(tmp_dir)
             handler = serve.Handler.__new__(serve.Handler)
             handler.server = types.SimpleNamespace(db_path=db_path)
             captured: dict[str, object] = {}
@@ -147,7 +230,7 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertEqual(payload["summary"]["tool_calls"], 0)
         self.assertEqual(payload["projects"]["rows"], [])
         self.assertEqual(payload["sessions"]["rows"], [])
-        self.assertEqual(payload["turns"], {"rows": [], "total": 0, "page": 2, "per_page": 5, "focused": False})
+        self.assertEqual(payload["turns"], {"rows": [], "total": 0, "page": 1, "per_page": 5, "focused": False})
         self.assertEqual(payload["tools"]["rows"], [])
         self.assertEqual([row["rows"] for row in payload["subagents"]["rows"]], [0, 0, 0, 0, 0])
         self.assertEqual(payload["freshness"]["status"], "missing_db")
@@ -174,7 +257,7 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
                 con.commit()
             finally:
                 con.close()
-            serve.TOKEN_USAGE_ROOT = base
+            serve.OUTPUT_DIR = base
             handler = serve.Handler.__new__(serve.Handler)
             handler.server = types.SimpleNamespace(db_path=db_path)
             sent: list[tuple[dict[str, object], int]] = []
@@ -210,7 +293,7 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
                 con.commit()
             finally:
                 con.close()
-            serve.TOKEN_USAGE_ROOT = base
+            serve.OUTPUT_DIR = base
             handler = serve.Handler.__new__(serve.Handler)
             handler.server = types.SimpleNamespace(db_path=db_path)
             sent: list[tuple[dict[str, object], int]] = []
@@ -218,7 +301,7 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
 
             handler.handle_api("/api/turns", {"page": ["2"], "per_page": ["5"]})
 
-        self.assertEqual(sent, [({"rows": [], "total": 0, "page": 2, "per_page": 5, "focused": False}, 200)])
+        self.assertEqual(sent, [({"rows": [], "total": 0, "page": 1, "per_page": 5, "focused": False}, 200)])
 
     def test_dashboard_freshness_counts_pending_raw_rows_since_normalize_state(self) -> None:
         freshness = load_module("dashboard_freshness_pending_rows_test", ROOT / "scripts" / "dashboard_freshness.py")
@@ -239,7 +322,7 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
                 json.dumps({"logic_version": 5, "sources": {str(raw_path): len(first)}, "processed_segments": {}}),
                 encoding="utf-8",
             )
-            db_path = analytics_dir / "token-usage.sqlite"
+            db_path = analytics_dir / "bola.sqlite"
             db_path.write_text("", encoding="utf-8")
 
             payload = freshness.freshness_payload(base, db_path)
@@ -250,6 +333,78 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertEqual(payload["pending_raw_files"], 1)
         self.assertGreater(payload["latest_raw_mtime_unix"], 0)
         self.assertGreater(payload["analytics_db_mtime_unix"], 0)
+
+    def test_dashboard_freshness_degrades_when_current_raw_cannot_be_read(self) -> None:
+        freshness = load_module("dashboard_freshness_unreadable_raw_test", ROOT / "scripts" / "dashboard_freshness.py")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = pathlib.Path(tmp_dir)
+            raw_dir = base / "raw" / "current"
+            state_dir = base / "state"
+            normalized_dir = base / "normalized"
+            analytics_dir = base / "analytics"
+            raw_dir.mkdir(parents=True)
+            state_dir.mkdir()
+            normalized_dir.mkdir()
+            analytics_dir.mkdir()
+            raw_path = raw_dir / "prompt-usage.raw.jsonl.current.unreadable.jsonl"
+            raw_path.write_text(json.dumps({"record_type": "turn_usage_raw", "turn_id": "pending"}) + "\n", encoding="utf-8")
+            (state_dir / "current-raw-segments.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "base": str(base.resolve()),
+                        "current": {
+                            "prompt_usage": {
+                                "id": "unreadable",
+                                "kind": "prompt_usage",
+                                "path": str(raw_path),
+                                "source_name": "prompt-usage.raw.jsonl",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (state_dir / "raw-segments-manifest.json").write_text(
+                json.dumps({"schema_version": 1, "base": str(base.resolve()), "segments": []}),
+                encoding="utf-8",
+            )
+            (normalized_dir / "normalize-state.json").write_text(
+                json.dumps({"logic_version": 5, "sources": {}, "processed_segments": {}}),
+                encoding="utf-8",
+            )
+            db_path = analytics_dir / "bola.sqlite"
+            db_path.write_text("", encoding="utf-8")
+            raw_path.chmod(0)
+            try:
+                payload = freshness.freshness_payload(base, db_path)
+            finally:
+                raw_path.chmod(0o600)
+
+        self.assertEqual(payload["status"], "degraded")
+        self.assertFalse(payload["needs_analyze"])
+        self.assertEqual(payload["data_health"], "degraded")
+        self.assertEqual(payload["pending_raw_rows"], 0)
+        self.assertIn("freshness_source_read_error", [warning["code"] for warning in payload["warnings"]])
+
+    def test_dashboard_freshness_degrades_when_normalized_log_cannot_be_read(self) -> None:
+        freshness = load_module("dashboard_freshness_unreadable_normalized_test", ROOT / "scripts" / "dashboard_freshness.py")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = pathlib.Path(tmp_dir)
+            db_path = self.write_empty_freshness_fixture(base)
+            normalized_path = base / "normalized" / "prompt-usage.normalized.jsonl"
+            normalized_path.write_text(json.dumps({"turn_id": "pending"}) + "\n", encoding="utf-8")
+            normalized_path.chmod(0)
+            try:
+                payload = freshness.freshness_payload(base, db_path)
+            finally:
+                normalized_path.chmod(0o600)
+
+        self.assertEqual(payload["status"], "degraded")
+        self.assertFalse(payload["needs_analyze"])
+        self.assertEqual(payload["data_health"], "degraded")
+        self.assertEqual(payload["pending_normalized_rows"], 0)
+        self.assertIn("freshness_source_read_error", [warning["code"] for warning in payload["warnings"]])
 
     def test_dashboard_freshness_counts_missing_start_recovery_state_as_analyze_needed(self) -> None:
         freshness = load_module("dashboard_freshness_pending_recovery_test", ROOT / "scripts" / "dashboard_freshness.py")
@@ -281,7 +436,7 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
                 json.dumps({"schema_version": 1, "base": str(base.resolve()), "segments": []}),
                 encoding="utf-8",
             )
-            db_path = analytics_dir / "token-usage.sqlite"
+            db_path = analytics_dir / "bola.sqlite"
             db_path.write_text("", encoding="utf-8")
 
             payload = freshness.freshness_payload(base, db_path)
@@ -350,7 +505,7 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertTrue(payload["needs_analyze"])
         self.assertEqual(payload["pending_recovery_files"], 1)
 
-    def test_dashboard_freshness_falls_back_to_full_scan_for_turn_start_terminal_event(self) -> None:
+    def test_dashboard_freshness_does_not_match_terminal_event_before_turn_start_offset(self) -> None:
         freshness = load_module("dashboard_freshness_terminal_turn_start_fallback_test", ROOT / "scripts" / "dashboard_freshness.py")
         with tempfile.TemporaryDirectory() as tmp_dir:
             base = pathlib.Path(tmp_dir)
@@ -374,9 +529,9 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
 
             payload = freshness.freshness_payload(base, db_path)
 
-        self.assertEqual(payload["status"], "needs_analyze")
-        self.assertTrue(payload["needs_analyze"])
-        self.assertEqual(payload["pending_recovery_files"], 1)
+        self.assertEqual(payload["status"], "current")
+        self.assertFalse(payload["needs_analyze"])
+        self.assertEqual(payload["pending_recovery_files"], 0)
 
     def test_dashboard_freshness_ignores_malformed_transcript_bytes_for_recovery(self) -> None:
         freshness = load_module("dashboard_freshness_malformed_recovery_test", ROOT / "scripts" / "dashboard_freshness.py")
@@ -411,13 +566,11 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
             base = pathlib.Path(tmp_dir)
             db_path = self.write_empty_freshness_fixture(base)
             transcript = base / "rollout.jsonl"
+            prefix = json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {}}}) + "\n"
             terminal_one = json.dumps({"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "t-one"}}) + "\n"
             terminal_two = json.dumps({"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "t-two"}}) + "\n"
-            transcript.write_text(
-                terminal_one + terminal_two + json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {}}}) + "\n",
-                encoding="utf-8",
-            )
-            start_file_size = len(terminal_one.encode("utf-8")) + len(terminal_two.encode("utf-8"))
+            transcript.write_text(prefix + terminal_one + terminal_two, encoding="utf-8")
+            start_file_size = len(prefix.encode("utf-8"))
             for name, turn_id in (("one", "t-one"), ("two", "t-two")):
                 (base / "state" / f"pending-{name}.json").write_text(
                     json.dumps(
@@ -446,6 +599,72 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
 
         self.assertEqual(payload["pending_recovery_files"], 2)
         self.assertLessEqual(transcript_opens, 2)
+
+    def test_dashboard_freshness_scans_only_new_complete_transcript_suffixes(self) -> None:
+        freshness = load_module("dashboard_freshness_terminal_suffix_cache_test", ROOT / "scripts" / "dashboard_freshness.py")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            transcript = pathlib.Path(tmp_dir) / "rollout.jsonl"
+            prefix = json.dumps({"type": "event_msg", "payload": {"type": "token_count"}}) + "\n"
+            terminal_one = json.dumps({"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "t-one"}}) + "\n"
+            transcript.write_text(prefix + terminal_one, encoding="utf-8")
+            states = [{"turn_id": "t-one", "start_file_size": len(prefix.encode("utf-8"))}]
+
+            with mock.patch.object(freshness, "_scan_terminal_turn_ids", wraps=freshness._scan_terminal_turn_ids) as scan:
+                self.assertEqual(freshness._terminal_turn_ids_for_pending_states(transcript, states), {"t-one"})
+                self.assertEqual(freshness._terminal_turn_ids_for_pending_states(transcript, states), {"t-one"})
+                self.assertEqual(scan.call_count, 1)
+
+                partial = json.dumps({"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "t-two"}})
+                with transcript.open("ab") as handle:
+                    handle.write(partial.encode("utf-8"))
+                self.assertEqual(freshness._terminal_turn_ids_for_pending_states(transcript, states), {"t-one"})
+                self.assertEqual(scan.call_count, 1)
+
+                with transcript.open("ab") as handle:
+                    handle.write(b"\n")
+                states.append({"turn_id": "t-two", "start_file_size": len(prefix.encode("utf-8"))})
+                self.assertEqual(freshness._terminal_turn_ids_for_pending_states(transcript, states), {"t-one", "t-two"})
+                self.assertEqual(scan.call_count, 2)
+
+    def test_dashboard_freshness_invalidates_same_size_transcript_rewrite(self) -> None:
+        freshness = load_module("dashboard_freshness_terminal_rewrite_cache_test", ROOT / "scripts" / "dashboard_freshness.py")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            transcript = pathlib.Path(tmp_dir) / "rollout.jsonl"
+            one = json.dumps({"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "t-one"}}) + "\n"
+            two = json.dumps({"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "t-two"}}) + "\n"
+            self.assertEqual(len(one), len(two))
+            transcript.write_text(one, encoding="utf-8")
+            states = [{"turn_id": "t-one", "start_file_size": 0}]
+            self.assertEqual(freshness._terminal_turn_ids_for_pending_states(transcript, states), {"t-one"})
+
+            time.sleep(0.002)
+            transcript.write_text(two, encoding="utf-8")
+            self.assertEqual(
+                freshness._terminal_turn_ids_for_pending_states(transcript, [{"turn_id": "t-two", "start_file_size": 0}]),
+                {"t-two"},
+            )
+
+    def test_dashboard_freshness_coalesces_concurrent_terminal_scans(self) -> None:
+        freshness = load_module("dashboard_freshness_terminal_singleflight_test", ROOT / "scripts" / "dashboard_freshness.py")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            transcript = pathlib.Path(tmp_dir) / "rollout.jsonl"
+            transcript.write_text(
+                json.dumps({"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "t-one"}}) + "\n",
+                encoding="utf-8",
+            )
+            states = [{"turn_id": "t-one", "start_file_size": 0}]
+            original_scan = freshness._scan_terminal_turn_ids
+
+            def slow_scan(*args, **kwargs):
+                time.sleep(0.02)
+                return original_scan(*args, **kwargs)
+
+            with mock.patch.object(freshness, "_scan_terminal_turn_ids", side_effect=slow_scan) as scan:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                    results = list(executor.map(lambda _index: freshness._terminal_turn_ids_for_pending_states(transcript, states), range(4)))
+
+            self.assertEqual(results, [{"t-one"}] * 4)
+            self.assertEqual(scan.call_count, 1)
 
     def test_dashboard_freshness_ignores_recent_turn_start_recovery_state(self) -> None:
         freshness = load_module("dashboard_freshness_recent_turn_start_test", ROOT / "scripts" / "dashboard_freshness.py")
@@ -542,7 +761,7 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            db_path = analytics_dir / "token-usage.sqlite"
+            db_path = analytics_dir / "bola.sqlite"
             db_path.write_text("", encoding="utf-8")
 
             payload = freshness.freshness_payload(base, db_path)
@@ -567,7 +786,7 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
             analytics_dir.mkdir(parents=True)
             raw_path = raw_dir / "prompt-usage.raw.jsonl.current.orphan.jsonl"
             raw_path.write_text(json.dumps({"record_type": "turn_usage_raw", "turn_id": "orphan"}) + "\n", encoding="utf-8")
-            db_path = analytics_dir / "token-usage.sqlite"
+            db_path = analytics_dir / "bola.sqlite"
             db_path.write_text("", encoding="utf-8")
 
             payload = freshness.freshness_payload(base, db_path)
@@ -594,7 +813,7 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
             raw_path = raw_dir / "prompt-usage.raw.jsonl.current.orphan.jsonl"
             raw_path.write_text(json.dumps({"record_type": "turn_usage_raw", "turn_id": "orphan"}) + "\n", encoding="utf-8")
             (state_dir / "current-raw-segments.json").write_text("{bad\n", encoding="utf-8")
-            db_path = analytics_dir / "token-usage.sqlite"
+            db_path = analytics_dir / "bola.sqlite"
             db_path.write_text("", encoding="utf-8")
 
             payload = freshness.freshness_payload(base, db_path)
@@ -621,7 +840,7 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
             (state_dir / "current-raw-segments.json").write_text(json.dumps({"schema_version": 1, "base": "/old/wrong", "current": {}}), encoding="utf-8")
             (state_dir / "raw-segments-manifest.json").write_text(json.dumps({"schema_version": 1, "base": str(base.resolve()), "segments": []}), encoding="utf-8")
             (normalized_dir / "normalize-state.json").write_text(json.dumps({"logic_version": 5, "sources": {}, "processed_segments": {}}), encoding="utf-8")
-            db_path = analytics_dir / "token-usage.sqlite"
+            db_path = analytics_dir / "bola.sqlite"
             db_path.write_text("", encoding="utf-8")
 
             payload = freshness.freshness_payload(base, db_path)
@@ -658,7 +877,7 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
                 encoding="utf-8",
             )
             (normalized_dir / "normalize-state.json").write_text(json.dumps({"logic_version": 5, "sources": {}, "processed_segments": {segment_id: {"path": str(raw_path)}}}), encoding="utf-8")
-            db_path = analytics_dir / "token-usage.sqlite"
+            db_path = analytics_dir / "bola.sqlite"
             db_path.write_text("", encoding="utf-8")
 
             result = freshness.freshness_payload(base, db_path)
@@ -695,7 +914,7 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
             )
             (state_dir / "raw-segments-manifest.json").write_text(json.dumps({"schema_version": 1, "base": str(base.resolve()), "segments": []}), encoding="utf-8")
             (normalized_dir / "normalize-state.json").write_text(json.dumps({"logic_version": 5, "sources": {}, "processed_segments": {}}), encoding="utf-8")
-            db_path = analytics_dir / "token-usage.sqlite"
+            db_path = analytics_dir / "bola.sqlite"
             db_path.write_text("", encoding="utf-8")
 
             result = freshness.freshness_payload(base, db_path)
@@ -720,7 +939,7 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
             raw_path.write_text(first + second, encoding="utf-8")
             raw_segments.write_manifest(base, raw_segments.empty_manifest(base))
             (normalized_dir / "normalize-state.json").write_text(json.dumps({"logic_version": 4, "sources": {str(raw_path): len(first)}, "processed_segments": {}}), encoding="utf-8")
-            db_path = analytics_dir / "token-usage.sqlite"
+            db_path = analytics_dir / "bola.sqlite"
             db_path.write_text("", encoding="utf-8")
 
             result = freshness.freshness_payload(base, db_path)
@@ -749,7 +968,7 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
                 json.dumps({"logic_version": 5, "sources": {}, "processed_segments": {raw_path.name.removesuffix(".jsonl"): {"path": str(raw_path)}}}),
                 encoding="utf-8",
             )
-            db_path = analytics_dir / "token-usage.sqlite"
+            db_path = analytics_dir / "bola.sqlite"
             db_path.write_text("", encoding="utf-8")
 
             result = freshness.freshness_payload(base, db_path)
@@ -771,9 +990,9 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
             analytics_dir.mkdir(parents=True)
             raw_path = raw_dir / "prompt-usage.raw.jsonl.current.orphan.jsonl"
             raw_path.write_text(json.dumps({"record_type": "turn_usage_raw", "turn_id": "orphan"}) + "\n", encoding="utf-8")
-            db_path = analytics_dir / "token-usage.sqlite"
+            db_path = analytics_dir / "bola.sqlite"
             db_path.write_text("", encoding="utf-8")
-            serve.TOKEN_USAGE_ROOT = base
+            serve.OUTPUT_DIR = base
             handler = serve.Handler.__new__(serve.Handler)
             handler.server = types.SimpleNamespace(db_path=db_path)
 
@@ -784,6 +1003,26 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertEqual(payload["freshness"]["pending_raw_rows"], 1)
         self.assertIn("warnings", payload["freshness"])
         self.assertIn("current_pointer_missing", [warning["code"] for warning in payload["freshness"]["warnings"]])
+
+    def test_dynamic_dashboard_uses_new_output_on_next_request(self) -> None:
+        serve = load_module("serve_dashboard_dynamic_paths_test", ROOT / "scripts" / "serve_dashboard.py")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = pathlib.Path(tmp_dir)
+            first = root / "A"
+            second = root / "B"
+            handler = serve.Handler.__new__(serve.Handler)
+            handler.server = types.SimpleNamespace(dynamic_runtime_paths=True, db_override=None)
+            with mock.patch.dict(serve.os.environ, {"XDG_CONFIG_HOME": str(root / "config")}, clear=True):
+                serve.service_paths.write_config({"output_dir": first})
+                first_snapshot = handler.dashboard_output_dir()
+                serve.service_paths.write_config({"output_dir": second})
+                same_request_snapshot = handler.dashboard_output_dir()
+                handler._runtime_paths_snapshot = None
+                next_request_snapshot = handler.dashboard_output_dir()
+
+        self.assertEqual(first_snapshot, first)
+        self.assertEqual(same_request_snapshot, first)
+        self.assertEqual(next_request_snapshot, second)
 
     def test_dashboard_freshness_detects_normalized_rows_not_built_into_db(self) -> None:
         freshness = load_module("dashboard_freshness_pending_normalized_test", ROOT / "scripts" / "dashboard_freshness.py")
@@ -797,7 +1036,7 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
             first = json.dumps({"record_type": "turn_usage_normalized", "turn_id": "t1"}) + "\n"
             second = json.dumps({"record_type": "turn_usage_normalized", "turn_id": "t2"}) + "\n"
             normalized.write_text(first + second, encoding="utf-8")
-            db_path = analytics_dir / "token-usage.sqlite"
+            db_path = analytics_dir / "bola.sqlite"
             con = sqlite3.connect(db_path)
             con.execute("create table run_metadata(key text primary key, value text not null)")
             con.execute("insert into run_metadata values (?,?)", ("applied_normalized_turns_size", json.dumps(len(first))))
@@ -814,9 +1053,8 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
 
     def test_post_api_errors_are_returned_as_json(self) -> None:
         serve = load_module("serve_dashboard_post_error_json_test", ROOT / "scripts" / "serve_dashboard.py")
-        handler = serve.Handler.__new__(serve.Handler)
+        handler = self.secure_post_handler(serve)
         sent: list[tuple[dict[str, object], int]] = []
-        handler.path = "/api/rebuild"
         handler.handle_rebuild = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
         handler.send_json = lambda payload, status=200: sent.append((payload, status))
 
@@ -826,11 +1064,8 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
 
     def test_post_api_rejects_malformed_json_body_before_mutation(self) -> None:
         serve = load_module("serve_dashboard_invalid_json_body_test", ROOT / "scripts" / "serve_dashboard.py")
-        handler = serve.Handler.__new__(serve.Handler)
+        handler = self.secure_post_handler(serve, b"{bad\n")
         sent: list[tuple[dict[str, object], int]] = []
-        handler.path = "/api/rebuild"
-        handler.headers = {"Content-Length": "5"}
-        handler.rfile = io.BytesIO(b"{bad\n")
         handler.handle_rebuild = lambda: (_ for _ in ()).throw(AssertionError("mutation must not start"))
         handler.send_json = lambda payload, status=200: sent.append((payload, status))
 
@@ -838,10 +1073,110 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
 
         self.assertEqual(sent, [({"error": "invalid_json"}, 400)])
 
+    def test_post_security_headers_block_before_mutation(self) -> None:
+        serve = load_module("serve_dashboard_post_security_test", ROOT / "scripts" / "serve_dashboard.py")
+        cases = (
+            ("Host", "attacker.example", "request_host_forbidden", 403),
+            ("Origin", "https://attacker.example", "request_origin_forbidden", 403),
+            ("Sec-Fetch-Site", "cross-site", "cross_site_request_forbidden", 403),
+            ("Content-Type", "text/plain", "application_json_required", 415),
+        )
+
+        for header, value, error, status in cases:
+            with self.subTest(header=header):
+                handler = self.secure_post_handler(serve, b'{"confirm_all_logs":true}')
+                sent: list[tuple[dict[str, object], int]] = []
+                mutations: list[bool] = []
+                handler.headers[header] = value
+                handler.handle_rebuild = lambda: mutations.append(True)
+                handler.send_json = lambda payload, response_status=200: sent.append((payload, response_status))
+
+                handler.do_POST()
+
+                self.assertEqual(mutations, [])
+                self.assertEqual(sent, [({"error": error}, status)])
+
+    def test_post_requires_origin_even_without_sec_fetch_site(self) -> None:
+        serve = load_module("serve_dashboard_post_origin_required_test", ROOT / "scripts" / "serve_dashboard.py")
+        handler = self.secure_post_handler(serve)
+        sent: list[tuple[dict[str, object], int]] = []
+        mutations: list[bool] = []
+        del handler.headers["Origin"]
+        del handler.headers["Sec-Fetch-Site"]
+        handler.handle_rebuild = lambda: mutations.append(True)
+        handler.send_json = lambda payload, status=200: sent.append((payload, status))
+
+        handler.do_POST()
+
+        self.assertEqual(mutations, [])
+        self.assertEqual(sent, [({"error": "request_origin_forbidden"}, 403)])
+
+    def test_post_accepts_json_charset_and_missing_sec_fetch_site(self) -> None:
+        serve = load_module("serve_dashboard_post_json_charset_test", ROOT / "scripts" / "serve_dashboard.py")
+        handler = self.secure_post_handler(serve)
+        sent: list[tuple[dict[str, object], int]] = []
+        mutations: list[bool] = []
+        del handler.headers["Sec-Fetch-Site"]
+        handler.headers["Content-Type"] = "application/json; charset=UTF-8"
+        handler.handle_rebuild = lambda: mutations.append(True)
+        handler.send_json = lambda payload, status=200: sent.append((payload, status))
+
+        handler.do_POST()
+
+        self.assertEqual(mutations, [True])
+        self.assertEqual(sent, [])
+
+    def test_post_rejects_oversized_body_before_read_or_mutation(self) -> None:
+        serve = load_module("serve_dashboard_post_body_limit_test", ROOT / "scripts" / "serve_dashboard.py")
+        handler = self.secure_post_handler(serve)
+        sent: list[tuple[dict[str, object], int]] = []
+        mutations: list[bool] = []
+        handler.headers["Content-Length"] = str(serve.MAX_JSON_BODY_BYTES + 1)
+        handler.rfile = None
+        handler.handle_rebuild = lambda: mutations.append(True)
+        handler.send_json = lambda payload, status=200: sent.append((payload, status))
+
+        handler.do_POST()
+
+        self.assertEqual(mutations, [])
+        self.assertEqual(sent, [({"error": "request_body_too_large"}, 413)])
+
+    def test_post_rejects_missing_and_invalid_content_length_before_mutation(self) -> None:
+        serve = load_module("serve_dashboard_post_content_length_test", ROOT / "scripts" / "serve_dashboard.py")
+        cases = (
+            (None, "content_length_required", 411),
+            ("not-a-number", "invalid_content_length", 400),
+            ("-1", "invalid_content_length", 400),
+        )
+
+        for length, error, status in cases:
+            with self.subTest(length=length):
+                handler = self.secure_post_handler(serve)
+                sent: list[tuple[dict[str, object], int]] = []
+                mutations: list[bool] = []
+                if length is None:
+                    del handler.headers["Content-Length"]
+                else:
+                    handler.headers["Content-Length"] = length
+                handler.handle_rebuild = lambda: mutations.append(True)
+                handler.send_json = lambda payload, response_status=200: sent.append((payload, response_status))
+
+                handler.do_POST()
+
+                self.assertEqual(mutations, [])
+                self.assertEqual(sent, [({"error": error}, status)])
+
+    def test_dashboard_post_helper_always_sends_json_object(self) -> None:
+        source = (ROOT / "scripts" / "assets" / "dashboard" / "api.js").read_text(encoding="utf-8")
+        self.assertIn("headers: { 'Content-Type': 'application/json' }", source)
+        self.assertIn("body: JSON.stringify(body === null ? {} : body)", source)
+
     def test_root_dashboard_html_is_not_cached(self) -> None:
         serve = load_module("serve_dashboard_root_cache_test", ROOT / "scripts" / "serve_dashboard.py")
         handler = serve.Handler.__new__(serve.Handler)
         headers: list[tuple[str, str]] = []
+        handler.server = types.SimpleNamespace(allowed_authority="127.0.0.1:8766")
+        handler.headers = {"Host": "127.0.0.1:8766"}
         handler.path = "/"
         handler.send_response = lambda status: None
         handler.send_header = lambda name, value: headers.append((name, value))
@@ -851,6 +1186,20 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
         handler.do_GET()
 
         self.assertIn(("Cache-Control", "no-cache"), headers)
+
+    def test_get_rejects_unexpected_host_before_routing(self) -> None:
+        serve = load_module("serve_dashboard_get_host_test", ROOT / "scripts" / "serve_dashboard.py")
+        handler = serve.Handler.__new__(serve.Handler)
+        sent: list[tuple[dict[str, object], int]] = []
+        handler.server = types.SimpleNamespace(allowed_authority="127.0.0.1:8766")
+        handler.headers = {"Host": "localhost:8766"}
+        handler.path = "/api/dashboard"
+        handler.handle_api = lambda *_args: (_ for _ in ()).throw(AssertionError("route must not run"))
+        handler.send_json = lambda payload, status=200: sent.append((payload, status))
+
+        handler.do_GET()
+
+        self.assertEqual(sent, [({"error": "request_host_forbidden"}, 403)])
     def test_dashboard_payload_can_focus_a_specific_turn(self) -> None:
         queries = load_module("dashboard_queries_focus_turn_test", ROOT / "scripts" / "dashboard_queries.py")
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -962,8 +1311,8 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
         queries = load_module("dashboard_queries_turn_contract_test", ROOT / "scripts" / "dashboard_queries.py")
         fixture = load_module("dashboard_fixture_data_turn_contract_test", ROOT / "scripts" / "dashboard_fixture_data.py")
         with tempfile.TemporaryDirectory() as tmp_dir:
-            codex_home = pathlib.Path(tmp_dir) / "codex-home"
-            db_path = fixture.write_dashboard_fixture(codex_home)
+            codex_dir = pathlib.Path(tmp_dir) / "codex-dir"
+            db_path = fixture.write_dashboard_fixture(codex_dir)
             con = sqlite3.connect(db_path)
             con.row_factory = sqlite3.Row
 
@@ -1306,8 +1655,6 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertEqual(credits_asc[-1]["confidence"], "child_task_time_overlap")
 
     def test_analysis_scope_percent_control_is_removed(self) -> None:
-        serve = load_module("serve_dashboard_analysis_scope_removed_test", ROOT / "scripts" / "serve_dashboard.py")
-
         self.assertNotIn('id="rows"', DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("Analysis rollup scope", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("Top 10%", DASHBOARD_ASSET_BUNDLE)
@@ -1318,7 +1665,6 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertNotIn("appliedRowsMode", DASHBOARD_ASSET_BUNDLE)
     def test_overview_uses_real_session_rows_not_inferred_projects(self) -> None:
         queries = load_module("dashboard_queries_overview_session_test", ROOT / "scripts" / "dashboard_queries.py")
-        serve = load_module("serve_dashboard_overview_session_test", ROOT / "scripts" / "serve_dashboard.py")
         with tempfile.TemporaryDirectory() as tmp_dir:
             db_path = pathlib.Path(tmp_dir) / "analytics.sqlite"
             self._write_dashboard_fixture(db_path)
@@ -1346,14 +1692,14 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertNotIn("<h2>Project Detail</h2>", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("q.set('lite', '1');", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("const { summary, turns } = dashboard;", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("async function loadOverviewData(seq = state.requestSeq)", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("await getJSON('/api/sessions?' + q)", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("async function loadToolsData(seq = state.requestSeq)", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("await getJSON('/api/tools?' + q)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("async function loadOverviewData(seq = state.requestSeq, page = state.listPages.projects || 1, busy = false)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("const path = sessionsPath(page);", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("async function loadToolsData(seq = state.requestSeq, page = state.listPages.tools || 1, busy = false)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("const path = toolsPath(page);", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("async function loadSubagentData(seq = state.requestSeq)", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("await getJSON('/api/subagents?' + q)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("const subagents = await cachedValue(subagentsPath());", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("loadVisibleRollupData(seq);", DASHBOARD_ASSET_BUNDLE)
-        self.assertIn("await getJSON('/api/session-detail?' + q)", DASHBOARD_ASSET_BUNDLE)
+        self.assertIn("return prepareDetail(key, sessionDetailPath(key));", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("/api/project-detail", DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn("project_detail_payload", (ROOT / "scripts" / "dashboard_queries.py").read_text(encoding="utf-8"))
         self.assertIn("{label:'Session', sort:'session'}, {label:'Cost Units', sort:'credits', cls:'num'}, {label:'Total Tokens', sort:'raw', cls:'num'}, {label:'Turns', sort:'turns', cls:'num'}", DASHBOARD_ASSET_BUNDLE)
@@ -1416,7 +1762,8 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
                   project text,
                   thread_name text,
                   prompt_preview text,
-                  weighted_credits real
+                  weighted_credits real,
+                  started_at_unix real generated always as (captured_at_unix) virtual
                 );
                 create table task_rollups (
                   parent_session_id text,
@@ -1515,7 +1862,9 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
                   non_cached_input_tokens integer,
                   output_tokens integer,
                   reasoning_output_tokens integer,
-                  model_call_count integer
+                  model_call_count integer,
+                  started_at_unix real generated always as (captured_at_unix) virtual,
+                  started_at text generated always as (captured_at) virtual
                 );
                 create table task_rollups (
                   parent_session_id text,
@@ -1575,7 +1924,6 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertEqual(subagent_row["child_credits"], 1010.0)
 
     def test_tool_detail_selected_tool_includes_description(self) -> None:
-        serve = load_module("serve_dashboard_tool_description_test", ROOT / "scripts" / "serve_dashboard.py")
         self.assertIn("function toolDescription(value)", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("exec_command: 'shell command execution output captured from terminal runs'", DASHBOARD_ASSET_BUNDLE)
         self.assertIn("toolDisplay(toolName)", DASHBOARD_ASSET_BUNDLE)
@@ -1586,21 +1934,30 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertNotIn('method-desc"> - ', DASHBOARD_ASSET_BUNDLE)
         self.assertNotIn('<div class="label">Selected tool</div>', DASHBOARD_ASSET_BUNDLE)
     def test_analyze_endpoint_runs_incremental_pipeline(self) -> None:
-        source = (ROOT / "scripts" / "serve_dashboard.py").read_text(encoding="utf-8")
-        self.assertIn('"--incremental",', source)
-        self.assertIn('"--recover",', source)
-        self.assertIn('if parsed.path == "/api/rebuild/cancel":', source)
-        self.assertIn('env["CODEX_TOKEN_USAGE_PROGRESS_FILE"] = str(progress_file)', source)
-        self.assertIn('if path == "/api/rebuild/progress":', source)
-        self.assertIn("def handle_rebuild_progress(self):", source)
-        self.assertIn('if path == "/api/log-cleanup/progress":', source)
-        self.assertIn("def handle_cleanup_progress(self):", source)
-        self.assertIn('env[progress_control.PROGRESS_ENV] = str(progress_file)', source)
-        self.assertIn("REBUILD_CANCEL_EVENT", source)
-        self.assertIn("REBUILD_PROCESS", source)
-        self.assertIn('metadata["analysis_elapsed_ms"] = metadata.pop("elapsed_ms")', source)
-        self.assertIn("AUTO_COMPACT_MIN_BYTES = 64 * 1024 * 1024", source)
-        self.assertIn('metadata["pre_analysis_rotate"]', source)
-        self.assertNotIn("self.run_compact_command(output, AUTO_COMPACT_MIN_BYTES)", source)
-        self.assertIn("dashboard_cleanup.refresh_retention_index_for_current_sources(TOKEN_USAGE_ROOT)", source)
-        self.assertIn('self.send_json({"ok": True, **metadata, "elapsed_ms": round((time.monotonic() - started) * 1000)})', source)
+        serve_source = (ROOT / "scripts" / "serve_dashboard.py").read_text(encoding="utf-8")
+        rebuild_source = (ROOT / "scripts" / "dashboard_rebuild_api.py").read_text(encoding="utf-8")
+        cleanup_source = (ROOT / "scripts" / "dashboard_cleanup_api.py").read_text(encoding="utf-8")
+        state_source = (ROOT / "scripts" / "dashboard_operation_state.py").read_text(encoding="utf-8")
+        self.assertIn('"--incremental",', rebuild_source)
+        self.assertIn('"--recover",', rebuild_source)
+        self.assertIn('if parsed.path == "/api/rebuild/cancel":', serve_source)
+        self.assertIn('env["BOLA_PROGRESS_FILE"] = str(progress_file)', rebuild_source)
+        self.assertIn('if path == "/api/rebuild/progress":', serve_source)
+        self.assertIn("def handle_rebuild_progress(self):", rebuild_source)
+        self.assertIn('if path == "/api/log-cleanup/progress":', serve_source)
+        self.assertIn("def handle_cleanup_progress(self):", cleanup_source)
+        self.assertIn('env[progress_control.PROGRESS_ENV] = str(progress_file)', cleanup_source)
+        self.assertIn("class DashboardOperationManager", state_source)
+        self.assertIn("operation_id", state_source)
+        self.assertIn("ManagedProcess.start", rebuild_source)
+        self.assertIn('metadata["analysis_elapsed_ms"] = metadata.pop("elapsed_ms")', rebuild_source)
+        self.assertIn("AUTO_COMPACT_MIN_BYTES = 64 * 1024 * 1024", rebuild_source)
+        self.assertIn('metadata["pre_analysis_rotate"]', rebuild_source)
+        self.assertNotIn("self.run_compact_command(output, AUTO_COMPACT_MIN_BYTES)", rebuild_source)
+        self.assertIn("dashboard_cleanup.refresh_retention_index_for_current_sources(self.dashboard_output_dir())", rebuild_source)
+        self.assertIn('degraded = process.returncode == 1 and metadata.get("status") == "degraded"', rebuild_source)
+        self.assertIn('"data_health": "degraded" if degraded else "ok"', rebuild_source)
+        self.assertIn('"ok": True,', rebuild_source)
+        for operation_source in (rebuild_source, cleanup_source, state_source):
+            self.assertNotIn("import serve_dashboard", operation_source)
+            self.assertNotIn("from serve_dashboard", operation_source)
