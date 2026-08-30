@@ -11,13 +11,16 @@ The private Apply workflow accepts only the recorded candidate SHA after all can
 The trusted private manifest permits only:
 
 - `.github/dependabot.yml`
+- `.github/public-ops-managed-paths.json`
 - `.github/release-dependency-audit-allowlist.json`
 - `.github/scripts/public_candidate_snapshot_guard.py`
 - `.github/scripts/public_codeql_result.py`
 - `.github/scripts/public_main_release_guard.py`
+- `.github/scripts/public_release_retry_guard.py`
 - `.github/scripts/public_snapshot_commit_policy.py`
 - `.github/scripts/release_dependency_audit.py`
 - `.github/workflows/codeql.yml`
+- `.github/workflows/release-retry.yml`
 - `.github/workflows/release.yml`
 - `docs/public-ops-path-policy.md`
 - `docs/public-ruleset-checklist.md`
