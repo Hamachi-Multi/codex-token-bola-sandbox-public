@@ -2,9 +2,9 @@
 
 Public operations use two private `workflow_dispatch` decisions and a public candidate branch
 
-The private Stage workflow creates one exact commit on `public-ops/*`. GitHub Actions runs `public-ops-candidate-guard`, the normal compile and asset checks, the sensitive-path guard, and CodeQL on that commit
+The private Stage workflow creates one exact commit on `public-ops/*`. GitHub Actions runs `compile-test`, `public-sensitive-guard`, `public-ops-candidate-guard`, and CodeQL on that commit
 
-The private Apply workflow accepts only the recorded candidate SHA after all candidate checks succeed. It fast-forwards public `main` to that exact SHA and verifies the resulting main checks before closing the durable ops record
+The private Apply workflow accepts only the recorded candidate SHA after all candidate checks succeed. Before the push, it compares the Ops Apply App actor with the public `PUBLIC_OPS_ACTOR` variable. It then fast-forwards public `main` to that exact SHA and verifies branch-specific main workflow runs before closing the durable ops record
 
 ## Allowed Paths
 
@@ -13,6 +13,7 @@ The trusted private manifest permits only:
 - `.github/dependabot.yml`
 - `.github/release-dependency-audit-allowlist.json`
 - `.github/scripts/public_candidate_snapshot_guard.py`
+- `.github/scripts/public_codeql_result.py`
 - `.github/scripts/public_main_release_guard.py`
 - `.github/scripts/public_snapshot_commit_policy.py`
 - `.github/scripts/release_dependency_audit.py`
@@ -48,8 +49,10 @@ The private Stage validates the subject as a single line and applies the same se
 
 The Ops Stage GitHub App may create, update, and delete only `public-ops/*` branches
 
-The Ops Apply GitHub App may update only public `main`
+The Ops Apply GitHub App may update only public `main`. Its repository permissions are limited to Contents read/write, Workflows read/write, and Variables read so the private Apply workflow can validate the public actor setting before mutation
 
 The candidate SHA, public base SHA, private source SHA, policy digest, tree digest, and state transitions are retained under the private `release/ops-records/**` namespace
 
-The current record keeps the latest valid apply and verification observations with the workflow run ID, run attempt, original actor, triggering actor, outcome, and observation time. Earlier observations remain available in the release-record branch Git history. Runs that do not change or observe public state are not added to the durable record
+The current record keeps the latest valid apply and verification observations with the workflow run ID, run attempt, original actor, triggering actor, outcome, and observation time. Exact candidate and main checks are selected by branch, workflow, push event, SHA, and latest run attempt. Earlier observations remain available in the release-record branch Git history
+
+The manual private reconcile workflow can recheck an `applied` record. A false `applied_failed` result may be corrected only with explicit recovery after exact public main, public-ci, and CodeQL verification. Recovery never writes public state and preserves the original failure as an incident in the private record
