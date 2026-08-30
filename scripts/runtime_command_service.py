@@ -6,7 +6,7 @@ import os
 import pathlib
 import sys
 from dataclasses import dataclass
-from typing import Callable, NoReturn
+from typing import Callable, Mapping, NoReturn
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -46,6 +46,7 @@ class ServeDependencies:
         [str | pathlib.Path | None, str | pathlib.Path | None],
         service_paths.RuntimePaths,
     ]
+    require_runtime_config: Callable[[], Mapping[str, object]]
     replace_command: Callable[..., NoReturn]
 
 
@@ -55,7 +56,6 @@ class BuildOptions:
     output_dir: str | pathlib.Path | None = None
     normalized_log: str | None = None
     state_db: str | None = None
-    output: str | None = None
     project_roots: tuple[str, ...] = ()
     extra_arguments: tuple[str, ...] = ()
 
@@ -98,7 +98,6 @@ def run_build(options: BuildOptions, dependencies: RuntimeCommandDependencies) -
     for name, value in (
         ("normalized-log", options.normalized_log),
         ("state-db", options.state_db),
-        ("output", options.output),
     ):
         if value:
             arguments.extend((f"--{name}", value))
@@ -117,6 +116,7 @@ def run_build(options: BuildOptions, dependencies: RuntimeCommandDependencies) -
 
 
 def run_serve(options: ServeOptions, dependencies: ServeDependencies) -> NoReturn:
+    dependencies.require_runtime_config()
     paths = dependencies.resolve_paths(options.codex_dir, options.output_dir)
     arguments = ["--host", options.host, "--port", str(options.port)]
     if options.codex_dir is not None:

@@ -1,6 +1,6 @@
 export const fmt = new Intl.NumberFormat();
 export const money = new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 });
-export const views = new Set(['overview', 'turns', 'tools', 'subagents', 'cleanup']);
+export const views = new Set(['overview', 'turns', 'tools', 'subagents', 'cleanup', 'settings']);
 export const DEFAULT_TURN_PAGE_SIZE = 25;
 export const CLEANUP_AFFECTED_FILE_PAGE_SIZE = 25;
 export const TURN_SORT_LABELS = { date: 'Date', session: 'Session', prompt: 'Prompt', credits: 'Cost Units', raw: 'Total Tokens' };
@@ -16,6 +16,7 @@ export const ROLLUP_SORT_KEYS = {
   subagents: new Set(['confidence', 'rows', 'child_credits', 'child_raw']),
 };
 export const CLEANUP_RETENTION_MODES = ['1', '7', '14', '30', '90', 'all', 'custom'];
+export const SESSION_LABEL_MODES = new Set(['project', 'thread']);
 export const SETTINGS_KEY = 'bola-dashboard-settings';
 
 export const state = {
@@ -23,8 +24,8 @@ export const state = {
   selectedSession: null,
   selectedTool: null,
   selectedSubagentConfidence: null,
-  themeMode: 'light',
-  themeModeExplicit: false,
+  themeMode: 'system',
+  sessionLabelMode: 'project',
   view: 'overview',
   turnPage: 1,
   turnPageSize: DEFAULT_TURN_PAGE_SIZE,
@@ -53,8 +54,6 @@ export const state = {
   modalSeq: 0,
   cleanupSeq: 0,
   cleanupRetentionAvailable: false,
-  modalTrigger: null,
-  cleanupModalTrigger: null,
   detailData: null,
   promptExpanded: false,
   toolSummaryExpanded: false,

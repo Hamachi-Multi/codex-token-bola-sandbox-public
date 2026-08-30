@@ -81,7 +81,7 @@ class DashboardOperationManager:
         *,
         operation_id: str | None = None,
     ) -> OperationLease:
-        if kind not in {"analysis", "cleanup"}:
+        if kind not in {"analysis", "cleanup", "cost_recalculation"}:
             raise ValueError(f"unsupported dashboard operation: {kind}")
         resolved_id = operation_id or str(uuid.uuid4())
         with self._condition:
@@ -107,6 +107,18 @@ class DashboardOperationManager:
     def active_record(self) -> OperationRecord | None:
         with self._condition:
             return self._active
+
+    def active_snapshot(self) -> dict[str, Any] | None:
+        """Return immutable fields needed by read-only status endpoints."""
+        with self._condition:
+            active = self._active
+            if active is None:
+                return None
+            return {
+                "operation_id": active.operation_id,
+                "kind": active.kind,
+                "progress_file": active.progress_file,
+            }
 
     def has_active_operation(self) -> bool:
         with self._condition:
@@ -210,6 +222,8 @@ def lock_operation(lock_path: pathlib.Path | str | None) -> str:
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         return "analysis"
     reason = str(payload.get("reason") or "").lower() if isinstance(payload, dict) else ""
+    if "cost-recalculation" in reason:
+        return "cost_recalculation"
     if any(fragment in reason for fragment in ("cleanup", "compact", "delete", "retention")):
         return "cleanup"
     return "analysis"
@@ -224,7 +238,7 @@ def service_busy_payload(
     resolved_operation = operation or lock_operation(lock_path)
     return {
         "error": "analysis_or_cleanup_running",
-        "operation": resolved_operation if resolved_operation in {"analysis", "cleanup"} else "analysis",
+        "operation": resolved_operation if resolved_operation in {"analysis", "cleanup", "cost_recalculation"} else "analysis",
         "progress_available": bool(progress_available and resolved_operation == "analysis"),
         **({"lock_path": str(lock_path)} if lock_path else {}),
     }

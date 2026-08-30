@@ -317,27 +317,209 @@ class QuarantineHealthTests(unittest.TestCase):
                 captured_at_ns=1,
             )
             paths = types.SimpleNamespace(codex_dir=base / "codex", output_dir=base)
-            list_args = types.SimpleNamespace(codex_dir=None, output_dir=None, quarantine_action="list", include_acknowledged=False)
+            list_args = types.SimpleNamespace(
+                codex_dir=None,
+                output_dir=None,
+                quarantine_action="list",
+                include_acknowledged=False,
+                json_output=False,
+            )
             acknowledge_args = types.SimpleNamespace(
                 codex_dir=None,
                 output_dir=None,
                 quarantine_action="acknowledge",
                 event_id=[event],
                 acknowledge_all=False,
+                json_output=False,
             )
-            with (
-                mock.patch.object(cli, "runtime_paths", return_value=paths),
-                contextlib.redirect_stdout(io.StringIO()),
-            ):
-                before_code = cli.quarantine_command(list_args)
-                acknowledge_code = cli.quarantine_command(acknowledge_args)
-                after_code = cli.quarantine_command(list_args)
+            before_output = io.StringIO()
+            acknowledge_output = io.StringIO()
+            after_output = io.StringIO()
+            with mock.patch.object(cli, "runtime_paths", return_value=paths):
+                with contextlib.redirect_stdout(before_output):
+                    before_code = cli.quarantine_command(list_args)
+                with contextlib.redirect_stdout(acknowledge_output):
+                    acknowledge_code = cli.quarantine_command(acknowledge_args)
+                with contextlib.redirect_stdout(after_output):
+                    after_code = cli.quarantine_command(list_args)
                 evidence_retained = evidence.exists()
 
         self.assertEqual(before_code, 1)
         self.assertEqual(acknowledge_code, 0)
         self.assertEqual(after_code, 0)
         self.assertTrue(evidence_retained)
+        self.assertIn("BOLA Quarantine: NEEDS REVIEW", before_output.getvalue())
+        self.assertIn(f"Event ID: {event}", before_output.getvalue())
+        self.assertIn(f"Review: bola quarantine acknowledge --event-id {event}", before_output.getvalue())
+        self.assertIn("Evidence: bad/prompt-usage.bad.jsonl", before_output.getvalue())
+        self.assertIn("BOLA Quarantine: UPDATED", acknowledge_output.getvalue())
+        self.assertIn("Acknowledged now: 1", acknowledge_output.getvalue())
+        self.assertIn("Evidence retained: yes", acknowledge_output.getvalue())
+        self.assertIn("BOLA Quarantine: HEALTHY", after_output.getvalue())
+        self.assertIn("No events need review", after_output.getvalue())
+        self.assertNotIn("\x1b", before_output.getvalue() + acknowledge_output.getvalue() + after_output.getvalue())
+
+    def test_quarantine_cli_json_modes_preserve_payloads(self) -> None:
+        cli = load_module("quarantine_cli_json_contract_test", ROOT / "scripts" / "bola.py")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = pathlib.Path(tmp_dir)
+            evidence = base / "bad" / "prompt-usage.bad.jsonl"
+            evidence.parent.mkdir(parents=True)
+            evidence.write_text("", encoding="utf-8")
+            event = cli.quarantine_health.event_id(kind="normalize_raw", source="segment.jsonl", content="{", error="JSONDecodeError")
+            cli.quarantine_health.record_event(
+                base,
+                event=event,
+                kind="normalize_raw",
+                source="segment.jsonl",
+                error="JSONDecodeError",
+                evidence_path=evidence,
+                captured_at_ns=1,
+            )
+            paths = types.SimpleNamespace(codex_dir=base / "codex", output_dir=base)
+            list_output = io.StringIO()
+            acknowledge_output = io.StringIO()
+            with mock.patch.object(cli, "runtime_paths", return_value=paths):
+                with contextlib.redirect_stdout(list_output):
+                    list_code = cli.quarantine_command(
+                        types.SimpleNamespace(
+                            codex_dir=None,
+                            output_dir=None,
+                            quarantine_action="list",
+                            include_acknowledged=False,
+                            json_output=True,
+                        )
+                    )
+                with contextlib.redirect_stdout(acknowledge_output):
+                    acknowledge_code = cli.quarantine_command(
+                        types.SimpleNamespace(
+                            codex_dir=None,
+                            output_dir=None,
+                            quarantine_action="acknowledge",
+                            event_id=[event],
+                            acknowledge_all=False,
+                            json_output=True,
+                        )
+                    )
+
+        listed = json.loads(list_output.getvalue())
+        acknowledged = json.loads(acknowledge_output.getvalue())
+        self.assertEqual(list_code, 1)
+        self.assertEqual(listed["status"], "degraded")
+        self.assertEqual(listed["quarantine"]["events"][0]["event_id"], event)
+        self.assertEqual(acknowledge_code, 0)
+        self.assertEqual(acknowledged["acknowledged_events"], 1)
+        self.assertEqual(acknowledged["remaining_unacknowledged_events"], 0)
+
+    def test_quarantine_acknowledge_all_reports_updates_and_noop_repeat(self) -> None:
+        cli = load_module("quarantine_cli_acknowledge_all_test", ROOT / "scripts" / "bola.py")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = pathlib.Path(tmp_dir)
+            evidence = base / "bad" / "prompt-usage.bad.jsonl"
+            evidence.parent.mkdir(parents=True)
+            evidence.write_text("", encoding="utf-8")
+            for index in range(2):
+                event = cli.quarantine_health.event_id(
+                    kind="normalize_raw",
+                    source=f"segment-{index}.jsonl",
+                    content=f"{{{index}",
+                    error="JSONDecodeError",
+                )
+                cli.quarantine_health.record_event(
+                    base,
+                    event=event,
+                    kind="normalize_raw",
+                    source=f"segment-{index}.jsonl",
+                    error="JSONDecodeError",
+                    evidence_path=evidence,
+                    captured_at_ns=index + 1,
+                )
+            paths = types.SimpleNamespace(codex_dir=base / "codex", output_dir=base)
+            args = types.SimpleNamespace(
+                codex_dir=None,
+                output_dir=None,
+                quarantine_action="acknowledge",
+                event_id=[],
+                acknowledge_all=True,
+                json_output=False,
+            )
+            first_output = io.StringIO()
+            second_output = io.StringIO()
+            with mock.patch.object(cli, "runtime_paths", return_value=paths):
+                with contextlib.redirect_stdout(first_output):
+                    first_code = cli.quarantine_command(args)
+                with contextlib.redirect_stdout(second_output):
+                    second_code = cli.quarantine_command(args)
+
+        self.assertEqual((first_code, second_code), (0, 0))
+        self.assertIn("BOLA Quarantine: UPDATED", first_output.getvalue())
+        self.assertIn("Selected events: 2", first_output.getvalue())
+        self.assertIn("Acknowledged now: 2", first_output.getvalue())
+        self.assertIn("Remaining unacknowledged: 0", first_output.getvalue())
+        self.assertIn("BOLA Quarantine: UNCHANGED", second_output.getvalue())
+        self.assertIn("Already acknowledged: 2", second_output.getvalue())
+
+    def test_quarantine_include_acknowledged_marks_event_status(self) -> None:
+        cli = load_module("quarantine_cli_acknowledged_render_test", ROOT / "scripts" / "bola.py")
+        event = "a" * 64
+        payload = {
+            "status": "healthy",
+            "quarantine": {
+                "unacknowledged_events": 0,
+                "unacknowledged_occurrences": 0,
+                "acknowledged_events": 1,
+                "events": [
+                    {
+                        "event_id": event,
+                        "kind": "normalize_raw",
+                        "source": "segment.jsonl",
+                        "error_type": "JSONDecodeError",
+                        "evidence_path": "bad/prompt-usage.bad.jsonl",
+                        "occurrences": 1,
+                        "last_seen_at_ns": 1_000_000_000,
+                        "acknowledged_at_ns": 2_000_000_000,
+                    }
+                ],
+            },
+        }
+
+        output = cli.quarantine_renderer.render_list(payload, include_acknowledged=True)
+
+        self.assertIn("[ACKNOWLEDGED] normalize_raw", output)
+        self.assertIn(f"Event ID: {event}", output)
+        self.assertNotIn("Review: bola quarantine acknowledge", output)
+        self.assertIn("Full report: bola quarantine list --include-acknowledged --json", output)
+
+    def test_quarantine_cli_errors_follow_human_and_json_modes(self) -> None:
+        cli = load_module("quarantine_cli_error_output_test", ROOT / "scripts" / "bola.py")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = pathlib.Path(tmp_dir)
+            human_output = io.StringIO()
+            with (
+                mock.patch.object(
+                    cli.sys,
+                    "argv",
+                    ["bola", "quarantine", "--output-dir", str(base), "acknowledge", "--event-id", "missing"],
+                ),
+                contextlib.redirect_stdout(human_output),
+            ):
+                human_code = cli.main()
+            json_output = io.StringIO()
+            with (
+                mock.patch.object(
+                    cli.sys,
+                    "argv",
+                    ["bola", "quarantine", "--output-dir", str(base), "acknowledge", "--event-id", "missing", "--json"],
+                ),
+                contextlib.redirect_stdout(json_output),
+            ):
+                json_code = cli.main()
+
+        self.assertEqual(human_code, 2)
+        self.assertIn("BOLA Quarantine: FAILED", human_output.getvalue())
+        self.assertIn("Error: unknown quarantine event ids: missing", human_output.getvalue())
+        self.assertEqual(json_code, 2)
+        self.assertEqual(json.loads(json_output.getvalue())["error"], "quarantine_state_invalid")
 
     def test_quarantine_cli_requires_explicit_acknowledgement_scope(self) -> None:
         cli = load_module("quarantine_cli_parser_test", ROOT / "scripts" / "bola.py")
@@ -345,6 +527,13 @@ class QuarantineHealthTests(unittest.TestCase):
             cli.build_parser().parse_args(["quarantine", "acknowledge"])
         parsed = cli.build_parser().parse_args(["quarantine", "acknowledge", "--event-id", "event-1"])
         self.assertEqual(parsed.event_id, ["event-1"])
+        self.assertFalse(parsed.json_output)
+        multiple = cli.build_parser().parse_args(
+            ["quarantine", "acknowledge", "--event-id", "event-1", "--event-id", "event-2"]
+        )
+        self.assertEqual(multiple.event_id, ["event-1", "event-2"])
+        self.assertTrue(cli.build_parser().parse_args(["quarantine", "list", "--json"]).json_output)
+        self.assertTrue(cli.build_parser().parse_args(["quarantine", "acknowledge", "--all", "--json"]).json_output)
 
     def test_dashboard_treats_degraded_pipeline_as_completed_warning(self) -> None:
         serve = load_module("dashboard_rebuild_quarantine_test", ROOT / "scripts" / "serve_dashboard.py")

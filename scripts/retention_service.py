@@ -38,7 +38,6 @@ class RetentionPruneOptions:
     preview_signature: str | None = None
     codex_dir: str | None = None
     output_dir: str | None = None
-    output: str | None = None
 
 
 @dataclass(frozen=True)
@@ -51,7 +50,7 @@ class RetentionResult:
 @dataclass(frozen=True)
 class RetentionDependencies:
     resolve_paths: Callable[[str | None, str | None], service_paths.RuntimePaths]
-    db_path: Callable[[str | None, str | None, str | None], pathlib.Path]
+    db_path: Callable[[str | None, str | None], pathlib.Path]
     run_command: Callable[[RuntimeCommand, list[str], dict[str, str]], ProcessResult]
     create_checkpoint: Callable[[pathlib.Path, str], retention_checkpoints.RetentionCheckpoint | dict[str, object]]
     restore_checkpoint: Callable[[pathlib.Path, retention_checkpoints.RetentionCheckpoint | dict[str, object]], None]
@@ -121,7 +120,7 @@ def run_retention_prune(options: RetentionPruneOptions, dependencies: RetentionD
         )
     paths = dependencies.resolve_paths(options.codex_dir, options.output_dir)
     base = paths.output_dir
-    db_path = dependencies.db_path(str(paths.codex_dir), options.output, str(paths.output_dir))
+    db_path = dependencies.db_path(str(paths.codex_dir), str(paths.output_dir))
     env = service_lock.scrub_lock_env(os.environ.copy())
     env.update({"CODEX_HOME": str(paths.codex_dir), service_paths.OUTPUT_DIR_ENV: str(paths.output_dir)})
     with service_lock.acquire_service_lock(reason="retention-prune", output_dir=paths.output_dir) as lock:
@@ -387,7 +386,7 @@ def run_retention_prune(options: RetentionPruneOptions, dependencies: RetentionD
                 )
             degraded = degraded or normalize_degraded
             progress_control.write_progress(phase="cleanup-rebuild", phase_index=2, phase_count=4, checkpoint="build", phase_progress=0.45)
-            build = dependencies.run_command(RuntimeCommand.BUILD, ["--output", str(db_path)], child_env)
+            build = dependencies.run_command(RuntimeCommand.BUILD, [], child_env)
             build_result = build.payload or {}
             if build.exit_code != 0:
                 progress_control.write_progress(

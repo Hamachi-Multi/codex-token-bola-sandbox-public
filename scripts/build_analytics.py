@@ -28,6 +28,7 @@ import cancel_control
 import progress_control
 import analysis_inputs
 import service_paths
+import cost_rates
 import build_analytics_context
 from build_analytics_io import file_size, iter_jsonl, iter_jsonl_from_offset, parse_time
 from build_analytics_rows import safe_int, usage
@@ -39,16 +40,20 @@ import turn_resolution
 RUNTIME_PATHS = service_paths.resolve_runtime_paths()
 CODEX_DIR = RUNTIME_PATHS.codex_dir
 BASE_DIR = RUNTIME_PATHS.output_dir
-NORMALIZED_LOG = BASE_DIR / "normalized" / "prompt-usage.normalized.jsonl"
-ANALYTICS_DB = pathlib.Path(os.environ.get("BOLA_ANALYTICS_DB", str(BASE_DIR / "analytics" / "bola.sqlite"))).expanduser()
+OUTPUT_LAYOUT = service_paths.OutputLayout(BASE_DIR)
+NORMALIZED_LOG = OUTPUT_LAYOUT.normalized_log
+ANALYTICS_DB = OUTPUT_LAYOUT.analytics_db
 STATE_DB = pathlib.Path(os.environ.get("BOLA_STATE_DB", str(CODEX_DIR / "state_5.sqlite"))).expanduser()
 SESSION_INDEX = pathlib.Path(os.environ.get("BOLA_SESSION_INDEX", str(CODEX_DIR / "session_index.jsonl"))).expanduser()
-RETENTION_PRUNED_TURNS_FILE = BASE_DIR / "state" / "retention-pruned-turns.json"
+RETENTION_PRUNED_TURNS_FILE = OUTPUT_LAYOUT.state_dir / "retention-pruned-turns.json"
 PROJECT_ROOTS = [
     pathlib.Path(value).expanduser()
     for value in os.environ.get("BOLA_PROJECT_ROOTS", "").split(os.pathsep)
     if value
 ]
+COST_RATE_CONFIG = cost_rates.config_path()
+COST_RATE_CATALOG = cost_rates.CostRateCatalog(cost_rates.BUILTIN_RATES)
+_COST_RATE_REVISION = ""
 
 
 class BuildInputError(RuntimeError):
@@ -121,34 +126,24 @@ def full_build_connection(output: pathlib.Path) -> Iterable[sqlite3.Connection]:
 
 
 def token_usage_root() -> pathlib.Path:
-    return NORMALIZED_LOG.parent.parent
+    return OUTPUT_LAYOUT.root
 
 
-def float_env(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name, str(default)))
-    except (TypeError, ValueError):
-        return default
-
-
-def int_env(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, str(default)))
-    except (TypeError, ValueError):
-        return default
-
-
-NON_CACHED_INPUT_WEIGHT = float_env("BOLA_NON_CACHED_INPUT_WEIGHT", 1.0)
-CACHED_INPUT_WEIGHT = float_env("BOLA_CACHED_INPUT_WEIGHT", 0.1)
-OUTPUT_WEIGHT = float_env("BOLA_OUTPUT_WEIGHT", 6.0)
-TOOL_OUTPUT_PREVIEW_CHARS = int_env("BOLA_TOOL_OUTPUT_PREVIEW_CHARS", 0)
-
-
-def weighted_credits(non_cached_input: int, cached_input: int, output: int) -> float:
-    return (
-        non_cached_input * NON_CACHED_INPUT_WEIGHT
-        + cached_input * CACHED_INPUT_WEIGHT
-        + output * OUTPUT_WEIGHT
+def priced_usage(
+    model: Any,
+    started_at_unix: Any,
+    *,
+    non_cached_input: int,
+    cached_input: int,
+    output: int,
+) -> tuple[int | None, float | None, cost_rates.CostRate | None]:
+    return cost_rates.priced_usage(
+        COST_RATE_CATALOG,
+        model,
+        started_at_unix,
+        non_cached_input=non_cached_input,
+        cached_input=cached_input,
+        output=output,
     )
 
 
@@ -226,9 +221,6 @@ def upsert_turn_row(
     assistant = row.get("assistant") if isinstance(row.get("assistant"), dict) else {}
     project = project_from_cwd(row.get("cwd"))
     category, workflow = classify(str(prompt.get("prompt_preview") or ""), row.get("cwd"))
-    cached_ratio = (u["cached_input_tokens"] / u["input_tokens"]) if u["input_tokens"] else 0.0
-    credits = weighted_credits(u["non_cached_input_tokens"], u["cached_input_tokens"], u["output_tokens"])
-    equivalent = credits / NON_CACHED_INPUT_WEIGHT if NON_CACHED_INPUT_WEIGHT else 0.0
     thread = threads.get(session_id, {})
     thread_name = str(thread.get("thread_name") or "").strip()
     reasoning_effort = thread.get("reasoning_effort")
@@ -237,6 +229,20 @@ def upsert_turn_row(
     started_at_unix = parse_time(row.get("started_at"))
     if started_at_unix is None:
         started_at_unix = captured_at_unix
+    model = raw_model or thread.get("model")
+    cached_ratio = (u["cached_input_tokens"] / u["input_tokens"]) if u["input_tokens"] else 0.0
+    cost_pico_usd: int | None = None
+    credits: float | None = None
+    rate: cost_rates.CostRate | None = None
+    if analytics_eligible:
+        cost_pico_usd, credits, rate = priced_usage(
+            model,
+            started_at_unix,
+            non_cached_input=u["non_cached_input_tokens"],
+            cached_input=u["cached_input_tokens"],
+            output=u["output_tokens"],
+        )
+    cost_rate_status = "configured" if rate is not None else ("unconfigured" if analytics_eligible else "unavailable")
     con.execute(
         """
         insert or replace into turns (
@@ -246,8 +252,9 @@ def upsert_turn_row(
           prompt_preview, prompt_sha256, prompt_chars, prompt_lines, code_block_chars,
           assistant_chars, input_tokens, cached_input_tokens, non_cached_input_tokens,
           output_tokens, reasoning_output_tokens, total_tokens, cached_ratio, model_call_count,
-          weighted_credits, uncached_input_equivalent, category, workflow, transcript_path
-        ) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+          weighted_credits, cost_pico_usd, cost_rate_status, cost_rate_effective_from,
+          category, workflow, transcript_path
+        ) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             session_id,
@@ -260,7 +267,7 @@ def upsert_turn_row(
             row.get("cwd"),
             project,
             thread_name,
-            raw_model or thread.get("model"),
+            model,
             0 if raw_model else 1,
             reasoning_effort,
             row.get("turn_status"),
@@ -285,7 +292,9 @@ def upsert_turn_row(
             cached_ratio,
             safe_int(row.get("model_call_count")) if analytics_eligible else 0,
             credits,
-            equivalent,
+            cost_pico_usd,
+            cost_rate_status,
+            rate.effective_from if rate is not None else None,
             category,
             workflow,
             row.get("transcript_path"),
@@ -295,7 +304,7 @@ def upsert_turn_row(
         "session_id": session_id,
         "turn_id": turn_id,
         "analytics_eligible": bool(analytics_eligible),
-        "usage": {**u, "weighted_credits": credits},
+        "usage": {**u, "weighted_credits": credits, "cost_pico_usd": cost_pico_usd},
         "range": {
             "turn_id": turn_id,
             "start_ts": parse_time(row.get("started_at")) or parse_time(row.get("captured_at")) or 0,
@@ -389,7 +398,7 @@ def upsert_model_call_summary_delta(con: sqlite3.Connection, row: dict[str, Any]
     reasoning = safe_int(row.get("reasoning_output_tokens"))
     total = safe_int(row.get("total_tokens"))
     call_index = safe_int(row.get("call_index"))
-    credits = weighted_credits(non_cached, cached, output)
+    credits = None
     con.execute(
         """
         insert into model_call_summaries (
@@ -405,7 +414,10 @@ def upsert_model_call_summary_delta(con: sqlite3.Connection, row: dict[str, Any]
           output_tokens = coalesce(output_tokens,0) + excluded.output_tokens,
           reasoning_output_tokens = coalesce(reasoning_output_tokens,0) + excluded.reasoning_output_tokens,
           total_tokens = coalesce(total_tokens,0) + excluded.total_tokens,
-          weighted_credits = coalesce(weighted_credits,0) + excluded.weighted_credits,
+          weighted_credits = case
+            when weighted_credits is null or excluded.weighted_credits is null then null
+            else weighted_credits + excluded.weighted_credits
+          end,
           max_total_tokens = max(coalesce(max_total_tokens,0), excluded.max_total_tokens),
           max_output_tokens = max(coalesce(max_output_tokens,0), excluded.max_output_tokens),
           first_call_index = min(coalesce(first_call_index, excluded.first_call_index), excluded.first_call_index),
@@ -525,7 +537,7 @@ def replace_tool_call_rollups_from_batches(
     ranked = sorted(samples.values(), key=lambda item: tool_output_tokens(item), reverse=True)
     for rank, row in enumerate(ranked, start=1):
         con.execute(
-            "insert or replace into tool_call_samples values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "insert or replace into tool_call_samples values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 row.get("session_id"),
                 row.get("turn_id"),
@@ -542,7 +554,6 @@ def replace_tool_call_rollups_from_batches(
                 row.get("output_tokens", tool_output_tokens(row)),
                 row.get("status"),
                 row.get("exit_code"),
-                row.get("output_preview"),
             ),
         )
 
@@ -553,7 +564,7 @@ def load_turn_usage_context(
 ) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[str, list[dict[str, Any]]]]:
     turn_usage_by_key: dict[tuple[str, str], dict[str, Any]] = {}
     turn_ranges: dict[str, list[dict[str, Any]]] = {}
-    sql = "select session_id, turn_id, started_at, captured_at, stopped_at, total_tokens, weighted_credits from turns where analytics_eligible=1"
+    sql = "select session_id, turn_id, started_at, captured_at, stopped_at, total_tokens, weighted_credits, cost_pico_usd from turns where analytics_eligible=1"
     args: list[str] = []
     if sessions is not None:
         if not sessions:
@@ -565,7 +576,8 @@ def load_turn_usage_context(
         turn_id = str(row["turn_id"])
         turn_usage_by_key[(session_id, turn_id)] = {
             "total_tokens": safe_int(row["total_tokens"]),
-            "weighted_credits": float(row["weighted_credits"] or 0.0),
+            "weighted_credits": None if row["weighted_credits"] is None else float(row["weighted_credits"]),
+            "cost_pico_usd": row["cost_pico_usd"],
         }
         turn_ranges.setdefault(session_id, []).append(
             {
@@ -655,10 +667,13 @@ def nearest_pruned_parent_turn(pruned_turns: dict[str, list[dict[str, Any]]], se
 def child_usage_totals_by_session(turn_usage_by_key: dict[tuple[str, str], dict[str, Any]]) -> dict[str, dict[str, Any]]:
     totals: dict[str, dict[str, Any]] = {}
     for (session_id, _turn_id), value in turn_usage_by_key.items():
-        current = totals.setdefault(session_id, {"rows": 0, "total_tokens": 0, "weighted_credits": 0.0})
+        current = totals.setdefault(session_id, {"rows": 0, "total_tokens": 0, "weighted_credits": 0.0, "cost_available": True})
         current["rows"] += 1
         current["total_tokens"] += safe_int(value.get("total_tokens"))
-        current["weighted_credits"] += float(value.get("weighted_credits") or 0.0)
+        if value.get("weighted_credits") is None:
+            current["cost_available"] = False
+        else:
+            current["weighted_credits"] += float(value["weighted_credits"])
     return totals
 
 
@@ -730,12 +745,13 @@ def rebuild_task_rollups(
             confidence = "parent_pruned_by_retention"
         child_usage = child_usage_by_session.get(child, {})
         child_total = safe_int(child_usage.get("total_tokens"))
-        child_credits = float(child_usage.get("weighted_credits") or 0.0)
-        if safe_int(child_usage.get("rows")) <= 0 or (child_total == 0 and child_credits == 0.0):
+        child_credits = float(child_usage.get("weighted_credits") or 0.0) if child_usage.get("cost_available", True) else None
+        if safe_int(child_usage.get("rows")) <= 0 or (child_total == 0 and (child_credits is None or child_credits == 0.0)):
             continue
         own = turn_usage_by_key.get((parent, chosen["turn_id"]), {})
         own_total = safe_int(own.get("total_tokens"))
-        own_credits = float(own.get("weighted_credits") or 0.0)
+        own_credits = None if own and own.get("weighted_credits") is None else float(own.get("weighted_credits") or 0.0)
+        total_credits = None if own_credits is None or child_credits is None else own_credits + child_credits
         con.execute(
             "insert or replace into task_rollups values (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
@@ -752,7 +768,7 @@ def rebuild_task_rollups(
                 own_total + child_total,
                 own_credits,
                 child_credits,
-                own_credits + child_credits,
+                total_credits,
             ),
         )
     if edge_total and progress_total_units > 0:
@@ -827,9 +843,8 @@ def db_metadata(con: sqlite3.Connection) -> dict[str, Any]:
         "tool_call_summary_rows": con.execute("select count(*) from tool_call_summaries").fetchone()[0],
         "tool_call_sample_rows": con.execute("select count(*) from tool_call_samples").fetchone()[0],
         "task_rollup_rows": con.execute("select count(*) from task_rollups").fetchone()[0],
-        "non_cached_input_weight": NON_CACHED_INPUT_WEIGHT,
-        "cached_input_weight": CACHED_INPUT_WEIGHT,
-        "output_weight": OUTPUT_WEIGHT,
+        "unpriced_turn_rows": con.execute("select count(*) from turns where analytics_eligible=1 and weighted_credits is null").fetchone()[0],
+        "cost_rate_catalog_digest": COST_RATE_CATALOG.digest,
         "analytics_schema_version": ANALYTICS_SCHEMA_VERSION,
     }
 
@@ -1039,15 +1054,16 @@ def extract_tool_calls(paths: set[str], turn_ids_by_session: dict[str, set[str]]
         iter_jsonl=iter_jsonl,
         safe_int=safe_int,
         cancel_checker=cancel_control.check_cancelled,
-        output_preview_chars=TOOL_OUTPUT_PREVIEW_CHARS,
     )
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build a SQLite analytics database from normalized Codex Token Bola logs.")
+    parser = argparse.ArgumentParser(
+        description="Build a SQLite analytics database from normalized Codex Token Bola logs.",
+        allow_abbrev=False,
+    )
     parser.add_argument("--normalized-log", default=str(NORMALIZED_LOG))
     parser.add_argument("--state-db", default=str(STATE_DB))
-    parser.add_argument("--output", default=str(ANALYTICS_DB))
     parser.add_argument("--project-root", action="append", default=[], help="Root whose first path segment identifies a project. May be repeated.")
     parser.add_argument("--incremental", action="store_true", help="Upsert rows appended after the supplied normalized-log offsets.")
     parser.add_argument("--turns-offset", type=int, default=0)
@@ -1055,12 +1071,20 @@ def parse_args() -> argparse.Namespace:
 
 
 def configure_paths(args: argparse.Namespace) -> None:
+    global RUNTIME_PATHS, CODEX_DIR, BASE_DIR, OUTPUT_LAYOUT
     global NORMALIZED_LOG, STATE_DB, ANALYTICS_DB, SESSION_INDEX, RETENTION_PRUNED_TURNS_FILE, PROJECT_ROOTS
+    global COST_RATE_CONFIG, COST_RATE_CATALOG, _COST_RATE_REVISION
+    RUNTIME_PATHS = service_paths.resolve_runtime_paths()
+    CODEX_DIR = RUNTIME_PATHS.codex_dir
+    BASE_DIR = RUNTIME_PATHS.output_dir
+    OUTPUT_LAYOUT = service_paths.OutputLayout(BASE_DIR)
     NORMALIZED_LOG = pathlib.Path(args.normalized_log).expanduser()
     STATE_DB = pathlib.Path(args.state_db).expanduser()
     SESSION_INDEX = pathlib.Path(os.environ.get("BOLA_SESSION_INDEX", str(STATE_DB.parent / "session_index.jsonl"))).expanduser()
-    ANALYTICS_DB = pathlib.Path(args.output).expanduser()
-    RETENTION_PRUNED_TURNS_FILE = NORMALIZED_LOG.parent.parent / "state" / "retention-pruned-turns.json"
+    ANALYTICS_DB = OUTPUT_LAYOUT.analytics_db
+    RETENTION_PRUNED_TURNS_FILE = OUTPUT_LAYOUT.state_dir / "retention-pruned-turns.json"
+    COST_RATE_CONFIG = cost_rates.config_path()
+    COST_RATE_CATALOG, _COST_RATE_REVISION = cost_rates.load_catalog(COST_RATE_CONFIG)
     if args.project_root:
         PROJECT_ROOTS = [pathlib.Path(value).expanduser() for value in args.project_root]
 
@@ -1085,6 +1109,9 @@ def incremental_build(args: argparse.Namespace) -> dict[str, Any] | None:
             con.close()
             return None
         if metadata_value(con, "analytics_schema_version") != ANALYTICS_SCHEMA_VERSION:
+            con.close()
+            return None
+        if metadata_value(con, "cost_rate_catalog_digest") != COST_RATE_CATALOG.digest:
             con.close()
             return None
         ensure_indexes(con)
@@ -1113,6 +1140,26 @@ def incremental_build(args: argparse.Namespace) -> dict[str, Any] | None:
         current_edges = build_analytics_context.edge_projection(edges)
         changed_context_threads = build_analytics_context.changed_keys(previous_threads, current_threads)
         changed_context_edges = build_analytics_context.changed_keys(previous_edges, current_edges)
+        model_index = build_analytics_context.THREAD_COLUMNS.index("model")
+
+        def context_model(projection: dict[str, tuple[Any, ...]], session_id: str) -> Any:
+            row = projection.get(session_id)
+            return row[model_index] if row is not None else None
+
+        changed_context_models = {
+            session_id
+            for session_id in changed_context_threads
+            if context_model(previous_threads, session_id) != context_model(current_threads, session_id)
+        }
+        if changed_context_models:
+            placeholders = ",".join("?" for _ in changed_context_models)
+            context_priced_turn = con.execute(
+                f"select 1 from turns where model_from_context=1 and session_id in ({placeholders}) limit 1",
+                sorted(changed_context_models),
+            ).fetchone()
+            if context_priced_turn is not None:
+                con.close()
+                return None
         current_retention_fingerprint = retention_input_fingerprint()
         retention_changed = metadata_value(con, "applied_retention_fingerprint") != current_retention_fingerprint
         context_seed_sessions = changed_context_threads | build_analytics_context.edge_change_sessions(
@@ -1241,11 +1288,8 @@ def incremental_build(args: argparse.Namespace) -> dict[str, Any] | None:
         con.close()
 
 
-def build(output: pathlib.Path | None = None) -> dict[str, Any]:
+def build() -> dict[str, Any]:
     cancel_control.check_cancelled("build", "start-full")
-    global ANALYTICS_DB
-    if output is not None:
-        ANALYTICS_DB = pathlib.Path(output).expanduser()
     raw_root = token_usage_root()
     raw_segments.reconcile_apply_marker(raw_root)
     raw_segments.reconcile_pending_rotation(raw_root)
@@ -1340,8 +1384,8 @@ def build(output: pathlib.Path | None = None) -> dict[str, Any]:
 
 def main() -> int:
     args = parse_args()
-    configure_paths(args)
     try:
+        configure_paths(args)
         with service_lock.acquire_service_lock(reason="build"):
             if args.incremental:
                 result = incremental_build(args)
@@ -1356,6 +1400,9 @@ def main() -> int:
         return cancel_control.CANCEL_EXIT_CODE
     except BuildInputError as exc:
         print(json.dumps(exc.payload, ensure_ascii=False, separators=(",", ":")))
+        return 2
+    except cost_rates.CostRateError as exc:
+        print(json.dumps(exc.payload(), ensure_ascii=False, separators=(",", ":")))
         return 2
 
 

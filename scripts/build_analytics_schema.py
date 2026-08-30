@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 
 
-ANALYTICS_SCHEMA_VERSION = 1
+ANALYTICS_SCHEMA_VERSION = 3
 
 
 def setup_db(con: sqlite3.Connection) -> None:
@@ -56,7 +56,9 @@ def setup_db(con: sqlite3.Connection) -> None:
           cached_ratio real,
           model_call_count integer,
           weighted_credits real,
-          uncached_input_equivalent real,
+          cost_pico_usd integer,
+          cost_rate_status text not null default 'unconfigured' check(cost_rate_status in ('configured','unconfigured','unavailable')),
+          cost_rate_effective_from text,
           category text,
           workflow text,
           transcript_path text,
@@ -113,7 +115,6 @@ def setup_db(con: sqlite3.Connection) -> None:
           output_tokens integer,
           status text,
           exit_code integer,
-          output_preview text,
           primary key (session_id, turn_id, call_id, sample_reason)
         );
 
@@ -195,6 +196,12 @@ def ensure_indexes(con: sqlite3.Connection) -> None:
         con.execute("alter table turns add column token_resolution_reason text")
     if "analytics_eligible" not in existing_turn_columns:
         con.execute("alter table turns add column analytics_eligible integer not null default 1")
+    if "cost_pico_usd" not in existing_turn_columns:
+        con.execute("alter table turns add column cost_pico_usd integer")
+    if "cost_rate_status" not in existing_turn_columns:
+        con.execute("alter table turns add column cost_rate_status text not null default 'unconfigured'")
+    if "cost_rate_effective_from" not in existing_turn_columns:
+        con.execute("alter table turns add column cost_rate_effective_from text")
     con.executescript(
         """
         create table if not exists source_context_threads (

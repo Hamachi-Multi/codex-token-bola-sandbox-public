@@ -20,7 +20,10 @@ def check_theme_transition_stability(page) -> None:
     page.evaluate(
         """
         () => {
-          localStorage.setItem('bola-dashboard-settings', JSON.stringify({themeMode: 'dark'}));
+          const settings = JSON.parse(localStorage.getItem('bola-dashboard-settings') || '{}');
+          settings.themeMode = 'dark';
+          settings.view = 'settings';
+          localStorage.setItem('bola-dashboard-settings', JSON.stringify(settings));
         }
         """
     )
@@ -145,14 +148,14 @@ def check_theme_transition_stability(page) -> None:
         and dark_text_state["expectedText"] == "#e7e7e7",
         f"dark mode DOM colors should apply immediately while the view snapshot animates: {dark_text_state}",
     )
-    page.locator('[data-theme-mode="light"]').click()
+    page.evaluate("document.querySelector('[data-theme-mode=\"light\"]').click()")
     page.wait_for_timeout(180)
 
 
 def check_theme_text_contrast_across_views(page) -> None:
     views = ("overview", "turns", "tools", "subagents", "cleanup")
     for view in views:
-        page.locator('[data-theme-mode="light"]').click()
+        page.evaluate("document.querySelector('[data-theme-mode=\"light\"]').click()")
         page.wait_for_timeout(180)
         page.locator(f'button[data-view-target="{view}"]').click()
         if view == "cleanup":
@@ -234,7 +237,7 @@ def check_theme_text_contrast_across_views(page) -> None:
         low_contrast = [item for frame in frames for item in frame["lowContrast"]]
         assert_true(not low_contrast, f"{view} theme switch should not pass through unreadable text contrast: {frames}")
         page.wait_for_timeout(180)
-    page.locator('[data-theme-mode="light"]').click()
+    page.evaluate("document.querySelector('[data-theme-mode=\"light\"]').click()")
     page.wait_for_timeout(180)
     page.locator('button[data-view-target="overview"]').click()
 
@@ -313,11 +316,16 @@ def check_theme_toggle_inactive_icon_contrast(page) -> None:
 
 def check_toolbar(page) -> None:
     toolbar_dashboard_requests: list[str] = []
+    settings_api_requests: list[str] = []
     page.on(
         "request",
-        lambda request: toolbar_dashboard_requests.append(request.url)
-        if "/api/dashboard?" in request.url
-        else None,
+        lambda request: (
+            toolbar_dashboard_requests.append(request.url)
+            if "/api/dashboard?" in request.url
+            else settings_api_requests.append(request.url)
+            if "/api/" in request.url
+            else None
+        ),
     )
     toolbar_dashboard_requests.clear()
     toolbar_height = page.locator(".toolbar").bounding_box()["height"]
@@ -366,12 +374,10 @@ def check_toolbar(page) -> None:
               const brandItems = [...document.querySelectorAll('.brand-nav > *')].map(rect);
               const toolbarItems = [...document.querySelectorAll('.toolbar > *')].map(rect);
               const pairsOverlap = items => items.some((item, index) => items.slice(index + 1).some(other => overlaps(item, other)));
-              const theme = rect(document.querySelector('.theme-switcher'));
               return {
                 viewportWidth: innerWidth,
                 bodyScrollWidth: document.documentElement.scrollWidth,
                 appbar,
-                theme,
                 brandOverlap: pairsOverlap(brandItems),
                 toolbarOverlap: pairsOverlap(toolbarItems),
               };
@@ -382,8 +388,8 @@ def check_toolbar(page) -> None:
             intermediate_state["bodyScrollWidth"] == intermediate_state["viewportWidth"]
             and not intermediate_state["brandOverlap"]
             and not intermediate_state["toolbarOverlap"]
-            and intermediate_state["theme"]["left"] >= intermediate_state["appbar"]["left"]
-            and intermediate_state["theme"]["right"] <= intermediate_state["appbar"]["right"],
+            and intermediate_state["appbar"]["left"] >= 0
+            and intermediate_state["appbar"]["right"] <= intermediate_state["viewportWidth"],
             f"intermediate-width header controls should not overlap or escape the viewport: {intermediate_state}",
         )
     page.set_viewport_size({"width": 1280, "height": 720})
@@ -417,57 +423,110 @@ def check_toolbar(page) -> None:
         f"compact desktop appbar should fit inside the viewport: {compact_appbar_state}",
     )
     page.set_viewport_size({"width": 1440, "height": 900})
+    settings_api_requests.clear()
+    page.locator('button[data-view-target="settings"]').click()
+    page.locator('[data-theme-mode="system"]').click()
     theme_initial_state = page.evaluate(
         """
         () => ({
           selectCount: document.querySelectorAll('#theme-mode').length,
           toggleTop: Math.round(document.querySelector('.theme-toggle').getBoundingClientRect().top),
-          titleBottom: Math.round(document.querySelector('h1').getBoundingClientRect().bottom),
-          appbarBottom: Math.round(document.querySelector('.appbar').getBoundingClientRect().bottom),
-          appbarHeight: Math.round(document.querySelector('.appbar').getBoundingClientRect().height),
-          subrowCount: document.querySelectorAll('.appbar-subrow').length,
-          firstContentTop: Math.round(document.querySelector('.metric-strip').getBoundingClientRect().top),
+          settingsTop: Math.round(document.querySelector('.settings-master-detail').getBoundingClientRect().top),
+          settingsBottom: Math.round(document.querySelector('.settings-master-detail').getBoundingClientRect().bottom),
+          settingsViewActive: document.querySelector('[data-view="settings"]').classList.contains('active'),
+          activeView: document.body.dataset.activeView || '',
+          toolbarDisplay: getComputedStyle(document.querySelector('.toolbar')).display,
+          queryStatusDisplay: getComputedStyle(document.querySelector('#query-status')).display,
+          settingsPanelCount: document.querySelectorAll('[data-view="settings"] .settings-master-detail > .panel').length,
+          hash: location.hash,
           switcherRight: Math.round(document.querySelector('.theme-switcher').getBoundingClientRect().right),
-          labelCount: document.querySelectorAll('.theme-toggle-label').length,
+          label: document.querySelector('#theme-mode-label').textContent,
+          systemText: document.querySelector('[data-theme-mode="system"] .theme-toggle-text').textContent,
           lightText: document.querySelector('[data-theme-mode="light"] .theme-toggle-text').textContent,
           darkText: document.querySelector('[data-theme-mode="dark"] .theme-toggle-text').textContent,
           lightTextDisplay: getComputedStyle(document.querySelector('[data-theme-mode="light"] .theme-toggle-text')).display,
           toggleBackground: getComputedStyle(document.querySelector('.theme-toggle')).backgroundColor,
           toggleBorderTopWidth: getComputedStyle(document.querySelector('.theme-toggle')).borderTopWidth,
-          activeButtonBackground: getComputedStyle(document.querySelector('[data-theme-mode="light"]')).backgroundColor,
-          activeButtonShadow: getComputedStyle(document.querySelector('[data-theme-mode="light"]')).boxShadow,
-          activeButtonOpacity: getComputedStyle(document.querySelector('[data-theme-mode="light"]')).opacity,
+          activeButtonBackground: getComputedStyle(document.querySelector('[data-theme-mode="system"]')).backgroundColor,
+          activeButtonShadow: getComputedStyle(document.querySelector('[data-theme-mode="system"]')).boxShadow,
+          activeButtonOpacity: getComputedStyle(document.querySelector('[data-theme-mode="system"]')).opacity,
           toggleBottom: Math.round(document.querySelector('.theme-toggle').getBoundingClientRect().bottom),
           toggleLeft: Math.round(document.querySelector('.theme-toggle').getBoundingClientRect().left),
-          navLeft: Math.round(document.querySelector('.page-nav').getBoundingClientRect().left),
           toggleRight: Math.round(document.querySelector('.theme-toggle').getBoundingClientRect().right),
-          toolbarLeft: Math.round(document.querySelector('.toolbar').getBoundingClientRect().left),
           viewportWidth: window.innerWidth,
           viewportHeight: window.innerHeight,
           pageWidth: document.documentElement.clientWidth,
+          systemPressed: document.querySelector('[data-theme-mode="system"]').getAttribute('aria-pressed'),
           lightPressed: document.querySelector('[data-theme-mode="light"]').getAttribute('aria-pressed'),
           darkPressed: document.querySelector('[data-theme-mode="dark"]').getAttribute('aria-pressed'),
         })
         """
     )
     assert_true(theme_initial_state["selectCount"] == 0, f"theme mode should not use a select control: {theme_initial_state}")
-    assert_true(70 <= theme_initial_state["appbarHeight"] <= 74, f"theme toggle should not collapse or stretch the header: {theme_initial_state}")
-    assert_true(theme_initial_state["subrowCount"] == 0, f"theme toggle should not reserve a header subrow: {theme_initial_state}")
-    assert_true(theme_initial_state["toggleTop"] >= 0 and theme_initial_state["toggleBottom"] <= theme_initial_state["appbarBottom"], f"theme toggle should stay inside the header: {theme_initial_state}")
-    assert_true(theme_initial_state["firstContentTop"] > theme_initial_state["appbarBottom"], f"dashboard content should start below the header: {theme_initial_state}")
-    assert_true(theme_initial_state["labelCount"] == 0, f"theme control should not show a separate Theme label: {theme_initial_state}")
+    assert_true(
+        theme_initial_state["settingsViewActive"]
+        and theme_initial_state["activeView"] == "settings"
+        and theme_initial_state["hash"] == "#settings"
+        and theme_initial_state["settingsPanelCount"] == 2,
+        f"settings navigation should activate the list and detail panels: {theme_initial_state}",
+    )
+    assert_true(
+        theme_initial_state["toolbarDisplay"] == "flex" and theme_initial_state["queryStatusDisplay"] == "none",
+        f"settings should preserve the shared desktop toolbar while hiding empty status: {theme_initial_state}",
+    )
+    assert_true(
+        theme_initial_state["toggleTop"] >= theme_initial_state["settingsTop"]
+        and theme_initial_state["toggleBottom"] <= theme_initial_state["settingsBottom"],
+        f"theme toggle should stay inside the settings panel: {theme_initial_state}",
+    )
+    assert_true(theme_initial_state["label"] == "Theme", f"settings should label the theme control: {theme_initial_state}")
+    assert_true(theme_initial_state["systemText"] == "System", f"system theme button should keep accessible text content: {theme_initial_state}")
     assert_true(theme_initial_state["lightText"] == "Light", f"light theme button should keep accessible text content: {theme_initial_state}")
     assert_true(theme_initial_state["darkText"] == "Dark", f"dark theme button should keep accessible text content: {theme_initial_state}")
-    assert_true(theme_initial_state["lightTextDisplay"] == "none", f"desktop theme toggle should render icon-only controls: {theme_initial_state}")
-    assert_true(theme_initial_state["toggleBackground"] == "rgba(0, 0, 0, 0)", f"theme toggle frame should blend into the page background: {theme_initial_state}")
-    assert_true(theme_initial_state["toggleBorderTopWidth"] == "0px", f"theme toggle frame should not draw a separate border: {theme_initial_state}")
-    assert_true(theme_initial_state["activeButtonBackground"] == "rgba(0, 0, 0, 0)", f"active theme button should not draw a separate background: {theme_initial_state}")
+    assert_true(theme_initial_state["lightTextDisplay"] != "none", f"settings theme buttons should show text labels: {theme_initial_state}")
+    assert_true(theme_initial_state["toggleBackground"] != "rgba(0, 0, 0, 0)", f"settings theme group should have a shared surface: {theme_initial_state}")
+    assert_true(theme_initial_state["toggleBorderTopWidth"] == "1px", f"settings theme group should have one boundary: {theme_initial_state}")
+    assert_true(theme_initial_state["activeButtonBackground"] != "rgba(0, 0, 0, 0)", f"active theme button should have a selected surface: {theme_initial_state}")
     assert_true(theme_initial_state["activeButtonShadow"] == "none", f"active theme button should not draw a selected inset: {theme_initial_state}")
-    assert_true(theme_initial_state["activeButtonOpacity"] == "0.96", f"active theme button should use opacity instead of a filled state: {theme_initial_state}")
-    assert_true(theme_initial_state["toggleLeft"] > theme_initial_state["navLeft"], f"theme toggle should stay in the trailing appbar area: {theme_initial_state}")
+    assert_true(theme_initial_state["activeButtonOpacity"] == "0.96", f"active theme button should retain clear icon contrast: {theme_initial_state}")
     assert_true(theme_initial_state["switcherRight"] == theme_initial_state["toggleRight"], f"theme switcher should align as one trailing group: {theme_initial_state}")
-    assert_true(theme_initial_state["toggleRight"] < theme_initial_state["toolbarLeft"], f"theme toggle should sit between navigation and toolbar controls: {theme_initial_state}")
-    assert_true(theme_initial_state["lightPressed"] == "true" and theme_initial_state["darkPressed"] == "false", f"light mode should be active by default: {theme_initial_state}")
+    assert_true(theme_initial_state["toggleLeft"] >= 0 and theme_initial_state["toggleRight"] <= theme_initial_state["viewportWidth"], f"theme controls should fit the viewport: {theme_initial_state}")
+    assert_true(
+        theme_initial_state["systemPressed"] == "true"
+        and theme_initial_state["lightPressed"] == "false"
+        and theme_initial_state["darkPressed"] == "false",
+        f"system mode should be active by default: {theme_initial_state}",
+    )
+    page.locator("#turn-page-size").select_option("50")
+    page.locator("#session-label-mode").select_option("thread")
+    page.wait_for_timeout(100)
+    settings_storage_state = page.evaluate(
+        """
+        () => {
+          const settings = JSON.parse(localStorage.getItem('bola-dashboard-settings') || '{}');
+          return {
+            turnPageSize: settings.turnPageSize || '',
+            sessionLabelMode: settings.sessionLabelMode || '',
+          };
+        }
+        """
+    )
+    assert_true(
+        settings_storage_state == {"turnPageSize": "50", "sessionLabelMode": "thread"},
+        f"settings controls should persist immediately: {settings_storage_state}",
+    )
+    assert_true(
+        page.locator("#settings-general-summary").count() == 0,
+        "General menu should not duplicate the selected settings",
+    )
+    assert_true(
+        not settings_api_requests and not toolbar_dashboard_requests,
+        f"settings interactions should not issue API requests: {settings_api_requests + toolbar_dashboard_requests}",
+    )
+    with page.expect_response(lambda response: "/api/dashboard?" in response.url, timeout=10_000):
+        page.locator('button[data-view-target="overview"]').click()
+    page.locator('button[data-view-target="settings"]').click()
+    page.locator('[data-settings-select="general"]').click()
     page.locator('[data-theme-mode="dark"]').click()
     page.wait_for_function(
         "() => document.documentElement.dataset.theme === 'dark' && JSON.parse(localStorage.getItem('bola-dashboard-settings') || '{}').themeMode === 'dark'",
@@ -477,13 +536,14 @@ def check_toolbar(page) -> None:
         """
         () => ({
           theme: document.documentElement.dataset.theme || '',
+          systemPressed: document.querySelector('[data-theme-mode="system"]').getAttribute('aria-pressed'),
           lightPressed: document.querySelector('[data-theme-mode="light"]').getAttribute('aria-pressed'),
           darkPressed: document.querySelector('[data-theme-mode="dark"]').getAttribute('aria-pressed'),
           stored: JSON.parse(localStorage.getItem('bola-dashboard-settings') || '{}').themeMode || '',
         })
         """
     )
-    assert_true(theme_dark_state == {"theme": "dark", "lightPressed": "false", "darkPressed": "true", "stored": "dark"}, f"dark icon should activate dark mode: {theme_dark_state}")
+    assert_true(theme_dark_state == {"theme": "dark", "systemPressed": "false", "lightPressed": "false", "darkPressed": "true", "stored": "dark"}, f"dark icon should activate dark mode: {theme_dark_state}")
     page.locator('[data-theme-mode="light"]').click()
     page.wait_for_function(
         "() => document.documentElement.dataset.theme === 'light' && JSON.parse(localStorage.getItem('bola-dashboard-settings') || '{}').themeMode === 'light'",
@@ -493,16 +553,30 @@ def check_toolbar(page) -> None:
         """
         () => ({
           theme: document.documentElement.dataset.theme || '',
+          systemPressed: document.querySelector('[data-theme-mode="system"]').getAttribute('aria-pressed'),
           lightPressed: document.querySelector('[data-theme-mode="light"]').getAttribute('aria-pressed'),
           darkPressed: document.querySelector('[data-theme-mode="dark"]').getAttribute('aria-pressed'),
           stored: JSON.parse(localStorage.getItem('bola-dashboard-settings') || '{}').themeMode || '',
         })
         """
     )
-    assert_true(theme_light_state == {"theme": "light", "lightPressed": "true", "darkPressed": "false", "stored": "light"}, f"light icon should reactivate light mode: {theme_light_state}")
+    assert_true(theme_light_state == {"theme": "light", "systemPressed": "false", "lightPressed": "true", "darkPressed": "false", "stored": "light"}, f"light icon should reactivate light mode: {theme_light_state}")
+    page.locator('[data-theme-mode="system"]').click()
+    page.wait_for_function(
+        "() => JSON.parse(localStorage.getItem('bola-dashboard-settings') || '{}').themeMode === 'system'",
+        timeout=2_000,
+    )
+    page.emulate_media(color_scheme="dark")
+    page.wait_for_function(
+        "() => document.documentElement.dataset.theme === 'dark' && document.querySelector('[data-theme-mode=\"system\"]').getAttribute('aria-pressed') === 'true'",
+        timeout=2_000,
+    )
+    page.emulate_media(color_scheme="light")
     check_theme_transition_stability(page)
     check_theme_text_contrast_across_views(page)
+    page.locator('button[data-view-target="settings"]').click()
     check_theme_toggle_inactive_icon_contrast(page)
+    page.locator('button[data-view-target="overview"]').click()
     toolbar_dashboard_requests.clear()
     page.locator("#days").select_option("custom")
     page.wait_for_selector("#custom-days-popover:not([hidden])", timeout=5_000)

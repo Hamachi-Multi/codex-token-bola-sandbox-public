@@ -701,7 +701,7 @@ def check_cleanup_selection_state(page) -> None:
         },
         f"selected and active cleanup controls should apply dark DOM colors immediately: {selected_theme_state}",
     )
-    page.locator('[data-theme-mode="light"]').click()
+    page.evaluate("document.querySelector('[data-theme-mode=\"light\"]').click()")
     page.wait_for_timeout(180)
 
 

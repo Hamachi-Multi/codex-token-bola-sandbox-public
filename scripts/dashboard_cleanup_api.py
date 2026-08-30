@@ -17,6 +17,7 @@ import dashboard_operation_state as operation_state
 import progress_control
 import raw_segments
 import service_lock
+import service_paths
 
 
 class DashboardCleanupApiMixin:
@@ -42,7 +43,10 @@ class DashboardCleanupApiMixin:
         if active is None or active.kind != "cleanup":
             raise RuntimeError("managed cleanup command requires an active cleanup operation")
         script = self.dashboard_script_dir() / "bola.py"
-        with tempfile.TemporaryFile("w+", encoding="utf-8") as stdout_file, tempfile.TemporaryFile("w+", encoding="utf-8") as stderr_file:
+        tmp_dir = service_paths.ensure_output_tmp_dir(self.dashboard_output_dir())
+        with tempfile.TemporaryFile("w+", encoding="utf-8", dir=tmp_dir) as stdout_file, tempfile.TemporaryFile(
+            "w+", encoding="utf-8", dir=tmp_dir
+        ) as stderr_file:
             process = dashboard_managed_process.ManagedProcess.start(
                 cmd,
                 kind="cleanup",
@@ -123,7 +127,7 @@ class DashboardCleanupApiMixin:
         payload["cleanup_running"] = cleanup_running
         self.send_json(payload)
 
-    def run_pipeline_command(self, output: pathlib.Path, *, incremental: bool) -> dict[str, Any]:
+    def run_pipeline_command(self, *, incremental: bool) -> dict[str, Any]:
         script = self.dashboard_script_dir() / "bola.py"
         cmd = [
             sys.executable,
@@ -133,14 +137,12 @@ class DashboardCleanupApiMixin:
             str(self.dashboard_codex_dir()),
             "--output-dir",
             str(self.dashboard_output_dir()),
-            "--output",
-            str(output),
         ]
         if incremental:
             cmd.append("--incremental")
         return self.run_managed_cleanup_command(cmd, env=service_lock.scrub_lock_env(os.environ.copy()))
 
-    def run_retention_prune_command(self, output: pathlib.Path, cutoff_unix: float, preview_signature: str) -> dict[str, Any]:
+    def run_retention_prune_command(self, cutoff_unix: float, preview_signature: str) -> dict[str, Any]:
         script = self.dashboard_script_dir() / "bola.py"
         cmd = [
             sys.executable,
@@ -150,8 +152,6 @@ class DashboardCleanupApiMixin:
             str(self.dashboard_codex_dir()),
             "--output-dir",
             str(self.dashboard_output_dir()),
-            "--output",
-            str(output),
             "--cutoff",
             str(float(cutoff_unix)),
             "--preview-signature",
@@ -371,7 +371,7 @@ class DashboardCleanupApiMixin:
                 checkpoint="start-retention-prune",
                 phase_progress=0.0,
             )
-            prune_result = self.run_retention_prune_command(output, cutoff_unix, preview_signature)
+            prune_result = self.run_retention_prune_command(cutoff_unix, preview_signature)
             metadata = prune_result.get("metadata") if isinstance(prune_result.get("metadata"), dict) else {}
             degraded = prune_result["returncode"] == 1 and metadata.get("status") == "degraded"
             if prune_result["returncode"] != 0 and not degraded:

@@ -13,27 +13,26 @@ import {
   turnStatusClass,
 } from './formatters.js';
 
-export function createSelectedTurnController({ params, refreshScrollFades, setActiveModal }) {
+export function createSelectedTurnController({ params, refreshScrollFades, dialogManager }) {
   let modalDetailData = null;
   let modalToolSummaryExpanded = false;
+  const turnDialog = dialogManager.register({
+    rootId: 'turn-modal',
+    initialFocus: () => document.getElementById('turn-modal-close'),
+    closeSelectors: ['#turn-modal-close'],
+    onClose: () => {
+      state.modalSeq += 1;
+      modalDetailData = null;
+      modalToolSummaryExpanded = false;
+    },
+  });
 
 function openTurnModal(trigger = null) {
-  const modal = document.getElementById('turn-modal');
-  state.modalTrigger = trigger || document.activeElement;
-  modal.classList.add('open');
-  setActiveModal('turn-modal');
-  document.getElementById('turn-modal-close').focus();
+  turnDialog.open({ trigger: trigger || document.activeElement });
 }
 
 function closeTurnModal() {
-  const modal = document.getElementById('turn-modal');
-  modal.classList.remove('open');
-  setActiveModal();
-  state.modalSeq += 1;
-  modalDetailData = null;
-  modalToolSummaryExpanded = false;
-  state.modalTrigger?.focus?.();
-  state.modalTrigger = null;
+  turnDialog.close();
 }
 
 function turnPromptPreviewMarkup(turn) {
@@ -84,7 +83,7 @@ function selectedTurnDetailMarkup(data, options = {}) {
     <div class="selected-turn-detail">
       <div class="selected-turn-header">
         <div class="${identityClass}">
-          <div class="value attribution-method-value" title="${esc(promptText)}"><span class="method-name">${esc(promptText)}</span><span class="method-desc"${metaAttrs}><span class="prompt-toggle-label">${esc(identityMeta)}</span>${toggleIcon}</span></div>
+          <div class="value attribution-method-value" title="${esc(promptText)}"><span class="method-name scrollbar-hidden">${esc(promptText)}</span><span class="method-desc"${metaAttrs}><span class="prompt-toggle-label">${esc(identityMeta)}</span>${toggleIcon}</span></div>
         </div>
       </div>
       ${unavailableNotice}
@@ -117,7 +116,7 @@ function selectedTurnLoadingPanel() {
   return `<span class="sr-only">Loading selected turn detail.</span><div class="selected-turn-detail" aria-hidden="true">
     <div class="selected-turn-header">
       <div class="selected-turn-identity static loading-skeleton">
-        <div class="value attribution-method-value"><span class="method-name"><span class="loading-line"></span></span><span class="method-desc"><span class="loading-line"></span></span></div>
+        <div class="value attribution-method-value"><span class="method-name scrollbar-hidden"><span class="loading-line"></span></span><span class="method-desc"><span class="loading-line"></span></span></div>
       </div>
     </div>
     <div class="selected-turn-section">
@@ -179,9 +178,19 @@ function tokenMetric(turn, value, kind = '') {
   return compactNumberSpan(value || 0, kind);
 }
 
+function costMetric(turn, value) {
+  if (!tokenDataAvailable(turn) || value === null || value === undefined) return '<span class="token-unavailable-value">—</span>';
+  return compactNumberSpan(value, 'money');
+}
+
 function turnSummaryMetrics(turn) {
+  const costTitle = !tokenDataAvailable(turn)
+    ? 'Token data unavailable'
+    : (turn.weighted_credits === null || turn.weighted_credits === undefined
+      ? 'Cost rate is not configured for this model and date'
+      : exactNumber(turn.weighted_credits, 'money'));
   return selectedTurnMetricGrid([
-    selectedTurnMetric('Cost Units', tokenMetric(turn, turn.weighted_credits, 'money'), '', tokenDataAvailable(turn) ? exactNumber(turn.weighted_credits || 0, 'money') : 'Token data unavailable'),
+    selectedTurnMetric('Cost Units', costMetric(turn, turn.weighted_credits), '', costTitle),
     selectedTurnMetric('Total Tokens', tokenMetric(turn, turn.total_tokens), '', tokenDataAvailable(turn) ? exactNumber(turn.total_tokens || 0) : 'Token data unavailable'),
     selectedTurnMetric('Runtime', esc(durationLabel(elapsedMs(turn.started_at, turn.stopped_at))), '', `${compactDateTime(turn.started_at)} -> ${compactDateTime(turn.stopped_at)}`),
     selectedTurnMetric('Cached Ratio', tokenDataAvailable(turn) ? esc(money.format((turn.cached_ratio || 0) * 100) + '%') : '<span class="token-unavailable-value">—</span>'),

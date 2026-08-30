@@ -67,7 +67,7 @@ class UnavailableTurnAnalyticsTests(unittest.TestCase):
         self.assertEqual(stored["token_resolution_reason"], "no_token_count_before_task_complete")
         self.assertEqual(stored["analytics_eligible"], 0)
         self.assertEqual(stored["total_tokens"], 0)
-        self.assertEqual(stored["weighted_credits"], 0)
+        self.assertIsNone(stored["weighted_credits"])
         self.assertEqual(stored["model_call_count"], 0)
         self.assertEqual(summary["turns"], 1)
         self.assertEqual(summary["total_tokens"], 100)

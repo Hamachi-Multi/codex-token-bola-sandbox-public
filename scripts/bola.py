@@ -26,13 +26,15 @@ from codex_token_bola import __version__
 
 import service_lock
 import service_paths
-import dashboard_cleanup
+import dashboard_cleanup  # noqa: F401 - compatibility patch point for command tests
 import cancel_control
 import progress_control  # noqa: F401 - compatibility patch point for command tests
 import raw_segments  # noqa: F401 - compatibility facade for command tests and integrations
 import analysis_inputs
 import quarantine_health
+import quarantine_renderer
 import retention_checkpoints
+import doctor_renderer
 import doctor_service
 import hook_service
 import paths_service
@@ -399,11 +401,8 @@ def runtime_env(
     return {"CODEX_HOME": str(paths.codex_dir), service_paths.OUTPUT_DIR_ENV: str(paths.output_dir)}
 
 
-def analytics_db_path(output: str | None, output_dir: str | pathlib.Path | None = None) -> pathlib.Path:
-    base = service_paths.output_dir_path(output_dir)
-    return (
-        pathlib.Path(output).expanduser() if output else pathlib.Path(os.environ.get("BOLA_ANALYTICS_DB", str(base / "analytics" / "bola.sqlite"))).expanduser()
-    )
+def analytics_db_path(output_dir: str | pathlib.Path | None = None) -> pathlib.Path:
+    return service_paths.output_layout(output_dir).analytics_db
 
 
 def effective_codex_dir(codex_dir: str | pathlib.Path | None = None) -> pathlib.Path:
@@ -417,14 +416,8 @@ def token_bola_root(
     return runtime_paths(codex_dir, output_dir).output_dir
 
 
-def pipeline_output_path(codex_dir: str | None, output: str | None, output_dir: str | None = None) -> pathlib.Path:
-    base = token_bola_root(codex_dir, output_dir)
-    if output:
-        return dashboard_cleanup.ensure_service_owned_output(base, pathlib.Path(output).expanduser())
-    env_output = os.environ.get("BOLA_ANALYTICS_DB")
-    if env_output:
-        return dashboard_cleanup.ensure_service_owned_output(base, pathlib.Path(env_output).expanduser())
-    return dashboard_cleanup.ensure_service_owned_output(base, base / "analytics" / "bola.sqlite")
+def pipeline_output_path(codex_dir: str | None, output_dir: str | None = None) -> pathlib.Path:
+    return service_paths.OutputLayout(token_bola_root(codex_dir, output_dir)).analytics_db
 
 
 def analysis_input_fingerprint(codex_dir: str | None = None, state_db: str | None = None, output_dir: str | None = None) -> str:
@@ -440,11 +433,8 @@ def parse_cutoff(value: str) -> float:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
 
 
-def retention_db_path(codex_dir: str | None, output: str | None, output_dir: str | None = None) -> pathlib.Path:
-    base = token_bola_root(codex_dir, output_dir)
-    if output:
-        return dashboard_cleanup.ensure_service_owned_output(base, pathlib.Path(output).expanduser())
-    return dashboard_cleanup.ensure_service_owned_output(base, base / "analytics" / "bola.sqlite")
+def retention_db_path(codex_dir: str | None, output_dir: str | None = None) -> pathlib.Path:
+    return service_paths.OutputLayout(token_bola_root(codex_dir, output_dir)).analytics_db
 
 
 raw_segment_state_checkpoint = retention_checkpoints.create
@@ -453,7 +443,7 @@ restore_raw_segment_state_checkpoint = retention_checkpoints.restore
 
 
 def read_analytics_metadata(output: str | None) -> dict[str, object]:
-    db_path = analytics_db_path(output)
+    db_path = pathlib.Path(output).expanduser() if output else analytics_db_path()
     if not db_path.exists():
         return {}
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -512,7 +502,10 @@ def doctor(args: argparse.Namespace) -> int:
             now=time.time,
         ),
     )
-    print(json.dumps(result.report, ensure_ascii=False, indent=2))
+    if bool(getattr(args, "json_output", False)):
+        print(json.dumps(result.report, ensure_ascii=False, indent=2))
+    else:
+        print(doctor_renderer.render_doctor_report(result.report))
     return result.exit_code
 
 
@@ -528,10 +521,14 @@ def quarantine_command(args: argparse.Namespace) -> int:
         ),
         runtime_paths,
     )
-    if result.pretty:
+    if bool(getattr(args, "json_output", False)) and result.pretty:
         print(json.dumps(result.payload, ensure_ascii=False, indent=2))
-    else:
+    elif bool(getattr(args, "json_output", False)):
         print(json.dumps(result.payload, ensure_ascii=False, separators=(",", ":")))
+    elif args.quarantine_action == "list":
+        print(quarantine_renderer.render_list(result.payload, include_acknowledged=bool(getattr(args, "include_acknowledged", False))))
+    else:
+        print(quarantine_renderer.render_acknowledge(result.payload))
     return result.exit_code
 
 
@@ -565,7 +562,6 @@ def pipeline(args: argparse.Namespace) -> int:
             codex_dir=getattr(args, "codex_dir", None),
             output_dir=getattr(args, "output_dir", None),
             state_db=getattr(args, "state_db", None),
-            output=getattr(args, "output", None),
             project_roots=tuple(getattr(args, "project_root", None) or ()),
             incremental=bool(getattr(args, "incremental", False)),
             recover=bool(getattr(args, "recover", False)),
@@ -600,7 +596,6 @@ def retention_prune(args: argparse.Namespace) -> int:
                 preview_signature=getattr(args, "preview_signature", None),
                 codex_dir=getattr(args, "codex_dir", None),
                 output_dir=getattr(args, "output_dir", None),
-                output=getattr(args, "output", None),
             ),
             dependencies,
         )
@@ -740,6 +735,7 @@ def runtime_command_dependencies() -> runtime_command_service.RuntimeCommandDepe
 def serve_dependencies() -> runtime_command_service.ServeDependencies:
     return runtime_command_service.ServeDependencies(
         resolve_paths=runtime_paths,
+        require_runtime_config=service_paths.require_runtime_config,
         replace_command=replace_script,
     )
 
@@ -767,13 +763,14 @@ def handle_forwarded_runtime(
 
 
 def handle_build(args: argparse.Namespace, unknown: list[str], _parser: argparse.ArgumentParser) -> int:
+    if any(value == "--output" or value.startswith("--output=") for value in unknown):
+        _parser.error(f"unrecognized arguments: {' '.join(unknown)}")
     result = runtime_command_service.run_build(
         runtime_command_service.BuildOptions(
             codex_dir=args.codex_dir,
             output_dir=args.output_dir,
             normalized_log=args.normalized_log,
             state_db=args.state_db,
-            output=args.output,
             project_roots=tuple(args.project_root or ()),
             extra_arguments=tuple(unknown),
         ),
@@ -795,7 +792,6 @@ def handle_serve(args: argparse.Namespace, unknown: list[str], parser: argparse.
                 or args.output_dir
                 or os.environ.get("CODEX_HOME")
                 or os.environ.get(service_paths.OUTPUT_DIR_ENV)
-                or os.environ.get("BOLA_ANALYTICS_DB")
             ),
         ),
         serve_dependencies(),
@@ -848,6 +844,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="bola",
         description="Codex Token Bola capture, analytics, and dashboard commands.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,
         epilog="""Common commands:
   install-hook      Register the BOLA hook in a Codex directory
   doctor            Check configuration and runtime health
@@ -895,7 +892,6 @@ Advanced and recovery commands:
     add_runtime_path_args(build)
     build.add_argument("--normalized-log")
     build.add_argument("--state-db")
-    build.add_argument("--output")
     build.add_argument("--project-root", action="append")
     build.set_defaults(handler=handle_build)
 
@@ -908,7 +904,6 @@ Advanced and recovery commands:
     pipe = sub.add_parser("pipeline", description="Run normalize and analytics build; add --recover to recover pending turns first.")
     add_runtime_path_args(pipe)
     pipe.add_argument("--state-db")
-    pipe.add_argument("--output")
     pipe.add_argument("--project-root", action="append")
     pipe.add_argument("--incremental", action="store_true")
     pipe.add_argument("--recover", action="store_true", help="Recover pending turns before analysis.")
@@ -923,12 +918,12 @@ Advanced and recovery commands:
     retention = sub.add_parser("retention-prune", description="Delete service data older than a cutoff and rebuild analytics.")
     retention.add_argument("--cutoff", required=True, help="ISO timestamp or unix seconds cutoff.")
     add_runtime_path_args(retention)
-    retention.add_argument("--output")
     retention.add_argument("--preview-signature")
     retention.set_defaults(handler=handle_retention_prune)
 
-    doc = sub.add_parser("doctor", description="Print local file and database availability.")
+    doc = sub.add_parser("doctor", description="Summarize configuration, hook, recovery, and analytics health.")
     add_runtime_path_args(doc)
+    doc.add_argument("--json", dest="json_output", action="store_true", help="Print the complete machine-readable diagnostic report.")
     doc.set_defaults(handler=handle_doctor)
 
     quarantine = sub.add_parser(
@@ -943,10 +938,12 @@ Advanced and recovery commands:
     )
     quarantine_list = quarantine_sub.add_parser("list", help="List unacknowledged quarantined input records.")
     quarantine_list.add_argument("--include-acknowledged", action="store_true")
+    quarantine_list.add_argument("--json", dest="json_output", action="store_true", help="Print the complete machine-readable quarantine report.")
     quarantine_acknowledge = quarantine_sub.add_parser("acknowledge", help="Acknowledge quarantined input records without deleting evidence.")
     acknowledge_scope = quarantine_acknowledge.add_mutually_exclusive_group(required=True)
     acknowledge_scope.add_argument("--event-id", action="append")
     acknowledge_scope.add_argument("--all", dest="acknowledge_all", action="store_true")
+    quarantine_acknowledge.add_argument("--json", dest="json_output", action="store_true", help="Print the machine-readable acknowledgement result.")
     quarantine.set_defaults(handler=handle_quarantine)
 
     install = sub.add_parser("install-hook", description="Register the installed BOLA hook in a Codex directory.")
@@ -978,6 +975,8 @@ Advanced and recovery commands:
     paths_migrate_parser.add_argument("--apply", action="store_true", help="Apply migration. Omit for preview.")
     paths.set_defaults(handler=handle_paths)
 
+    for command_parser in sub.choices.values():
+        command_parser.allow_abbrev = False
     return parser
 
 
@@ -1029,7 +1028,10 @@ def main() -> int:
         print(json.dumps({"error": "configuration_invalid", "message": str(exc)}, ensure_ascii=False, separators=(",", ":")))
         return 2
     except quarantine_health.QuarantineError as exc:
-        print(json.dumps({"status": "failed", "error": "quarantine_state_invalid", "message": str(exc)}, ensure_ascii=False, separators=(",", ":")))
+        if getattr(args, "command", None) == "quarantine" and not bool(getattr(args, "json_output", False)):
+            print(quarantine_renderer.render_error(str(exc)))
+        else:
+            print(json.dumps({"status": "failed", "error": "quarantine_state_invalid", "message": str(exc)}, ensure_ascii=False, separators=(",", ":")))
         return 2
     parser.error("unknown command")
     return 2

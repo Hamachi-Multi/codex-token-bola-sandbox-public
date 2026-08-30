@@ -5,6 +5,7 @@ import {
   compactNumber,
   compactSessionId,
   sessionDetailLabel,
+  sessionPrimaryLabel,
   sessionPathLabel,
 } from './formatters.js';
 
@@ -21,9 +22,9 @@ function sessionOptionDaysValue() {
 
 function sessionFilterRows() {
   const current = sessionFilterValue();
-  const rows = [{session_id: '', thread_name: 'All Sessions', cwd: '', turns: 0, credits: 0}, ...state.sessionOptions];
+  const rows = [{session_id: '', thread_name: 'All Sessions', project: '', cwd: '', turns: 0, credits: 0}, ...state.sessionOptions];
   if (current && !state.sessionOptions.some(row => String(row.session_id || '') === current)) {
-    rows.splice(1, 0, {session_id: current, thread_name: '', cwd: '', turns: null, credits: 0, out_of_scope: true});
+    rows.splice(1, 0, {session_id: current, thread_name: '', project: '', cwd: '', turns: null, credits: 0, out_of_scope: true});
   }
   return rows;
 }
@@ -33,6 +34,7 @@ function sessionSearchText(row) {
     row.session_id || '',
     compactSessionId(row.session_id || ''),
     row.thread_name || '',
+    row.project || '',
     row.cwd || '',
     sessionPathLabel(row),
     sessionDetailLabel(row),
@@ -41,7 +43,7 @@ function sessionSearchText(row) {
 
 function sessionOptionPrimary(row) {
   if (!row || !row.session_id) return 'All Sessions';
-  return String(row.thread_name || '').trim() || sessionPathLabel(row) || 'Session';
+  return sessionPrimaryLabel(row);
 }
 
 function sessionOptionId(row) {

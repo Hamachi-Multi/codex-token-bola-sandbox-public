@@ -55,11 +55,23 @@ except ModuleNotFoundError:
 
 
 class ToolTimingTests(unittest.TestCase):
-    def test_weighted_credits_use_non_cached_input_equivalent_units(self) -> None:
+    def test_priced_usage_uses_effective_model_rate(self) -> None:
         build = load_module("build_analytics_weighted_units_test", ROOT / "scripts" / "build_analytics.py")
-        self.assertEqual(build.weighted_credits(non_cached_input=2_000_000, cached_input=1_000_000, output=100_000), 2_700_000.0)
+        cost_pico_usd, cost_units, rate = build.priced_usage(
+            model="gpt-5.5",
+            started_at_unix=build.parse_time("2026-06-01T00:00:00Z"),
+            non_cached_input=2_000_000,
+            cached_input=1_000_000,
+            output=100_000,
+        )
+        self.assertEqual(cost_pico_usd, 13_500_000_000_000)
+        self.assertEqual(cost_units, 13_500_000.0)
+        self.assertIsNotNone(rate)
+        assert rate is not None
+        self.assertIsNone(rate.effective_from)
+        self.assertTrue(rate.is_default)
 
-    def test_turn_rows_store_non_cached_input_equivalent_units(self) -> None:
+    def test_turn_rows_store_effective_model_cost(self) -> None:
         build = load_module("build_analytics_turn_weighted_units_test", ROOT / "scripts" / "build_analytics.py")
         con = sqlite3.connect(":memory:")
         try:
@@ -67,7 +79,8 @@ class ToolTimingTests(unittest.TestCase):
             row = {
                 "session_id": "s1",
                 "turn_id": "t1",
-                "captured_at": "2026-01-01T00:00:00Z",
+                "captured_at": "2026-06-01T00:00:00Z",
+                "model": "gpt-5.5",
                 "cwd": "/example/.codex/codex-token-bola",
                 "prompt": {"prompt_preview": "inspect usage"},
                 "usage": {
@@ -80,13 +93,244 @@ class ToolTimingTests(unittest.TestCase):
                 },
             }
             turn = build.upsert_turn_row(con, row, {})
-            stored = con.execute("select weighted_credits, uncached_input_equivalent from turns").fetchone()
+            stored = con.execute(
+                "select weighted_credits, cost_pico_usd, cost_rate_status, cost_rate_effective_from from turns"
+            ).fetchone()
         finally:
             con.close()
         self.assertIsNotNone(turn)
         assert turn is not None
-        self.assertEqual(turn["usage"]["weighted_credits"], 2_700_000.0)
-        self.assertEqual(stored, (2_700_000.0, 2_700_000.0))
+        self.assertEqual(turn["usage"]["weighted_credits"], 13_500_000.0)
+        self.assertEqual(stored, (13_500_000.0, 13_500_000_000_000, "configured", None))
+
+    def test_cost_rate_catalog_selects_the_latest_effective_period(self) -> None:
+        build = load_module("build_analytics_cost_rate_boundary_test", ROOT / "scripts" / "build_analytics.py")
+        catalog, _revision = build.cost_rates.load_catalog(pathlib.Path("/nonexistent/cost-rates.json"))
+
+        before = catalog.resolve("gpt-5.6-terra", build.parse_time("2026-07-29T23:59:59Z"))
+        after = catalog.resolve("gpt-5.6-terra", build.parse_time("2026-07-30T00:00:00Z"))
+        unavailable = catalog.resolve("new-model", build.parse_time("2026-08-29T00:00:00Z"))
+
+        self.assertIsNotNone(before)
+        self.assertIsNotNone(after)
+        assert before is not None and after is not None
+        self.assertTrue(before.is_default)
+        self.assertIsNone(before.effective_from)
+        self.assertEqual(build.cost_rates.decimal_text(before.input_price), "2.5")
+        self.assertFalse(after.is_default)
+        self.assertEqual(after.effective_from, "2026-07-30")
+        self.assertEqual(build.cost_rates.decimal_text(after.input_price), "2")
+        self.assertIsNone(unavailable)
+
+    def test_cost_rate_overrides_are_atomic_and_revision_checked(self) -> None:
+        build = load_module("build_analytics_cost_rate_update_test", ROOT / "scripts" / "build_analytics.py")
+        rates = build.cost_rates
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = pathlib.Path(tmp_dir) / "cost-rates.json"
+            _catalog, revision = rates.load_catalog(path)
+            override = {
+                "model_id": "gpt-5.5",
+                "effective_from": None,
+                "is_default": True,
+                "input_price": "4.25",
+                "cached_input_price": "0.425",
+                "output_price": "25.5",
+            }
+            catalog, updated_revision = rates.update_custom_rates(
+                action="upsert",
+                expected_revision=revision,
+                rate_payload=override,
+                path=path,
+            )
+            selected = catalog.resolve("gpt-5.5", build.parse_time("2026-06-01T00:00:00Z"))
+            self.assertIsNotNone(selected)
+            assert selected is not None
+            self.assertEqual(rates.decimal_text(selected.input_price), "4.25")
+            self.assertTrue(selected.is_default)
+            self.assertNotEqual(updated_revision, revision)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+            with self.assertRaises(rates.CostRateRevisionConflict):
+                rates.update_custom_rates(
+                    action="upsert",
+                    expected_revision=revision,
+                    rate_payload=override,
+                    path=path,
+                )
+
+            catalog, reset_revision = rates.update_custom_rates(
+                action="reset",
+                expected_revision=updated_revision,
+                rate_payload=override,
+                path=path,
+            )
+            selected = catalog.resolve("gpt-5.5", build.parse_time("2026-06-01T00:00:00Z"))
+            self.assertIsNotNone(selected)
+            assert selected is not None
+            self.assertEqual(rates.decimal_text(selected.input_price), "5")
+            self.assertNotEqual(reset_revision, updated_revision)
+
+    def test_all_cost_rate_overrides_can_be_reset_atomically(self) -> None:
+        build = load_module("build_analytics_cost_rate_reset_all_test", ROOT / "scripts" / "build_analytics.py")
+        rates = build.cost_rates
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = pathlib.Path(tmp_dir) / "cost-rates.json"
+            _catalog, revision = rates.load_catalog(path)
+            override = {
+                "model_id": "gpt-5.5",
+                "effective_from": None,
+                "is_default": True,
+                "input_price": "4.25",
+                "cached_input_price": "0.425",
+                "output_price": "25.5",
+            }
+            _catalog, updated_revision = rates.update_custom_rates(
+                action="upsert",
+                expected_revision=revision,
+                rate_payload=override,
+                path=path,
+            )
+
+            catalog, reset_revision = rates.reset_all_custom_rates(
+                expected_revision=updated_revision,
+                path=path,
+            )
+            custom, stored_revision = rates.read_custom_rates(path)
+            selected = catalog.resolve("gpt-5.5", build.parse_time("2026-06-01T00:00:00Z"))
+
+            self.assertEqual(custom, [])
+            self.assertEqual(stored_revision, reset_revision)
+            self.assertIsNotNone(selected)
+            assert selected is not None
+            self.assertEqual(rates.decimal_text(selected.input_price), "5")
+            with self.assertRaises(rates.CostRateRevisionConflict):
+                rates.reset_all_custom_rates(expected_revision=updated_revision, path=path)
+
+    def test_dated_built_in_rate_can_be_deleted_and_default_cannot(self) -> None:
+        build = load_module("build_analytics_cost_rate_delete_test", ROOT / "scripts" / "build_analytics.py")
+        rates = build.cost_rates
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = pathlib.Path(tmp_dir) / "cost-rates.json"
+            _catalog, revision = rates.load_catalog(path)
+            dated = {
+                "model_id": "gpt-5.6",
+                "effective_from": "2026-08-21",
+                "is_default": False,
+                "input_price": "4",
+                "cached_input_price": "0.4",
+                "output_price": "20",
+            }
+            catalog, deleted_revision = rates.update_custom_rates(
+                action="delete",
+                expected_revision=revision,
+                rate_payload=dated,
+                path=path,
+            )
+
+            selected = catalog.resolve("gpt-5.6", build.parse_time("2026-08-22T00:00:00Z"))
+            self.assertIsNotNone(selected)
+            assert selected is not None
+            self.assertTrue(selected.is_default)
+            self.assertEqual(rates.decimal_text(selected.input_price), "5")
+
+            restored, stored_revision = rates.load_catalog(path)
+            self.assertEqual(stored_revision, deleted_revision)
+            restored_selected = restored.resolve("gpt-5.6", build.parse_time("2026-08-22T00:00:00Z"))
+            self.assertIsNotNone(restored_selected)
+            assert restored_selected is not None
+            self.assertTrue(restored_selected.is_default)
+
+            default = {
+                "model_id": "gpt-5.6",
+                "effective_from": None,
+                "is_default": True,
+                "input_price": "5",
+                "cached_input_price": "0.5",
+                "output_price": "30",
+            }
+            with self.assertRaises(rates.CostRateError) as forbidden:
+                rates.update_custom_rates(
+                    action="delete",
+                    expected_revision=deleted_revision,
+                    rate_payload=default,
+                    path=path,
+                )
+            self.assertEqual(forbidden.exception.error, "cost_rate_delete_forbidden")
+
+            restored_catalog, _reset_revision = rates.reset_all_custom_rates(
+                expected_revision=deleted_revision,
+                path=path,
+            )
+            restored_dated = restored_catalog.resolve("gpt-5.6", build.parse_time("2026-08-22T00:00:00Z"))
+            self.assertIsNotNone(restored_dated)
+            assert restored_dated is not None
+            self.assertEqual(restored_dated.effective_from, "2026-08-21")
+
+    def test_cost_rate_validation_rejects_unknown_and_excess_precision(self) -> None:
+        build = load_module("build_analytics_cost_rate_validation_test", ROOT / "scripts" / "build_analytics.py")
+        rates = build.cost_rates
+        with self.assertRaises(rates.CostRateError) as unknown:
+            rates.parse_rate(
+                {
+                    "model_id": "unknown",
+                    "effective_from": "2026-08-29",
+                    "input_price": "1",
+                    "cached_input_price": "0.1",
+                    "output_price": "6",
+                }
+            )
+        self.assertEqual(unknown.exception.field, "model_id")
+
+        with self.assertRaises(rates.CostRateError) as precision:
+            rates.parse_rate(
+                {
+                    "model_id": "future-model",
+                    "effective_from": "2026-08-29",
+                    "input_price": "0.0000001",
+                    "cached_input_price": "0",
+                    "output_price": "1",
+                }
+            )
+        self.assertEqual(precision.exception.field, "input_price")
+
+        with self.assertRaises(rates.CostRateError) as missing_period:
+            rates.parse_rate(
+                {
+                    "model_id": "future-model",
+                    "input_price": "1",
+                    "cached_input_price": "0.1",
+                    "output_price": "6",
+                }
+            )
+        self.assertEqual(missing_period.exception.field, "effective_from")
+
+        default_rate = rates.parse_rate(
+            {
+                "model_id": "future-model",
+                "effective_from": None,
+                "is_default": True,
+                "input_price": "1",
+                "cached_input_price": "0.1",
+                "output_price": "6",
+            }
+        )
+        self.assertTrue(default_rate.is_default)
+        self.assertIsNone(default_rate.effective_from)
+
+    def test_build_main_reports_invalid_cost_rate_config_as_json(self) -> None:
+        build = load_module("build_analytics_cost_rate_error_test", ROOT / "scripts" / "build_analytics.py")
+        args = argparse.Namespace()
+        error = build.cost_rates.CostRateError("cost_rates_config_invalid", "Invalid cost rates config")
+        output = io.StringIO()
+        with (
+            mock.patch.object(build, "parse_args", return_value=args),
+            mock.patch.object(build, "configure_paths", side_effect=error),
+            mock.patch.object(build.sys, "stdout", output),
+        ):
+            exit_code = build.main()
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(json.loads(output.getvalue()), error.payload())
 
     def test_turn_rows_index_prompt_start_time_separately_from_capture_time(self) -> None:
         build = load_module("build_analytics_prompt_time_test", ROOT / "scripts" / "build_analytics.py")
@@ -724,6 +968,11 @@ class ToolTimingTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_dir), "BOLA_OUTPUT_DIR": str(codex_dir / "bola")}, clear=False):
                 hook = load_module("hook_stop_bounds_turn_test", ROOT / "scripts" / "hook.py")
             hook.handle_start({"session_id": "s1", "turn_id": "t1", "transcript_path": str(transcript), "cwd": "/tmp"})
+            state_path = hook.state_path("s1", "t1")
+            start_state = json.loads(state_path.read_text(encoding="utf-8"))
+            start_state["prompt"]["instruction_excerpt"] = "old excerpt"
+            start_state["prompt"]["instruction_excerpt_chars"] = 11
+            state_path.write_text(json.dumps(start_state), encoding="utf-8")
             with transcript.open("a", encoding="utf-8") as handle:
                 handle.write(event({"type": "task_started", "turn_id": "t1"}))
                 handle.write(
@@ -759,6 +1008,8 @@ class ToolTimingTests(unittest.TestCase):
         self.assertEqual(rows[0]["usage"]["total_tokens"], 100)
         self.assertEqual(rows[0]["end_token_usage"]["total_tokens"], 100)
         self.assertEqual(rows[0]["model_call_count"], 1)
+        self.assertNotIn("instruction_excerpt", rows[0]["prompt"])
+        self.assertNotIn("instruction_excerpt_chars", rows[0]["prompt"])
 
     def test_stop_hook_defers_when_token_count_exists_without_turn_end_event(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1271,7 +1522,7 @@ class ToolTimingTests(unittest.TestCase):
         self.assertEqual(calls[0]["issued_by_model_call_index"], 2)
         self.assertEqual(calls[0]["consumed_by_model_call_index"], 3)
         self.assertEqual(calls[0]["output_reported_tokens"], 42)
-        self.assertEqual(calls[0]["output_preview"], "")
+        self.assertNotIn("output_preview", calls[0])
 
     def test_project_root_can_be_configured(self) -> None:
         build = load_module("build_analytics_project_test", ROOT / "scripts" / "build_analytics.py")
@@ -1770,7 +2021,8 @@ class ToolTimingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             base = pathlib.Path(tmp_dir)
             turns = base / "turns.jsonl"
-            db_path = base / "analytics.sqlite"
+            output_dir = base / "output"
+            db_path = output_dir / "analytics" / "bola.sqlite"
             state_db = base / "missing-state.sqlite"
             turns.write_text(json.dumps(_turn_normalized("s1", "t1", total=100)) + "\n", encoding="utf-8")
             subprocess.run(
@@ -1781,13 +2033,12 @@ class ToolTimingTests(unittest.TestCase):
                     str(turns),
                     "--state-db",
                     str(state_db),
-                    "--output",
-                    str(db_path),
                 ],
                 cwd=ROOT,
                 check=True,
                 text=True,
                 capture_output=True,
+                env={**os.environ, "BOLA_OUTPUT_DIR": str(output_dir)},
             )
             turns_offset = turns.stat().st_size
             turns.write_text(turns.read_text(encoding="utf-8") + json.dumps(_turn_normalized("s2", "t2", total=200)) + "\n", encoding="utf-8")
@@ -1799,8 +2050,6 @@ class ToolTimingTests(unittest.TestCase):
                     str(turns),
                     "--state-db",
                     str(state_db),
-                    "--output",
-                    str(db_path),
                     "--incremental",
                     "--turns-offset",
                     str(turns_offset),
@@ -1809,6 +2058,7 @@ class ToolTimingTests(unittest.TestCase):
                 check=True,
                 text=True,
                 capture_output=True,
+                env={**os.environ, "BOLA_OUTPUT_DIR": str(output_dir)},
             )
             metadata = json.loads(result.stdout)
             con = sqlite3.connect(db_path)
@@ -1826,7 +2076,8 @@ class ToolTimingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             base = pathlib.Path(tmp_dir)
             turns = base / "turns.jsonl"
-            db_path = base / "analytics.sqlite"
+            output_dir = base / "output"
+            db_path = output_dir / "analytics" / "bola.sqlite"
             state_db = base / "missing-state.sqlite"
             turns.write_text(json.dumps(_turn_normalized("s1", "t1", total=200)) + "\n", encoding="utf-8")
             subprocess.run(
@@ -1837,13 +2088,12 @@ class ToolTimingTests(unittest.TestCase):
                     str(turns),
                     "--state-db",
                     str(state_db),
-                    "--output",
-                    str(db_path),
                 ],
                 cwd=ROOT,
                 check=True,
                 text=True,
                 capture_output=True,
+                env={**os.environ, "BOLA_OUTPUT_DIR": str(output_dir)},
             )
             turns_offset = turns.stat().st_size
             stale = _turn_normalized("s1", "t1", total=10) | {"turn_status": "incomplete", "estimated": True}
@@ -1857,8 +2107,6 @@ class ToolTimingTests(unittest.TestCase):
                     str(turns),
                     "--state-db",
                     str(state_db),
-                    "--output",
-                    str(db_path),
                     "--incremental",
                     "--turns-offset",
                     str(turns_offset),
@@ -1867,6 +2115,7 @@ class ToolTimingTests(unittest.TestCase):
                 check=True,
                 text=True,
                 capture_output=True,
+                env={**os.environ, "BOLA_OUTPUT_DIR": str(output_dir)},
             )
             metadata = json.loads(result.stdout)
             con = sqlite3.connect(db_path)
@@ -1882,7 +2131,8 @@ class ToolTimingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             base = pathlib.Path(tmp_dir)
             turns = base / "turns.jsonl"
-            db_path = base / "analytics.sqlite"
+            output_dir = base / "output"
+            db_path = output_dir / "analytics" / "bola.sqlite"
             state_db = base / "missing-state.sqlite"
             turns.write_text(json.dumps(_turn_normalized("s1", "t1", total=10)) + "\n", encoding="utf-8")
             subprocess.run(
@@ -1893,13 +2143,12 @@ class ToolTimingTests(unittest.TestCase):
                     str(turns),
                     "--state-db",
                     str(state_db),
-                    "--output",
-                    str(db_path),
                 ],
                 cwd=ROOT,
                 check=True,
                 text=True,
                 capture_output=True,
+                env={**os.environ, "BOLA_OUTPUT_DIR": str(output_dir)},
             )
             turns_offset = turns.stat().st_size
             turns.write_text(turns.read_text(encoding="utf-8") + json.dumps(_turn_normalized("s1", "t1", total=20)) + "\n", encoding="utf-8")
@@ -1912,8 +2161,6 @@ class ToolTimingTests(unittest.TestCase):
                     str(turns),
                     "--state-db",
                     str(state_db),
-                    "--output",
-                    str(db_path),
                     "--incremental",
                     "--turns-offset",
                     str(turns_offset),
@@ -1922,6 +2169,7 @@ class ToolTimingTests(unittest.TestCase):
                 check=True,
                 text=True,
                 capture_output=True,
+                env={**os.environ, "BOLA_OUTPUT_DIR": str(output_dir)},
             )
             metadata = json.loads(result.stdout)
             con = sqlite3.connect(db_path)
@@ -1979,6 +2227,7 @@ class ToolTimingTests(unittest.TestCase):
                     {
                         "context_snapshot_version": build.build_analytics_context.CONTEXT_SNAPSHOT_VERSION,
                         "analytics_schema_version": build.ANALYTICS_SCHEMA_VERSION,
+                        "cost_rate_catalog_digest": build.COST_RATE_CATALOG.digest,
                     },
                 )
                 con.commit()
@@ -1997,11 +2246,76 @@ class ToolTimingTests(unittest.TestCase):
         self.assertEqual(total, 20)
         self.assertEqual(tool_rows, 0)
 
+    def test_schema_v1_incremental_build_rebuilds_and_purges_tool_output_preview(self) -> None:
+        build = load_module("build_schema_v1_preview_purge_test", ROOT / "scripts" / "build_analytics.py")
+        sentinel = "removed-tool-output-preview-sentinel"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = pathlib.Path(tmp_dir)
+            normalized = base / "normalized.jsonl"
+            database = base / "analytics.sqlite"
+            normalized.write_text("", encoding="utf-8")
+            con = sqlite3.connect(database)
+            try:
+                con.executescript(
+                    """
+                    create table turns (session_id text);
+                    create table run_metadata (key text primary key, value text);
+                    create table tool_call_samples (output_preview text);
+                    """
+                )
+                con.execute("insert into tool_call_samples values (?)", (sentinel,))
+                con.executemany(
+                    "insert into run_metadata values (?, ?)",
+                    [
+                        ("context_snapshot_version", json.dumps(build.build_analytics_context.CONTEXT_SNAPSHOT_VERSION)),
+                        ("analytics_schema_version", json.dumps(1)),
+                    ],
+                )
+                con.commit()
+            finally:
+                con.close()
+
+            build.NORMALIZED_LOG = normalized
+            build.ANALYTICS_DB = database
+
+            def full_rebuild() -> dict[str, object]:
+                with build.full_build_connection(database) as rebuilt:
+                    build.setup_db(rebuilt)
+                    build.write_metadata(rebuilt, {"analytics_schema_version": build.ANALYTICS_SCHEMA_VERSION})
+                return {"output": str(database), "analytics_schema_version": build.ANALYTICS_SCHEMA_VERSION}
+
+            lock_context = mock.MagicMock(__enter__=lambda _self: None, __exit__=lambda *_args: None)
+            args = argparse.Namespace(incremental=True, turns_offset=0)
+            with (
+                mock.patch.object(build, "parse_args", return_value=args),
+                mock.patch.object(build, "configure_paths"),
+                mock.patch.object(build.service_lock, "acquire_service_lock", return_value=lock_context),
+                mock.patch.object(build, "build", side_effect=full_rebuild) as rebuild,
+                mock.patch.object(build.sys, "stdout", io.StringIO()),
+            ):
+                exit_code = build.main()
+
+            con = sqlite3.connect(database)
+            try:
+                columns = {str(row[1]) for row in con.execute("pragma table_info(tool_call_samples)")}
+                stored_version = json.loads(
+                    con.execute("select value from run_metadata where key='analytics_schema_version'").fetchone()[0]
+                )
+            finally:
+                con.close()
+
+            self.assertEqual(exit_code, 0)
+            rebuild.assert_called_once_with()
+            self.assertEqual(stored_version, build.ANALYTICS_SCHEMA_VERSION)
+            self.assertNotIn("output_preview", columns)
+            self.assertNotIn(sentinel.encode(), database.read_bytes())
+
     def test_build_full_replaces_equal_rank_turn_with_later_row(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             base = pathlib.Path(tmp_dir)
             turns = base / "turns.jsonl"
-            db_path = base / "analytics.sqlite"
+            output_dir = base / "output"
+            db_path = output_dir / "analytics" / "bola.sqlite"
             state_db = base / "missing-state.sqlite"
             turns.write_text(
                 json.dumps(_turn_normalized("s1", "t1", total=10)) + "\n" + json.dumps(_turn_normalized("s1", "t1", total=20)) + "\n",
@@ -2015,13 +2329,12 @@ class ToolTimingTests(unittest.TestCase):
                     str(turns),
                     "--state-db",
                     str(state_db),
-                    "--output",
-                    str(db_path),
                 ],
                 cwd=ROOT,
                 check=True,
                 text=True,
                 capture_output=True,
+                env={**os.environ, "BOLA_OUTPUT_DIR": str(output_dir)},
             )
             con = sqlite3.connect(db_path)
             try:
@@ -2035,7 +2348,7 @@ class ToolTimingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             base = pathlib.Path(tmp_dir)
             turns = base / "turns.jsonl"
-            db_path = base / "analytics.sqlite"
+            output_dir = base / "output"
             state_db = base / "missing-state.sqlite"
             turns.write_text(json.dumps(_turn_normalized("s1", "t1", total=100)) + "\n", encoding="utf-8")
             subprocess.run(
@@ -2046,13 +2359,12 @@ class ToolTimingTests(unittest.TestCase):
                     str(turns),
                     "--state-db",
                     str(state_db),
-                    "--output",
-                    str(db_path),
                 ],
                 cwd=ROOT,
                 check=True,
                 text=True,
                 capture_output=True,
+                env={**os.environ, "BOLA_OUTPUT_DIR": str(output_dir)},
             )
 
             result = subprocess.run(
@@ -2063,8 +2375,6 @@ class ToolTimingTests(unittest.TestCase):
                     str(turns),
                     "--state-db",
                     str(state_db),
-                    "--output",
-                    str(db_path),
                     "--incremental",
                     "--turns-offset",
                     str(turns.stat().st_size + 1),
@@ -2072,6 +2382,7 @@ class ToolTimingTests(unittest.TestCase):
                 cwd=ROOT,
                 text=True,
                 capture_output=True,
+                env={**os.environ, "BOLA_OUTPUT_DIR": str(output_dir)},
             )
 
         self.assertNotEqual(result.returncode, 0)
@@ -2152,25 +2463,31 @@ class ToolTimingTests(unittest.TestCase):
         build = load_module("build_apply_marker_fail_test", ROOT / "scripts" / "build_analytics.py")
         with tempfile.TemporaryDirectory() as tmp:
             output = pathlib.Path(tmp) / "bola.sqlite"
-            with mock.patch.object(
-                build.raw_segments,
-                "reconcile_apply_marker",
-                side_effect=build.raw_segments.ManifestError("bad marker"),
+            with (
+                mock.patch.object(build, "ANALYTICS_DB", output),
+                mock.patch.object(
+                    build.raw_segments,
+                    "reconcile_apply_marker",
+                    side_effect=build.raw_segments.ManifestError("bad marker"),
+                ),
             ):
                 with self.assertRaises(build.raw_segments.ManifestError):
-                    build.build(output)
+                    build.build()
 
     def test_build_fails_before_archive_discovery_when_rotation_reconcile_fails(self) -> None:
         build = load_module("build_rotation_marker_fail_test", ROOT / "scripts" / "build_analytics.py")
         with tempfile.TemporaryDirectory() as tmp:
             output = pathlib.Path(tmp) / "bola.sqlite"
-            with mock.patch.object(
-                build.raw_segments,
-                "reconcile_pending_rotation",
-                side_effect=build.raw_segments.ManifestError("bad rotation marker"),
+            with (
+                mock.patch.object(build, "ANALYTICS_DB", output),
+                mock.patch.object(
+                    build.raw_segments,
+                    "reconcile_pending_rotation",
+                    side_effect=build.raw_segments.ManifestError("bad rotation marker"),
+                ),
             ):
                 with self.assertRaises(build.raw_segments.ManifestError):
-                    build.build(output)
+                    build.build()
 
     def test_full_build_failure_preserves_database_and_removes_temporary_artifacts(self) -> None:
         build = load_module("build_temp_cleanup_failure_test", ROOT / "scripts" / "build_analytics.py")
@@ -2179,6 +2496,7 @@ class ToolTimingTests(unittest.TestCase):
             output.write_bytes(b"previous database")
 
             with (
+                mock.patch.object(build, "ANALYTICS_DB", output),
                 mock.patch.object(build.raw_segments, "reconcile_apply_marker", return_value=None),
                 mock.patch.object(build.raw_segments, "reconcile_pending_rotation", return_value=None),
                 mock.patch.object(build, "scan_normalized_build_inputs", return_value=(1, set())),
@@ -2188,7 +2506,7 @@ class ToolTimingTests(unittest.TestCase):
                 mock.patch.object(build, "iter_jsonl", side_effect=RuntimeError("turn scan failed")),
             ):
                 with self.assertRaisesRegex(RuntimeError, "turn scan failed"):
-                    build.build(output)
+                    build.build()
 
             leftovers = list(output.parent.glob(f".{output.name}.*.tmp*"))
             preserved = output.read_bytes()
@@ -2229,7 +2547,7 @@ class ToolTimingTests(unittest.TestCase):
             self.assertEqual(raised.exception.payload["error"], "analytics_temp_artifact_unsafe")
             self.assertEqual(external.read_bytes(), b"external")
 
-    def test_build_reconciles_raw_segments_from_configured_normalized_root(self) -> None:
+    def test_build_reconciles_raw_segments_from_configured_output_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             default_dir = pathlib.Path(tmp) / "default-dir"
             target_dir = pathlib.Path(tmp) / "target-dir"
@@ -2240,14 +2558,17 @@ class ToolTimingTests(unittest.TestCase):
             ):
                 build = load_module("build_configured_raw_root_test", ROOT / "scripts" / "build_analytics.py")
             normalized = target_dir / "bola" / "normalized" / "prompt-usage.normalized.jsonl"
-            output = target_dir / "bola" / "analytics" / "bola.sqlite"
             args = argparse.Namespace(
                 normalized_log=str(normalized),
                 state_db=str(target_dir / "state_5.sqlite"),
-                output=str(output),
                 project_root=[],
             )
-            build.configure_paths(args)
+            with mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(default_dir), "BOLA_OUTPUT_DIR": str(default_dir / "bola")},
+                clear=False,
+            ):
+                build.configure_paths(args)
             observed: list[pathlib.Path] = []
 
             def record_reconcile(base: pathlib.Path) -> None:
@@ -2265,7 +2586,7 @@ class ToolTimingTests(unittest.TestCase):
             ):
                 build.build()
 
-        self.assertEqual(observed, [target_dir / "bola", target_dir / "bola"])
+        self.assertEqual(observed, [default_dir / "bola", default_dir / "bola"])
 
     def test_incremental_pipeline_builds_when_normalized_is_ahead_of_db(self) -> None:
         normalize = load_module("normalize_pipeline_version_test", ROOT / "scripts" / "normalize.py")
@@ -2306,13 +2627,12 @@ class ToolTimingTests(unittest.TestCase):
                     str(normalized),
                     "--state-db",
                     str(codex_dir / "missing-state.sqlite"),
-                    "--output",
-                    str(db_path),
                 ],
                 cwd=ROOT,
                 check=True,
                 text=True,
                 capture_output=True,
+                env={**os.environ, "CODEX_HOME": str(codex_dir), "BOLA_OUTPUT_DIR": str(base)},
             )
             normalized.write_text(first_row + second_row, encoding="utf-8")
             state_file.write_text(
@@ -2338,8 +2658,6 @@ class ToolTimingTests(unittest.TestCase):
                     str(codex_dir),
                     "--output-dir",
                     str(base),
-                    "--output",
-                    str(db_path),
                     "--state-db",
                     str(codex_dir / "missing-state.sqlite"),
                     "--incremental",
@@ -2542,7 +2860,7 @@ class ToolTimingTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertIn(("normalize.py", ["--incremental"]), calls)
-        self.assertIn(("build_analytics.py", ["--output", str(output_path), "--incremental", "--turns-offset", "10"]), calls)
+        self.assertIn(("build_analytics.py", ["--incremental", "--turns-offset", "10"]), calls)
 
     def test_noop_incremental_analyze_rotates_current_segment_before_noop_check(self) -> None:
         cli = load_module("cli_noop_analyze_rotate_test", ROOT / "scripts" / "bola.py")
@@ -2580,7 +2898,7 @@ class ToolTimingTests(unittest.TestCase):
             result = cli.pipeline(args)
         self.assertEqual(result, 0)
         self.assertEqual(calls[0], ("compact_raw.py", ["--rotate-current"]))
-        self.assertIn(("build_analytics.py", ["--output", str(output_path), "--incremental", "--turns-offset", "10"]), calls)
+        self.assertIn(("build_analytics.py", ["--incremental", "--turns-offset", "10"]), calls)
 
     def test_noop_incremental_analyze_uses_context_snapshot_when_fingerprint_changes(self) -> None:
         cli = load_module("cli_noop_context_fingerprint_test", ROOT / "scripts" / "bola.py")
@@ -2618,7 +2936,7 @@ class ToolTimingTests(unittest.TestCase):
             result = cli.pipeline(args)
 
         self.assertEqual(result, 0)
-        self.assertIn(("build_analytics.py", ["--output", str(output_path), "--incremental", "--turns-offset", "10"]), calls)
+        self.assertIn(("build_analytics.py", ["--incremental", "--turns-offset", "10"]), calls)
 
     def test_incremental_analyze_rebuilds_full_when_applied_offset_exceeds_normalized_size(self) -> None:
         cli = load_module("cli_oversized_applied_offset_test", ROOT / "scripts" / "bola.py")
@@ -2656,7 +2974,7 @@ class ToolTimingTests(unittest.TestCase):
             result = cli.pipeline(args)
 
         self.assertEqual(result, 0)
-        self.assertIn(("build_analytics.py", ["--output", str(output_path)]), calls)
+        self.assertIn(("build_analytics.py", []), calls)
 
     def test_analysis_input_fingerprint_uses_shared_path_digest(self) -> None:
         helper = load_module("analysis_inputs_shared_digest_test", ROOT / "scripts" / "analysis_inputs.py")
@@ -2731,7 +3049,7 @@ class ToolTimingTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(observed_metadata_outputs, [expected_output])
         self.assertIn(
-            ("build_analytics.py", ["--output", expected_output, "--incremental", "--turns-offset", "0"]),
+            ("build_analytics.py", ["--incremental", "--turns-offset", "0"]),
             calls,
         )
 
@@ -2828,8 +3146,6 @@ class ToolTimingTests(unittest.TestCase):
                     str(codex_dir),
                     "--output-dir",
                     str(base),
-                    "--output",
-                    str(db_path),
                 ],
                 check=True,
                 capture_output=True,
@@ -2929,8 +3245,6 @@ class ToolTimingTests(unittest.TestCase):
                     str(codex_dir),
                     "--output-dir",
                     str(base),
-                    "--output",
-                    str(db_path),
                 ],
                 check=True,
                 capture_output=True,
@@ -2973,15 +3287,13 @@ class ToolTimingTests(unittest.TestCase):
                 encoding="utf-8",
             )
             db_path = analytics_dir / "bola.sqlite"
-            test_env = {**os.environ, "CODEX_HOME": str(codex_dir)}
+            test_env = {**os.environ, "CODEX_HOME": str(codex_dir), "BOLA_OUTPUT_DIR": str(base)}
             subprocess.run(
                 [
                     sys.executable,
                     str(ROOT / "scripts" / "build_analytics.py"),
                     "--normalized-log",
                     str(normalized_dir / "prompt-usage.normalized.jsonl"),
-                    "--output",
-                    str(db_path),
                 ],
                 check=True,
                 capture_output=True,
@@ -3018,8 +3330,6 @@ class ToolTimingTests(unittest.TestCase):
                     str(codex_dir),
                     "--output-dir",
                     str(base),
-                    "--output",
-                    str(db_path),
                 ],
                 check=True,
                 capture_output=True,
@@ -3235,7 +3545,6 @@ class ToolTimingTests(unittest.TestCase):
                         "output_reported_tokens": 4,
                         "duration_ms": 20,
                         "status": "completed",
-                        "output_preview": "one",
                     }
                 ],
                 [
@@ -3249,7 +3558,6 @@ class ToolTimingTests(unittest.TestCase):
                         "output_reported_tokens": 2,
                         "duration_ms": 30,
                         "status": "failed",
-                        "output_preview": "two",
                     }
                 ],
             )
@@ -3450,6 +3758,11 @@ class ToolTimingTests(unittest.TestCase):
                         "transcript_path": str(transcript),
                         "captured_at": "2026-05-31T10:00:00+00:00",
                         "start_token_usage": {"input_tokens": 0, "total_tokens": 0},
+                        "prompt": {
+                            "prompt_preview": "old prompt",
+                            "instruction_excerpt": "old excerpt",
+                            "instruction_excerpt_chars": 11,
+                        },
                     }
                 ),
                 encoding="utf-8",
@@ -3470,6 +3783,9 @@ class ToolTimingTests(unittest.TestCase):
             self.assertFalse((base / "raw" / "prompt-usage.raw.jsonl").exists())
             self.assertEqual(len(current_paths), 1)
             self.assertIn('"session_id":"s-recovered"', current_payload)
+            recovered = json.loads(current_payload)
+            self.assertNotIn("instruction_excerpt", recovered["prompt"])
+            self.assertNotIn("instruction_excerpt_chars", recovered["prompt"])
 
     def test_reconcile_rechecks_current_segments_before_append(self) -> None:
         reconcile = load_module("reconcile_append_race_recheck_test", ROOT / "scripts" / "reconcile.py")

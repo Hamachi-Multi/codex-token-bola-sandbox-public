@@ -24,7 +24,6 @@ def extract_tool_calls(
     iter_jsonl: JsonlReader,
     safe_int: SafeInt,
     cancel_checker: CancelChecker,
-    output_preview_chars: int,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for path_index, path_text in enumerate(sorted(paths), 1):
@@ -82,7 +81,6 @@ def extract_tool_calls(
                             "output_reported_tokens": safe_int(token_match.group(1)) if token_match else None,
                             "status": str(payload.get("status") or "completed"),
                             "exit_code": safe_int(exit_match.group(1)) if exit_match else None,
-                            "output_preview": output_text[:output_preview_chars] if output_preview_chars > 0 else "",
                         }
                     )
                     if base.get("turn_id") in turn_ids_by_session.get(str(base.get("session_id") or ""), set()):

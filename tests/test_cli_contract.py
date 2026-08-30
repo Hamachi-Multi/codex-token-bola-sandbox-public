@@ -98,8 +98,13 @@ class CliContractTests(unittest.TestCase):
     def test_readme_uses_supported_hook_install_and_verification_commands(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
-        self.assertIn('bola install-hook --codex-dir "${CODEX_HOME:-$HOME/.codex}"', readme)
-        self.assertIn('bola doctor --codex-dir "${CODEX_HOME:-$HOME/.codex}"', readme)
+        self.assertIn("bola install-hook\nbola doctor", readme)
+        self.assertIn("Register the hook with the effective paths", readme)
+        self.assertIn("#### `install-hook` options", readme)
+        self.assertIn("| `--codex-dir` |", readme)
+        self.assertIn("| `--output-dir` |", readme)
+        self.assertIn("bola install-hook \\\n  --codex-dir ~/private/codex-dir \\\n  --output-dir ~/private/codex-token-data", readme)
+        self.assertNotIn('${CODEX_HOME:-$HOME/.codex}', readme)
         assert_order(
             self,
             readme,
@@ -107,11 +112,89 @@ class CliContractTests(unittest.TestCase):
             "source .venv/bin/activate",
             "python -m pip install .",
             "bola --version",
-            'bola install-hook --codex-dir "${CODEX_HOME:-$HOME/.codex}"',
+            "bola install-hook\nbola doctor",
+            "#### `install-hook` options",
+            "| `--codex-dir` |",
+            "| `--output-dir` |",
+            "### 3. Capture a Codex turn",
+            "### 4. Open the dashboard",
+            "bola serve\n```",
+            "bola serve --host 127.0.0.1 --port 9000",
+        )
+        self.assertIn("![Codex Token Bola dashboard overview with sample data](./docs/assets/dashboard/overview.png)", readme)
+        self.assertIn("*All screenshots use synthetic sample data.*", readme)
+        self.assertIn("<summary>Internal processing details</summary>", readme)
+        self.assertIn("<summary>Internal processing details</summary>\n\n<br>\n\n| Step", readme)
+        assert_order(
+            self,
+            readme,
+            "## How it works",
+            "<summary>Internal processing details</summary>",
+            "| 1 | Prompt start |",
+            "| 2 | Turn stop |",
+            "| 3 | Segment handoff |",
+            "| 4 | Reconcile |",
+            "| 5 | Normalize |",
+            "| 6 | Build |",
+            "| 7 | Query |",
+            "| 8 | Rebuild |",
+            "Execution constraints:",
+            "## Command guide",
         )
         self.assertNotIn("python3 -m pip install .", readme)
-        self.assertIn("It does not create a missing Codex directory", readme)
-        self.assertIn("An `--output-dir` does not need to exist during installation", readme)
+        self.assertNotIn("CODEX_HOME=~/private/codex-dir codex", readme)
+        self.assertNotIn("The default command uses `~/.codex`", readme)
+        self.assertIn("#### Codex hooks", readme)
+        self.assertIn("BOLA uses `UserPromptSubmit` for the turn baseline and `Stop`", readme)
+        self.assertNotIn("Codex hook behavior:", readme)
+        self.assertIn("> [!IMPORTANT]\n> Run `bola install-hook` again after moving the checkout or replacing its", readme)
+        self.assertIn("| Option | Purpose | Environment override | Default on WSL/Linux |", readme)
+        self.assertNotIn("| Requirement |", readme)
+        self.assertIn("| `--codex-dir` | Codex state input and hook registration | `CODEX_HOME` | `~/.codex` |", readme)
+        self.assertIn("| `--output-dir` | BOLA-generated data | `BOLA_OUTPUT_DIR` |", readme)
+        self.assertEqual(readme.count("Codex state input and hook registration"), 1)
+        self.assertEqual(readme.count("BOLA-generated data"), 1)
+        self.assertIn("`doctor`, `quarantine list`, and `quarantine acknowledge` support `--json`", readme)
+        self.assertIn("bola quarantine list --include-acknowledged", readme)
+        self.assertIn("`list` exits with `1` when records need review", readme)
+        self.assertNotIn("XDG_DATA_HOME", readme)
+        self.assertNotIn("XDG_CONFIG_HOME", readme)
+        self.assertNotIn("Hook scan and append tuning", readme)
+        self.assertNotIn("BOLA_HOOK_TAIL_SCAN_BYTES", readme)
+        self.assertNotIn("BOLA_HOOK_FORWARD_SCAN_BYTES", readme)
+        self.assertNotIn("BOLA_HOOK_APPEND_LOCK_TIMEOUT_MS", readme)
+        self.assertNotIn("BOLA-owned file permissions", readme)
+        self.assertIn("## Change paths later", readme)
+        self.assertNotIn("#### Change paths later", readme)
+        self.assertIn("Migrate only while Codex is stopped and no BOLA data operation is running", readme)
+        self.assertIn("bola paths migrate --output-dir --apply", readme)
+        self.assertNotIn("\n## Runtime paths\n", readme)
+        self.assertNotIn("### Path change recommendation", readme)
+        self.assertNotIn("Output migration safety guarantees", readme)
+        self.assertIn("## Measured storage footprint", readme)
+        self.assertIn("6,318 analyzed turns", readme)
+        self.assertIn("**10.26 KiB per analyzed turn**", readme)
+        self.assertIn("| 100,000 | about 0.98 GiB |", readme)
+        self.assertIn("observations, not a storage guarantee", readme)
+        assert_order(
+            self,
+            readme,
+            "### 2. Register and verify the hook",
+            "#### Codex hooks",
+            "Register the hook with the effective paths",
+            "bola install-hook\nbola doctor",
+            "### 3. Capture a Codex turn",
+            "## Command guide",
+            "## Change paths later",
+            "## Privacy and capture policy",
+        )
+        assert_order(
+            self,
+            readme,
+            "## Privacy and capture policy",
+            "## Measured storage footprint",
+            "## Operations and analytics",
+        )
         self.assertNotIn("cp hooks/token-usage.py", readme)
 
     def test_root_help_groups_common_and_advanced_commands(self) -> None:
@@ -157,6 +240,21 @@ class CliContractTests(unittest.TestCase):
             self.assertEqual(paths.codex_dir, codex_dir)
             self.assertEqual(paths.output_dir, data_home / "bola")
 
+    def test_output_layout_is_fixed_lazy_and_owner_only_for_temporary_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = pathlib.Path(tmp_dir) / "output"
+            layout = service_paths.OutputLayout(root)
+
+            self.assertEqual(layout.analytics_db, root / "analytics" / "bola.sqlite")
+            self.assertEqual(layout.normalized_log, root / "normalized" / "prompt-usage.normalized.jsonl")
+            self.assertEqual(layout.error_log, root / "prompt-usage-errors.jsonl")
+            self.assertFalse(root.exists())
+
+            tmp_path = service_paths.ensure_output_tmp_dir(root)
+
+            self.assertEqual(tmp_path, root / "tmp")
+            self.assertEqual(stat.S_IMODE(tmp_path.stat().st_mode), 0o700)
+
     def test_runtime_path_precedence_is_cli_environment_config_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = pathlib.Path(tmp_dir)
@@ -165,7 +263,7 @@ class CliContractTests(unittest.TestCase):
                 "CODEX_HOME": str(root / "env-codex"),
                 "BOLA_OUTPUT_DIR": str(root / "env-data"),
             }
-            config_path = service_paths.config_path(env)
+            config_path = service_paths.runtime_config_path(env)
             service_paths.write_config(
                 {"codex_dir": root / "config-codex", "output_dir": root / "config-data"},
                 config_path,
@@ -187,11 +285,89 @@ class CliContractTests(unittest.TestCase):
 
     def test_invalid_config_schema_fails_instead_of_using_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
-            path = pathlib.Path(tmp_dir) / "config.json"
-            path.write_text(json.dumps({"schema_version": 99}), encoding="utf-8")
+            path = pathlib.Path(tmp_dir) / "runtime.conf"
+            path.write_text("schema_version=99\ncodex_dir=/tmp/codex\noutput_dir=/tmp/output\n", encoding="utf-8")
 
             with self.assertRaises(service_paths.ConfigurationError):
                 service_paths.read_config(path)
+
+    def test_runtime_config_parser_accepts_comments_and_canonicalizes_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = pathlib.Path(tmp_dir)
+            path = root / "runtime.conf"
+            path.write_text(
+                "# BOLA runtime paths\n\n schema_version = 1 \n"
+                f"codex_dir={root}/codex\noutput_dir={root}/output\n",
+                encoding="utf-8",
+            )
+
+            configured = service_paths.read_config(path)
+
+        self.assertEqual(configured["schema_version"], 1)
+        self.assertEqual(configured["codex_dir"], str(root / "codex"))
+        self.assertEqual(configured["output_dir"], str(root / "output"))
+
+    def test_runtime_config_parser_rejects_invalid_structure(self) -> None:
+        cases = {
+            "missing": "schema_version=1\ncodex_dir=/tmp/codex\n",
+            "duplicate": "schema_version=1\ncodex_dir=/tmp/a\ncodex_dir=/tmp/b\noutput_dir=/tmp/output\n",
+            "unknown": "schema_version=1\ncodex_dir=/tmp/codex\noutput_dir=/tmp/output\nextra=true\n",
+            "relative": "schema_version=1\ncodex_dir=relative\noutput_dir=/tmp/output\n",
+            "malformed": "schema_version=1\ncodex_dir=/tmp/codex\noutput_dir\n",
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = pathlib.Path(tmp_dir) / "runtime.conf"
+            for name, text in cases.items():
+                with self.subTest(name=name):
+                    path.write_text(text, encoding="utf-8")
+                    with self.assertRaises(service_paths.ConfigurationError):
+                        service_paths.read_config(path)
+
+    def test_runtime_config_write_is_complete_and_owner_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = pathlib.Path(tmp_dir)
+            path = root / "config" / "bola" / "runtime.conf"
+            service_paths.write_config(
+                {"codex_dir": root / "codex", "output_dir": root / "output"},
+                path,
+            )
+            text = path.read_text(encoding="utf-8")
+            directory_mode = stat.S_IMODE(path.parent.stat().st_mode)
+            file_mode = stat.S_IMODE(path.stat().st_mode)
+
+        self.assertEqual(
+            text,
+            f"schema_version=1\ncodex_dir={root / 'codex'}\noutput_dir={root / 'output'}\n",
+        )
+        self.assertEqual(directory_mode, 0o700)
+        self.assertEqual(file_mode, 0o600)
+
+    def test_runtime_config_failed_replace_preserves_previous_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = pathlib.Path(tmp_dir)
+            path = root / "runtime.conf"
+            service_paths.write_config({"codex_dir": root / "a", "output_dir": root / "output-a"}, path)
+            before = path.read_bytes()
+
+            with (
+                mock.patch.object(service_paths.os, "replace", side_effect=OSError("simulated replace failure")),
+                self.assertRaises(OSError),
+            ):
+                service_paths.write_config({"codex_dir": root / "b", "output_dir": root / "output-b"}, path)
+
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(list(root.glob(".runtime.conf.*.tmp")), [])
+
+    def test_paths_show_names_runtime_config_explicitly(self) -> None:
+        cli = load_module("paths_runtime_config_name_test", ROOT / "scripts" / "bola.py")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_home = pathlib.Path(tmp_dir) / "config"
+            with mock.patch.dict(cli.os.environ, {"XDG_CONFIG_HOME": str(config_home)}, clear=True):
+                report = cli.paths_report()
+
+        self.assertEqual(report["runtime_config_path"], str(config_home / "bola" / "runtime.conf"))
+        self.assertEqual(report["effective"]["runtime_config_path"], str(config_home / "bola" / "runtime.conf"))
+        self.assertFalse(report["exists"])
 
     def test_legacy_environment_name_fails_closed_with_mapping(self) -> None:
         cli = load_module("legacy_environment_name_test", ROOT / "scripts" / "bola.py")
@@ -229,7 +405,7 @@ class CliContractTests(unittest.TestCase):
             payload = json.loads(captured.getvalue())
             self.assertEqual(code, 2)
             self.assertEqual(payload["error"], "legacy_config_unsupported")
-            self.assertEqual(payload["mappings"], {str(legacy): str(config_home / "bola" / "config.json")})
+            self.assertEqual(payload["mappings"], {str(legacy): str(config_home / "bola" / "runtime.conf")})
             self.assertEqual(neighbor.read_text(encoding="utf-8"), "do-not-touch\n")
 
     def test_paths_set_switches_output_and_records_pending_migration(self) -> None:
@@ -544,6 +720,20 @@ class CliContractTests(unittest.TestCase):
             self.assertTrue((active / "reports" / "new.txt").exists())
             self.assertFalse((source / "raw").exists())
             self.assertIsNone(transition)
+
+    def test_paths_migrate_excludes_root_error_log_from_raw_sources(self) -> None:
+        cli = load_module("paths_migration_source_filter_test", ROOT / "scripts" / "bola.py")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source = pathlib.Path(tmp_dir) / "A"
+            source.mkdir(parents=True)
+            raw_log = source / "prompt-usage.raw.jsonl"
+            error_log = source / "prompt-usage-errors.jsonl"
+            raw_log.write_text("{}\n", encoding="utf-8")
+            error_log.write_text('{"error":"append_failed"}\n', encoding="utf-8")
+
+            sources = cli.raw_migration_sources(source)
+
+        self.assertEqual(sources, [raw_log.resolve()])
 
     def test_paths_migrate_accepts_only_explicit_degraded_exit_one(self) -> None:
         cli = load_module("paths_migration_process_result_test", ROOT / "scripts" / "bola.py")
@@ -1001,7 +1191,7 @@ class CliContractTests(unittest.TestCase):
             self.assertEqual(payload["reason"], "not_found")
             self.assertFalse(codex_dir.exists())
             self.assertFalse(output_dir.exists())
-            self.assertFalse((config_home / "bola" / "config.json").exists())
+            self.assertFalse((config_home / "bola" / "runtime.conf").exists())
 
     def test_install_hook_rejects_missing_codex_cli_before_any_mutation(self) -> None:
         cli = load_module("install_hook_invalid_cli_test", ROOT / "scripts" / "bola.py")
@@ -1023,7 +1213,7 @@ class CliContractTests(unittest.TestCase):
             self.assertEqual(payload["error"], "codex_cli_invalid")
             self.assertEqual(payload["reason"], "not_found")
             self.assertFalse((codex_dir / "hooks.json").exists())
-            self.assertFalse((config_home / "bola" / "config.json").exists())
+            self.assertFalse((config_home / "bola" / "runtime.conf").exists())
 
     def test_hook_runtime_status_checks_import_outside_checkout_without_pythonpath(self) -> None:
         cli = load_module("hook_runtime_status_test", ROOT / "scripts" / "bola.py")
@@ -1069,7 +1259,7 @@ class CliContractTests(unittest.TestCase):
             self.assertEqual(payload["error"], "hook_runtime_invalid")
             self.assertEqual(payload["reason"], "module_not_importable")
             self.assertFalse((codex_dir / "hooks.json").exists())
-            self.assertFalse((config_home / "bola" / "config.json").exists())
+            self.assertFalse((config_home / "bola" / "runtime.conf").exists())
 
     def test_paths_set_rejects_uninitialized_codex_dir_without_writing_config(self) -> None:
         cli = load_module("paths_set_invalid_codex_dir_test", ROOT / "scripts" / "bola.py")
@@ -1132,12 +1322,51 @@ class CliContractTests(unittest.TestCase):
             ):
                 code = cli.main()
 
-            configured = json.loads((config_home / "bola" / "config.json").read_text(encoding="utf-8"))
+            configured = cli.service_paths.read_config(config_home / "bola" / "runtime.conf")
             self.assertEqual(code, 0)
             self.assertEqual(configured["codex_dir"], str(codex_dir))
             self.assertEqual(configured["output_dir"], str(output_dir))
             self.assertFalse(output_dir.exists())
             self.assertTrue((codex_dir / "hooks.json").exists())
+
+    def test_install_hook_restores_hooks_when_runtime_config_write_fails(self) -> None:
+        cli = load_module("install_hook_config_rollback_test", ROOT / "scripts" / "bola.py")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = pathlib.Path(tmp_dir)
+            codex_dir = self.initialize_codex_dir(root / ".codex")
+            output_dir = root / "output"
+            config_home = root / "config"
+            hooks_path = codex_dir / "hooks.json"
+            original = '{"hooks":{"Notification":[{"command":"keep"}]}}\n'
+            hooks_path.write_text(original, encoding="utf-8")
+            captured = io.StringIO()
+            with (
+                mock.patch.dict(
+                    cli.os.environ,
+                    {
+                        "XDG_CONFIG_HOME": str(config_home),
+                        "CODEX_HOME": str(codex_dir),
+                        "BOLA_OUTPUT_DIR": str(output_dir),
+                    },
+                    clear=True,
+                ),
+                mock.patch.object(cli, "codex_cli_status", return_value=self.valid_codex_cli_status()),
+                mock.patch.object(cli, "hook_runtime_status", return_value=self.valid_hook_runtime_status()),
+                mock.patch.object(
+                    cli.service_paths,
+                    "write_config",
+                    side_effect=cli.service_paths.ConfigurationError("simulated config write failure"),
+                ),
+                mock.patch.object(cli.sys, "argv", ["bola.py", "install-hook"]),
+                mock.patch.object(cli.sys, "stdout", captured),
+            ):
+                code = cli.main()
+            final_hooks = hooks_path.read_text(encoding="utf-8")
+            config_exists = (config_home / "bola" / "runtime.conf").exists()
+
+        self.assertEqual(code, 2)
+        self.assertEqual(final_hooks, original)
+        self.assertFalse(config_exists)
 
     def test_install_hook_registers_repo_hook_and_keeps_hooks_json_owner_only(self) -> None:
         cli = load_module("install_hook_cli_test", ROOT / "scripts" / "bola.py")
@@ -1283,10 +1512,12 @@ class CliContractTests(unittest.TestCase):
             before_files = {str(path.relative_to(codex_dir)): (path.read_bytes(), path.stat().st_mtime_ns) for path in codex_dir.rglob("*") if path.is_file()}
             captured = io.StringIO()
             with (
+                mock.patch.dict(cli.os.environ, {"XDG_CONFIG_HOME": str(pathlib.Path(tmp_dir) / "config")}, clear=False),
                 mock.patch.object(cli, "codex_cli_status", return_value=self.valid_codex_cli_status()),
                 mock.patch.object(cli.sys, "stdout", captured),
             ):
-                code = cli.doctor(argparse.Namespace(codex_dir=str(codex_dir), output_dir=str(base)))
+                cli.service_paths.write_config({"codex_dir": codex_dir, "output_dir": base})
+                code = cli.doctor(argparse.Namespace(codex_dir=str(codex_dir), output_dir=str(base), json_output=True))
             after_files = {str(path.relative_to(codex_dir)): (path.read_bytes(), path.stat().st_mtime_ns) for path in codex_dir.rglob("*") if path.is_file()}
 
         report = json.loads(captured.getvalue())
@@ -1296,6 +1527,131 @@ class CliContractTests(unittest.TestCase):
         self.assertTrue(report["runtime"]["hooks_json"]["events"]["UserPromptSubmit"]["registered"])
         self.assertTrue(report["runtime"]["hooks_json"]["events"]["Stop"]["registered"])
         self.assertEqual(before_files, after_files)
+
+    def test_doctor_defaults_to_human_summary_with_actions(self) -> None:
+        cli = load_module("doctor_human_output_test", ROOT / "scripts" / "bola.py")
+        report = {
+            "codex_dir": {"path": "/tmp/codex", "valid": True},
+            "codex_cli": {"valid": True, "version": "codex-cli 1.0.0"},
+            "output_dir": {"path": "/tmp/output", "exists": True},
+            "analytics_db": {"path": "/tmp/output/analytics/bola.sqlite", "exists": True, "bytes": 1024},
+            "runtime": {
+                "hooks_json": {
+                    "events": {
+                        "UserPromptSubmit": {"registered": True},
+                        "Stop": {"registered": True},
+                    }
+                },
+                "recovery": {
+                    "last_error": {"code": "error:raw_append_failed", "age_seconds": 3600},
+                },
+            },
+            "health": {
+                "status": "degraded",
+                "exit_code": 1,
+                "issues": [
+                    {
+                        "code": "recent_hook_errors",
+                        "severity": "degraded",
+                        "count": 2,
+                        "errors": {"error:raw_append_failed": 2},
+                    },
+                    {
+                        "code": "unacknowledged_quarantine",
+                        "severity": "degraded",
+                        "count": 1,
+                        "occurrences": 3,
+                        "by_kind": {"invalid_json": 1},
+                    },
+                ],
+            },
+        }
+        captured = io.StringIO()
+        result = cli.doctor_service.DoctorResult(report=report, exit_code=1)
+
+        with (
+            mock.patch.object(cli.doctor_service, "run_doctor", return_value=result),
+            mock.patch.object(cli.sys, "stdout", captured),
+        ):
+            code = cli.doctor(argparse.Namespace(codex_dir=None, output_dir=None, json_output=False))
+
+        output = captured.getvalue()
+        self.assertEqual(code, 1)
+        self.assertIn("BOLA Doctor: DEGRADED", output)
+        self.assertIn("[OK] Codex hooks: Stop, UserPromptSubmit", output)
+        self.assertIn("[WARN] Recent hook writes failed", output)
+        self.assertIn("Errors: raw_append_failed (2)", output)
+        self.assertIn("Last occurrence: raw_append_failed, 1h ago", output)
+        self.assertIn("Run: bola quarantine list", output)
+        self.assertIn("Full report: bola doctor --json", output)
+        self.assertNotIn('"runtime":', output)
+        self.assertNotIn("\x1b", output)
+
+    def test_doctor_json_preserves_complete_report(self) -> None:
+        cli = load_module("doctor_json_output_test", ROOT / "scripts" / "bola.py")
+        report = {
+            "runtime": {"detail": {"nested": True}},
+            "health": {"status": "healthy", "exit_code": 0, "issues": []},
+        }
+        captured = io.StringIO()
+        result = cli.doctor_service.DoctorResult(report=report, exit_code=0)
+
+        with (
+            mock.patch.object(cli.doctor_service, "run_doctor", return_value=result),
+            mock.patch.object(cli.sys, "stdout", captured),
+        ):
+            code = cli.doctor(argparse.Namespace(codex_dir=None, output_dir=None, json_output=True))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(captured.getvalue()), report)
+
+    def test_doctor_renderer_covers_all_health_issue_codes_and_unknown_fallback(self) -> None:
+        cli = load_module("doctor_issue_rendering_contract_test", ROOT / "scripts" / "bola.py")
+        expected = {
+            "runtime_config_missing",
+            "codex_dir_invalid",
+            "codex_cli_invalid",
+            "runtime_status_invalid",
+            "current_segment_state_invalid",
+            "hooks_config_invalid",
+            "hook_registration_missing",
+            "stale_hook_registration",
+            "normalize_pending_publish_recovery_required",
+            "pending_recovery_state",
+            "recent_hook_errors",
+            "stale_analytics_temp_files",
+            "retention_pruned_store_invalid",
+            "cleanup_retention_job_invalid",
+            "retention_checkpoint_invalid",
+            "service_lock_state_invalid",
+            "path_transition_invalid",
+            "retention_pruned_store_migration_required",
+            "retention_pruned_state_recovery_ready",
+            "retention_pruned_state_resolution_required",
+            "retention_pruned_state_pending",
+            "retention_pruned_state_orphaned",
+            "stale_retention_checkpoints",
+            "quarantine_state_invalid",
+            "unacknowledged_quarantine",
+        }
+        self.assertEqual(cli.doctor_renderer.known_issue_codes(), expected)
+
+        output = cli.doctor_renderer.render_doctor_report(
+            {
+                "health": {
+                    "status": "failed",
+                    "issues": [{"code": "future_health_signal", "severity": "failed", "count": 7}],
+                }
+            }
+        )
+        self.assertIn("Future health signal (future_health_signal)", output)
+        self.assertIn("Count: 7", output)
+
+    def test_doctor_parser_exposes_explicit_json_mode(self) -> None:
+        cli = load_module("doctor_json_parser_test", ROOT / "scripts" / "bola.py")
+
+        self.assertFalse(cli.parse_args(["doctor"]).json_output)
+        self.assertTrue(cli.parse_args(["doctor", "--json"]).json_output)
 
     def test_doctor_classifies_retention_pending_lifecycle(self) -> None:
         cli = load_module("doctor_retention_lifecycle_test", ROOT / "scripts" / "bola.py")
@@ -1373,7 +1729,7 @@ class CliContractTests(unittest.TestCase):
                 mock.patch.object(cli, "codex_cli_status", return_value=self.valid_codex_cli_status()),
                 mock.patch.object(cli.sys, "stdout", captured),
             ):
-                code = cli.doctor(argparse.Namespace(codex_dir=str(codex_dir), output_dir=str(base)))
+                code = cli.doctor(argparse.Namespace(codex_dir=str(codex_dir), output_dir=str(base), json_output=True))
 
         report = json.loads(captured.getvalue())
         self.assertEqual(code, 2)
@@ -1433,11 +1789,13 @@ class CliContractTests(unittest.TestCase):
             captured = io.StringIO()
 
             with (
+                mock.patch.dict(cli.os.environ, {"XDG_CONFIG_HOME": str(pathlib.Path(tmp_dir) / "config")}, clear=False),
                 mock.patch.object(cli, "codex_cli_status", return_value=self.valid_codex_cli_status()),
                 mock.patch.object(cli.time, "time", return_value=now),
                 mock.patch.object(cli.sys, "stdout", captured),
             ):
-                code = cli.doctor(argparse.Namespace(codex_dir=str(codex_dir), output_dir=str(base)))
+                cli.service_paths.write_config({"codex_dir": codex_dir, "output_dir": base})
+                code = cli.doctor(argparse.Namespace(codex_dir=str(codex_dir), output_dir=str(base), json_output=True))
 
         report = json.loads(captured.getvalue())
         issue_codes = {issue["code"] for issue in report["health"]["issues"]}
@@ -1504,7 +1862,7 @@ class CliContractTests(unittest.TestCase):
                 mock.patch.object(cli, "codex_cli_status", return_value=invalid_cli),
                 mock.patch.object(cli.sys, "stdout", captured),
             ):
-                code = cli.doctor(argparse.Namespace(codex_dir=str(codex_dir), output_dir=str(root / "output")))
+                code = cli.doctor(argparse.Namespace(codex_dir=str(codex_dir), output_dir=str(root / "output"), json_output=True))
 
         report = json.loads(captured.getvalue())
         self.assertEqual(code, 2)
@@ -1545,11 +1903,11 @@ class CliContractTests(unittest.TestCase):
     def test_config_schema_persists_codex_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = pathlib.Path(tmp_dir)
-            path = root / "config.json"
+            path = root / "runtime.conf"
             service_paths.write_config({"codex_dir": root / "codex"}, path)
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = service_paths.read_config(path)
 
-        self.assertEqual(payload["schema_version"], 3)
+        self.assertEqual(payload["schema_version"], 1)
         self.assertEqual(payload["codex_dir"], str(root / "codex"))
 
     def test_cli_serve_rejects_removed_allow_network_option(self) -> None:
@@ -1590,7 +1948,7 @@ class CliContractTests(unittest.TestCase):
         captured = io.StringIO()
 
         with mock.patch.object(cli.sys, "stdout", captured):
-            code = cli.retention_prune(argparse.Namespace(codex_dir=None, output=None, cutoff="not-a-date", preview_signature="sig"))
+            code = cli.retention_prune(argparse.Namespace(codex_dir=None, output_dir=None, cutoff="not-a-date", preview_signature="sig"))
 
         payload = json.loads(captured.getvalue())
         self.assertEqual(code, 2)
@@ -1602,37 +1960,16 @@ class CliContractTests(unittest.TestCase):
 
         self.assertEqual(cli.parse_cutoff("2026-05-20"), cli.parse_cutoff("2026-05-20T00:00:00+00:00"))
 
-    def test_pipeline_rejects_output_outside_service_analytics_before_lock(self) -> None:
-        cli = load_module("pipeline_output_owner_guard_test", ROOT / "scripts" / "bola.py")
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            codex_dir = pathlib.Path(tmp_dir) / ".codex"
-            external = pathlib.Path(tmp_dir) / "external.sqlite"
-            args = argparse.Namespace(
-                codex_dir=str(codex_dir),
-                output=str(external),
-                state_db=None,
-                project_root=None,
-                incremental=True,
-                recover=False,
-                skip_rotate=False,
-            )
-
-            with mock.patch.object(cli.service_lock, "acquire_service_lock", side_effect=AssertionError("pipeline must reject output before acquiring lock")):
-                with self.assertRaises(ValueError):
-                    cli.pipeline(args)
-
-    def test_retention_prune_rejects_output_outside_service_analytics_before_lock(self) -> None:
-        cli = load_module("retention_prune_output_owner_guard_test", ROOT / "scripts" / "bola.py")
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            codex_dir = pathlib.Path(tmp_dir) / ".codex"
-            external = pathlib.Path(tmp_dir) / "external.sqlite"
-            args = argparse.Namespace(codex_dir=str(codex_dir), output=str(external), cutoff="2026-05-20", preview_signature="sig")
-
-            with mock.patch.object(
-                cli.service_lock, "acquire_service_lock", side_effect=AssertionError("retention-prune must reject output before acquiring lock")
-            ):
-                with self.assertRaises(ValueError):
-                    cli.retention_prune(args)
+    def test_per_file_analytics_output_options_are_not_public(self) -> None:
+        cli = load_module("analytics_output_option_contract_test", ROOT / "scripts" / "bola.py")
+        for command in ("build", "pipeline", "retention-prune"):
+            arguments = [command]
+            if command == "retention-prune":
+                arguments.extend(("--cutoff", "2026-05-20"))
+            with self.subTest(command=command):
+                with self.assertRaises(SystemExit) as raised:
+                    cli.parse_args([*arguments, "--output", "/tmp/external.sqlite"])
+                self.assertEqual(raised.exception.code, 2)
 
     def test_retention_prune_outputs_partial_mutation_envelope_last_after_normalize_failure(self) -> None:
         cli = load_module("retention_prune_partial_mutation_last_json_test", ROOT / "scripts" / "bola.py")
@@ -1705,10 +2042,12 @@ class CliContractTests(unittest.TestCase):
                 build.parse_args()
 
     def test_dashboard_rebuild_does_not_buffer_child_output_in_pipes(self) -> None:
-        source = (ROOT / "scripts" / "dashboard_rebuild_api.py").read_text(encoding="utf-8")
-        self.assertNotIn("stdout=subprocess.PIPE", source)
-        self.assertNotIn("stderr=subprocess.PIPE", source)
-        self.assertIn("tempfile.TemporaryFile", source)
+        for relative in ("scripts/dashboard_rebuild_api.py", "scripts/dashboard_cleanup_api.py"):
+            source = (ROOT / relative).read_text(encoding="utf-8")
+            self.assertNotIn("stdout=subprocess.PIPE", source)
+            self.assertNotIn("stderr=subprocess.PIPE", source)
+            self.assertIn("tempfile.TemporaryFile", source)
+            self.assertIn("dir=tmp_dir", source)
 
     def test_compat_facades_do_not_mutate_submodule_globals(self) -> None:
         for relative in ("scripts/raw_segments.py", "scripts/dashboard_cleanup.py"):

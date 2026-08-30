@@ -1,12 +1,9 @@
-import { fmt, money, state } from './core.js';
+import { money, state } from './core.js';
 import { esc } from './ui.js';
 import {
-  clearInteractiveRowSelection,
   detailMetric,
   focusActiveViewRow,
-  handleListArrowFocus,
   refreshScrollFades,
-  setInteractiveRowSelected,
   setPanelContent,
   table,
 } from './dom.js';
@@ -27,6 +24,8 @@ import {
   toolDisplay,
   toolOutputTokens,
 } from './formatters.js';
+import { createPager } from './components/pager.js';
+import { createListDetailView } from './components/list-detail-view.js';
 
 export function createOverviewRenderers({
   params,
@@ -43,30 +42,46 @@ const LIST_PAGER_IDS = {
   projects: 'projects-pager',
   tools: 'tool-output-pager',
 };
-
-function markPendingSelection(selector, row) {
-  const previous = document.querySelector(`${selector}.selected`);
-  clearInteractiveRowSelection(selector);
-  setInteractiveRowSelected(row, true);
-  return previous;
-}
-
-function restorePendingSelection(selector, previous) {
-  clearInteractiveRowSelection(selector);
-  if (!previous || !previous.isConnected) return;
-  setInteractiveRowSelected(previous, true);
-}
+const listPagerPayloads = { projects: null, tools: null };
+const listPagers = Object.fromEntries(Object.entries(LIST_PAGER_IDS).map(([key, rootId]) => [
+  key,
+  createPager({
+    rootId,
+    onPageChange: page => {
+      const payload = listPagerPayloads[key];
+      if (listIsServerPaged(payload)) {
+        requestListPage(key, page);
+      } else {
+        state.listPages[key] = page;
+        renderListPage(key);
+      }
+    },
+  }),
+]));
 
 function clearListPagers() {
-  Object.values(LIST_PAGER_IDS).forEach(id => {
-    const pager = document.getElementById(id);
-    if (pager) pager.innerHTML = '';
-  });
+  Object.values(listPagers).forEach(pager => pager.clear());
+}
+
+function setListPagerBusy(key, busy) {
+  listPagers[key]?.setBusy(busy);
 }
 
 function listPayloadRows(payload) {
   if (Array.isArray(payload)) return payload;
   return (payload || {}).rows || [];
+}
+
+function costCompact(value) {
+  return value === null || value === undefined ? '<span class="token-unavailable-value">—</span>' : compactNumberSpan(value, 'money');
+}
+
+function costText(value) {
+  return value === null || value === undefined ? '—' : compactNumber(value, 'money');
+}
+
+function costExact(value) {
+  return value === null || value === undefined ? 'Cost rate is not configured for every turn' : exactNumber(value, 'money');
 }
 
 function listIsServerPaged(payload) {
@@ -125,29 +140,8 @@ function renderListPager(key, total) {
     ? Math.max(1, Math.min(Number((payload || {}).page || state.listPages[key] || 1), Math.max(1, Math.ceil(totalRows / perPage))))
     : clampedListPage(key, totalRows, perPage);
   state.listPages[key] = page;
-  const pageCount = Math.max(1, Math.ceil(totalRows / perPage));
-  const start = totalRows ? (page - 1) * perPage + 1 : 0;
-  const end = Math.min(totalRows, page * perPage);
-  const pager = document.getElementById(LIST_PAGER_IDS[key]);
-  if (!pager) return;
-  pager.innerHTML = `
-    <button data-list-page="prev" ${page <= 1 ? 'disabled' : ''}>Prev</button>
-    <span class="page-status">${fmt.format(start)}-${fmt.format(end)} / ${fmt.format(totalRows)}</span>
-    <button data-list-page="next" ${page >= pageCount ? 'disabled' : ''}>Next</button>
-  `;
-  pager.querySelectorAll('[data-list-page]').forEach(button => {
-    button.addEventListener('click', () => {
-      const direction = button.dataset.listPage === 'next' ? 1 : -1;
-      const nextPage = Math.max(1, Math.min(Number(state.listPages[key] || 1) + direction, pageCount));
-      if (nextPage === state.listPages[key]) return;
-      if (serverPaged) {
-        requestListPage(key, nextPage);
-      } else {
-        state.listPages[key] = nextPage;
-        renderListPage(key);
-      }
-    });
-  });
+  listPagerPayloads[key] = payload;
+  listPagers[key]?.render({ page, total: totalRows, perPage });
 }
 
 function overviewSessionLabel(row) {
@@ -160,7 +154,7 @@ function renderSessionDetail(data) {
     <tr>
       <td class="truncate-cell" title="${esc(r.workflow || '')}">${esc(r.workflow || '(unlabeled)')}</td>
       <td class="truncate-cell" title="${esc(r.category || '')}">${esc(r.category || '(unlabeled)')}</td>
-      <td class="num">${compactNumberSpan(r.credits || 0, 'money')}</td>
+      <td class="num">${costCompact(r.credits)}</td>
       <td class="num">${compactNumberSpan(r.turns || 0)}</td>
     </tr>
   `);
@@ -175,7 +169,7 @@ function renderSessionDetail(data) {
     <tr>
       <td class="truncate-cell" title="${esc(r.confidence || '')}">${esc(confidenceLabel(r.confidence))}</td>
       <td class="num">${compactNumberSpan(r.rows || 0)}</td>
-      <td class="num">${compactNumberSpan(r.child_credits || 0, 'money')}</td>
+      <td class="num">${costCompact(r.child_credits)}</td>
       <td class="num">${compactNumberSpan(r.child_raw || 0)}</td>
     </tr>
   `);
@@ -183,13 +177,13 @@ function renderSessionDetail(data) {
     <tr class="session-detail-turn">
       <td class="truncate-cell" title="${esc(r.prompt_preview || '')}">${esc(r.prompt_preview || '(prompt text not stored)')}</td>
       <td>${statusLabel(r.turn_status)}</td>
-      <td class="num">${compactNumberSpan(r.credits || 0, 'money')}</td>
+      <td class="num">${costCompact(r.credits)}</td>
       <td class="num">${compactNumberSpan(r.raw || 0)}</td>
     </tr>
   `);
   return `
     <div class="session-detail-summary">
-      ${detailMetric('Cost Units', compactNumber(summary.credits || 0, 'money'), '', exactNumber(summary.credits || 0, 'money'))}
+      ${detailMetric('Cost Units', costText(summary.credits), '', costExact(summary.credits))}
       ${detailMetric('Total Tokens', compactNumber(summary.raw || 0), '', exactNumber(summary.raw || 0))}
       ${detailMetric('Cached Ratio', money.format((summary.cached_ratio || 0) * 100) + '%')}
       ${detailMetric('Turns', compactNumber(summary.turns || 0), '', exactNumber(summary.turns || 0))}
@@ -220,8 +214,6 @@ function sessionDetailPath(sessionId) {
 }
 
 function commitSessionRow(row, detail) {
-  clearInteractiveRowSelection('#projects tr[data-session-id]');
-  setInteractiveRowSelected(row, true);
   state.selectedSession = row.dataset.sessionId || '';
   const label = row.dataset.sessionLabel || compactSessionId(state.selectedSession) || '(unknown)';
   setPanelContent('session-detail', renderSessionDetail(detail));
@@ -229,53 +221,22 @@ function commitSessionRow(row, detail) {
   refreshScrollFades();
 }
 
-async function selectSessionRow(row, preparedDetail) {
-  clearQueryStatus();
-  const sessionId = row.dataset.sessionId || '';
-  const path = sessionDetailPath(sessionId);
-  const seq = ++state.sessionSeq;
-  if (preparedDetail !== undefined) {
-    commitSessionRow(row, preparedDetail);
-    return;
-  }
-  const cached = peekCachedJSON(path);
-  if (cached.hit) {
-    commitSessionRow(row, cached.data);
-    return;
-  }
-  const previous = markPendingSelection('#projects tr[data-session-id]', row);
-  const previousStatus = document.getElementById('session-detail-status').textContent;
-  row.setAttribute('aria-busy', 'true');
-  try {
-    const detail = await getCachedJSON(path);
-    if (seq !== state.sessionSeq || !row.isConnected) return;
-    commitSessionRow(row, detail);
-  } catch (err) {
-    if (seq === state.sessionSeq && row.isConnected) {
-      restorePendingSelection('#projects tr[data-session-id]', previous);
-      document.getElementById('session-detail-status').textContent = previousStatus;
-      if (!previous || !previous.isConnected) {
-        state.selectedSession = '';
-        document.getElementById('session-detail-status').textContent = 'error';
-        setPanelContent('session-detail', esc(err.message || err), 'error');
-      }
-      showQueryError(err.message || err);
-      refreshScrollFades();
-    }
-  } finally {
-    if (row.isConnected) row.removeAttribute('aria-busy');
-  }
-}
-
-function selectFirstVisibleSessionRow(row) {
-  if (row) {
-    row.click();
-    return;
-  }
-  state.selectedSession = '';
-  document.getElementById('session-detail-status').textContent = 'none';
-  setPanelContent('session-detail', 'No rows for the current filter.', 'empty');
-}
+const sessionDetailView = createListDetailView({
+  rowSelector: '#projects tr[data-session-id]',
+  buttonSelector: '#projects tr[data-session-id] .row-select-button',
+  detailId: 'session-detail',
+  statusId: 'session-detail-status',
+  keyForRow: row => row.dataset.sessionId || '',
+  pathForRow: row => sessionDetailPath(row.dataset.sessionId || ''),
+  nextRequestSequence: () => ++state.sessionSeq,
+  isCurrentRequest: sequence => sequence === state.sessionSeq,
+  commit: commitSessionRow,
+  reset: () => { state.selectedSession = ''; },
+  getCachedJSON,
+  peekCachedJSON,
+  clearQueryStatus,
+  showQueryError,
+});
 
 function renderToolDetail(data) {
   const summary = data.summary || {};
@@ -314,8 +275,6 @@ function toolDetailPath(toolName) {
 }
 
 function commitToolRow(row, detail) {
-  clearInteractiveRowSelection('#tool-output tr[data-tool]');
-  setInteractiveRowSelected(row, true);
   const toolName = row.dataset.tool || '';
   state.selectedTool = toolName;
   document.getElementById('tool-detail-status').textContent = `${compactNumber((detail.summary || {}).calls || 0)} calls`;
@@ -324,53 +283,22 @@ function commitToolRow(row, detail) {
   refreshScrollFades();
 }
 
-async function selectToolRow(row, preparedDetail) {
-  clearQueryStatus();
-  const toolName = row.dataset.tool || '';
-  const path = toolDetailPath(toolName);
-  const seq = ++state.toolSeq;
-  if (preparedDetail !== undefined) {
-    commitToolRow(row, preparedDetail);
-    return;
-  }
-  const cached = peekCachedJSON(path);
-  if (cached.hit) {
-    commitToolRow(row, cached.data);
-    return;
-  }
-  const previous = markPendingSelection('#tool-output tr[data-tool]', row);
-  const previousStatus = document.getElementById('tool-detail-status').textContent;
-  row.setAttribute('aria-busy', 'true');
-  try {
-    const detail = await getCachedJSON(path);
-    if (seq !== state.toolSeq || !row.isConnected) return;
-    commitToolRow(row, detail);
-  } catch (err) {
-    if (seq === state.toolSeq && row.isConnected) {
-      restorePendingSelection('#tool-output tr[data-tool]', previous);
-      document.getElementById('tool-detail-status').textContent = previousStatus;
-      if (!previous || !previous.isConnected) {
-        state.selectedTool = '';
-        document.getElementById('tool-detail-status').textContent = 'error';
-        setPanelContent('tool-detail', esc(err.message || err), 'error');
-      }
-      showQueryError(err.message || err);
-      refreshScrollFades();
-    }
-  } finally {
-    if (row.isConnected) row.removeAttribute('aria-busy');
-  }
-}
-
-function selectFirstVisibleToolRow(row) {
-  if (row) {
-    row.click();
-    return;
-  }
-  state.selectedTool = '';
-  document.getElementById('tool-detail-status').textContent = 'none';
-  setPanelContent('tool-detail', 'No rows for the current filter.', 'empty');
-}
+const toolDetailView = createListDetailView({
+  rowSelector: '#tool-output tr[data-tool]',
+  buttonSelector: '#tool-output tr[data-tool] .row-select-button',
+  detailId: 'tool-detail',
+  statusId: 'tool-detail-status',
+  keyForRow: row => row.dataset.tool || '',
+  pathForRow: row => toolDetailPath(row.dataset.tool || ''),
+  nextRequestSequence: () => ++state.toolSeq,
+  isCurrentRequest: sequence => sequence === state.toolSeq,
+  commit: commitToolRow,
+  reset: () => { state.selectedTool = ''; },
+  getCachedJSON,
+  peekCachedJSON,
+  clearQueryStatus,
+  showQueryError,
+});
 
 function renderSubagentDetail(data) {
   const summary = data.summary || {};
@@ -378,16 +306,17 @@ function renderSubagentDetail(data) {
   const rows = data.rows || [];
   const sessionRows = sessions.map(r => {
     const rows = Number(r.rows || 0);
-    const childCredits = Number(r.child_credits || 0);
-    const avgCost = rows ? childCredits / rows : 0;
-    return `<tr><td class="truncate-cell session-label-cell" title="${esc(sessionDetailLabel(r))}">${sessionLabelMarkup(r)}</td><td class="num">${compactNumberSpan(rows)}</td><td class="num">${compactNumberSpan(avgCost, 'money')}</td><td class="num">${compactNumberSpan(childCredits, 'money')}</td><td class="num">${compactNumberSpan(r.child_raw || 0)}</td><td class="num">${pct(childCredits, Number(summary.child_credits || 0))}</td></tr>`;
+    const childCredits = r.child_credits === null || r.child_credits === undefined ? null : Number(r.child_credits);
+    const avgCost = childCredits === null ? null : (rows ? childCredits / rows : 0);
+    const share = childCredits === null || summary.child_credits === null || summary.child_credits === undefined ? '—' : pct(childCredits, Number(summary.child_credits));
+    return `<tr><td class="truncate-cell session-label-cell" title="${esc(sessionDetailLabel(r))}">${sessionLabelMarkup(r)}</td><td class="num">${compactNumberSpan(rows)}</td><td class="num">${costCompact(avgCost)}</td><td class="num">${costCompact(childCredits)}</td><td class="num">${compactNumberSpan(r.child_raw || 0)}</td><td class="num">${share}</td></tr>`;
   });
   const childRows = rows.map(r => {
     const childLabel = r.child_agent_nickname || r.child_agent_role || shortSession(r.child_session_id || '');
     return `<tr>
       <td class="truncate-cell session-label-cell" title="${esc(sessionDetailLabel(r))}">${sessionLabelMarkup(r)}</td>
       <td class="truncate-cell" title="${esc(childLabel + ' / ' + (r.prompt_preview || ''))}">${esc(r.prompt_preview || childLabel || '(prompt text not stored)')}</td>
-      <td class="num">${compactNumberSpan(r.child_credits || 0, 'money')}</td>
+      <td class="num">${costCompact(r.child_credits)}</td>
       <td class="num">${compactNumberSpan(r.child_raw || 0)}</td>
     </tr>`;
   });
@@ -396,7 +325,7 @@ function renderSubagentDetail(data) {
       <div class="detail-grid tool-detail-grid">
         <div class="detail-cell tool-name-cell"><div class="value attribution-method-value" title="${esc(confidenceDisplay(summary.confidence))}"><span class="method-name">${esc(confidenceLabel(summary.confidence))}</span><span class="method-desc">${esc(confidenceDescription(summary.confidence))}</span></div></div>
         ${detailMetric('Rows', compactNumber(summary.rows || 0), '', exactNumber(summary.rows || 0))}
-        ${detailMetric('Child Cost Units', compactNumber(summary.child_credits || 0, 'money'), '', exactNumber(summary.child_credits || 0, 'money'))}
+        ${detailMetric('Child Cost Units', costText(summary.child_credits), '', costExact(summary.child_credits))}
         ${detailMetric('Child Tokens', compactNumber(summary.child_raw || 0), '', exactNumber(summary.child_raw || 0))}
       </div>
       <div class="tool-detail-section-title">Session Distribution</div>
@@ -416,8 +345,6 @@ function subagentDetailPath(confidence) {
 }
 
 function commitSubagentRow(row, detail) {
-  clearInteractiveRowSelection('#subagent-rollups tr[data-confidence]');
-  setInteractiveRowSelected(row, true);
   const confidence = row.dataset.confidence || '';
   state.selectedSubagentConfidence = confidence;
   document.getElementById('subagent-detail-status').textContent = `${compactNumber((detail.summary || {}).rows || 0)} rows`;
@@ -425,53 +352,22 @@ function commitSubagentRow(row, detail) {
   refreshScrollFades();
 }
 
-async function selectSubagentRow(row, preparedDetail) {
-  clearQueryStatus();
-  const confidence = row.dataset.confidence || '';
-  const path = subagentDetailPath(confidence);
-  const seq = ++state.subagentSeq;
-  if (preparedDetail !== undefined) {
-    commitSubagentRow(row, preparedDetail);
-    return;
-  }
-  const cached = peekCachedJSON(path);
-  if (cached.hit) {
-    commitSubagentRow(row, cached.data);
-    return;
-  }
-  const previous = markPendingSelection('#subagent-rollups tr[data-confidence]', row);
-  const previousStatus = document.getElementById('subagent-detail-status').textContent;
-  row.setAttribute('aria-busy', 'true');
-  try {
-    const detail = await getCachedJSON(path);
-    if (seq !== state.subagentSeq || !row.isConnected) return;
-    commitSubagentRow(row, detail);
-  } catch (err) {
-    if (seq === state.subagentSeq && row.isConnected) {
-      restorePendingSelection('#subagent-rollups tr[data-confidence]', previous);
-      document.getElementById('subagent-detail-status').textContent = previousStatus;
-      if (!previous || !previous.isConnected) {
-        state.selectedSubagentConfidence = '';
-        document.getElementById('subagent-detail-status').textContent = 'error';
-        setPanelContent('subagent-mix', esc(err.message || err), 'error');
-      }
-      showQueryError(err.message || err);
-      refreshScrollFades();
-    }
-  } finally {
-    if (row.isConnected) row.removeAttribute('aria-busy');
-  }
-}
-
-function selectFirstVisibleSubagentRow(row) {
-  if (row) {
-    row.click();
-    return;
-  }
-  state.selectedSubagentConfidence = '';
-  document.getElementById('subagent-detail-status').textContent = 'none';
-  setPanelContent('subagent-mix', 'No rows for the current filter.', 'empty');
-}
+const subagentDetailView = createListDetailView({
+  rowSelector: '#subagent-rollups tr[data-confidence]',
+  buttonSelector: '#subagent-rollups tr[data-confidence] .row-select-button',
+  detailId: 'subagent-mix',
+  statusId: 'subagent-detail-status',
+  keyForRow: row => row.dataset.confidence || '',
+  pathForRow: row => subagentDetailPath(row.dataset.confidence || ''),
+  nextRequestSequence: () => ++state.subagentSeq,
+  isCurrentRequest: sequence => sequence === state.subagentSeq,
+  commit: commitSubagentRow,
+  reset: () => { state.selectedSubagentConfidence = ''; },
+  getCachedJSON,
+  peekCachedJSON,
+  clearQueryStatus,
+  showQueryError,
+});
 
 function renderSessionList(payload, prepared = null) {
   const rows = listPayloadRows(payload);
@@ -481,28 +377,17 @@ function renderSessionList(payload, prepared = null) {
     [{label:'Session', sort:'session'}, {label:'Cost Units', sort:'credits', cls:'num'}, {label:'Total Tokens', sort:'raw', cls:'num'}, {label:'Turns', sort:'turns', cls:'num'}],
     paginateListRows('projects', payload).map(r => {
       const label = overviewSessionLabel(r);
-      return `<tr data-session-id="${esc(r.session_id || '')}" data-session-label="${esc(label)}"><td class="truncate-cell session-label-cell" title="${esc(label)}"><button type="button" class="row-select-button" aria-pressed="false" aria-label="Select session ${esc(label)}">${sessionLabelMarkup(r)}</button></td><td class="num">${compactNumberSpan(r.credits, 'money')}</td><td class="num">${compactNumberSpan(r.raw)}</td><td class="num">${compactNumberSpan(r.turns)}</td></tr>`;
+      return `<tr data-session-id="${esc(r.session_id || '')}" data-session-label="${esc(label)}"><td class="truncate-cell session-label-cell" title="${esc(label)}"><button type="button" class="row-select-button" aria-pressed="false" aria-label="Select session ${esc(label)}">${sessionLabelMarkup(r)}</button></td><td class="num">${costCompact(r.credits)}</td><td class="num">${compactNumberSpan(r.raw)}</td><td class="num">${compactNumberSpan(r.turns)}</td></tr>`;
     }),
     listTableSortState('projects')
   ));
   renderListPager('projects', payload);
   bindListSortButtons('projects', 'projects');
-  document.querySelectorAll('#projects tr[data-session-id]').forEach(row => {
-    row.addEventListener('click', () => selectSessionRow(row));
+  sessionDetailView.bindRows();
+  sessionDetailView.activateRendered({
+    isSelected: row => row.dataset.sessionId === state.selectedSession,
+    prepared,
   });
-  document.querySelectorAll('#projects tr[data-session-id] .row-select-button').forEach(button => {
-    button.addEventListener('keydown', event => handleListArrowFocus(event, '#projects tr[data-session-id] .row-select-button', true));
-  });
-  const visibleSession = [...document.querySelectorAll('#projects tr[data-session-id]')]
-    .find(row => row.dataset.sessionId === state.selectedSession);
-  const firstSession = document.querySelector('#projects tr[data-session-id]');
-  const target = visibleSession || firstSession;
-  if (target && prepared?.error && prepared.key === target.dataset.sessionId) {
-    state.selectedSession = '';
-    document.getElementById('session-detail-status').textContent = 'error';
-    setPanelContent('session-detail', esc(prepared.error.message || prepared.error), 'error');
-  } else if (target && prepared && prepared.key === target.dataset.sessionId) selectSessionRow(target, prepared.data);
-  else selectFirstVisibleSessionRow(target);
   focusActiveViewRow({replacedControl});
 }
 
@@ -518,22 +403,11 @@ function renderToolList(payload, prepared = null) {
   ));
   renderListPager('tools', payload);
   bindListSortButtons('tool-output', 'tools');
-  document.querySelectorAll('#tool-output tr[data-tool]').forEach(row => {
-    row.addEventListener('click', () => selectToolRow(row));
+  toolDetailView.bindRows();
+  toolDetailView.activateRendered({
+    isSelected: row => row.dataset.tool === state.selectedTool,
+    prepared,
   });
-  document.querySelectorAll('#tool-output tr[data-tool] .row-select-button').forEach(button => {
-    button.addEventListener('keydown', event => handleListArrowFocus(event, '#tool-output tr[data-tool] .row-select-button', true));
-  });
-  const visibleTool = [...document.querySelectorAll('#tool-output tr[data-tool]')]
-    .find(row => row.dataset.tool === state.selectedTool);
-  const firstTool = document.querySelector('#tool-output tr[data-tool]');
-  const target = visibleTool || firstTool;
-  if (target && prepared?.error && prepared.key === target.dataset.tool) {
-    state.selectedTool = '';
-    document.getElementById('tool-detail-status').textContent = 'error';
-    setPanelContent('tool-detail', esc(prepared.error.message || prepared.error), 'error');
-  } else if (target && prepared && prepared.key === target.dataset.tool) selectToolRow(target, prepared.data);
-  else selectFirstVisibleToolRow(target);
   focusActiveViewRow({replacedControl});
 }
 
@@ -542,26 +416,15 @@ function renderSubagentList(rows, prepared = null) {
   state.listRows.subagents = rows || [];
   setPanelContent('subagent-rollups', table(
     [{label:'Attribution Method', sort:'confidence'}, {label:'Rows', sort:'rows', cls:'num'}, {label:'Cost Units', sort:'child_credits', cls:'num'}, {label:'Tokens', sort:'child_raw', cls:'num'}],
-    (rows || []).map(r => `<tr data-confidence="${esc(r.confidence || '')}"><td title="${esc(r.confidence)}"><button type="button" class="row-select-button" aria-pressed="false" aria-label="Select attribution ${esc(confidenceLabel(r.confidence))}"><span>${esc(confidenceLabel(r.confidence))}</span><span class="mobile-row-meta">${compactNumber(r.child_credits, 'money')} cost · ${compactNumber(r.child_raw)} tokens</span></button></td><td class="num">${compactNumberSpan(r.rows)}</td><td class="num">${compactNumberSpan(r.child_credits, 'money')}</td><td class="num">${compactNumberSpan(r.child_raw)}</td></tr>`),
+    (rows || []).map(r => `<tr data-confidence="${esc(r.confidence || '')}"><td title="${esc(r.confidence)}"><button type="button" class="row-select-button" aria-pressed="false" aria-label="Select attribution ${esc(confidenceLabel(r.confidence))}"><span>${esc(confidenceLabel(r.confidence))}</span><span class="mobile-row-meta">${costText(r.child_credits)} cost · ${compactNumber(r.child_raw)} tokens</span></button></td><td class="num">${compactNumberSpan(r.rows)}</td><td class="num">${costCompact(r.child_credits)}</td><td class="num">${compactNumberSpan(r.child_raw)}</td></tr>`),
     listTableSortState('subagents')
   ));
   bindListSortButtons('subagent-rollups', 'subagents');
-  document.querySelectorAll('#subagent-rollups tr[data-confidence]').forEach(row => {
-    row.addEventListener('click', () => selectSubagentRow(row));
+  subagentDetailView.bindRows();
+  subagentDetailView.activateRendered({
+    isSelected: row => row.dataset.confidence === state.selectedSubagentConfidence,
+    prepared,
   });
-  document.querySelectorAll('#subagent-rollups tr[data-confidence] .row-select-button').forEach(button => {
-    button.addEventListener('keydown', event => handleListArrowFocus(event, '#subagent-rollups tr[data-confidence] .row-select-button', true));
-  });
-  const visibleSubagent = [...document.querySelectorAll('#subagent-rollups tr[data-confidence]')]
-    .find(row => row.dataset.confidence === state.selectedSubagentConfidence);
-  const firstSubagent = document.querySelector('#subagent-rollups tr[data-confidence]');
-  const target = visibleSubagent || firstSubagent;
-  if (target && prepared?.error && prepared.key === target.dataset.confidence) {
-    state.selectedSubagentConfidence = '';
-    document.getElementById('subagent-detail-status').textContent = 'error';
-    setPanelContent('subagent-mix', esc(prepared.error.message || prepared.error), 'error');
-  } else if (target && prepared && prepared.key === target.dataset.confidence) selectSubagentRow(target, prepared.data);
-  else selectFirstVisibleSubagentRow(target);
   focusActiveViewRow({replacedControl});
 }
 
@@ -571,5 +434,6 @@ return {
   renderSessionList,
   renderToolList,
   renderSubagentList,
+  setListPagerBusy,
 };
 }

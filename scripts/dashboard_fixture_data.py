@@ -79,6 +79,7 @@ def write_dashboard_fixture(output_dir: pathlib.Path, *, now_unix: float | None 
         output = 180 + index * 7
         input_tokens = total - output
         non_cached = max(0, input_tokens - cached)
+        weighted_credits = non_cached * 1.25 + cached * 0.125 + output * 10
         session_id = "11111111-2222-3333-4444-555555555555" if index < 6 else "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         turns.append(
             (
@@ -109,8 +110,10 @@ def write_dashboard_fixture(output_dir: pathlib.Path, *, now_unix: float | None 
                 total,
                 cached / input_tokens if input_tokens else 0.0,
                 2 if index < 3 else 1,
-                non_cached + cached * 0.1 + output * 6,
-                non_cached + output,
+                weighted_credits,
+                round(weighted_credits * 1_000_000),
+                "configured",
+                "2025-11-13",
                 "development",
                 "dashboard-check",
                 f"/tmp/transcript-{index:02d}.jsonl",
@@ -125,9 +128,9 @@ def write_dashboard_fixture(output_dir: pathlib.Path, *, now_unix: float | None 
           prompt_preview, prompt_sha256, prompt_chars, prompt_lines, code_block_chars,
           assistant_chars, input_tokens, cached_input_tokens, non_cached_input_tokens,
           output_tokens, reasoning_output_tokens, total_tokens, cached_ratio,
-          model_call_count, weighted_credits, uncached_input_equivalent, category,
-          workflow, transcript_path, started_at_unix
-        ) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+          model_call_count, weighted_credits, cost_pico_usd, cost_rate_status,
+          cost_rate_effective_from, category, workflow, transcript_path, started_at_unix
+        ) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         turns,
     )
@@ -159,11 +162,11 @@ def write_dashboard_fixture(output_dir: pathlib.Path, *, now_unix: float | None 
     ]
     con.executemany("insert into tool_call_summaries values (?,?,?,?,?,?,?,?,?,?,?,?)", tool_summaries)
     tool_samples = [
-        (turns[0][0], turns[0][1], "call-1", "exec_command", "functions", "largest_output", 1, _iso(now - 3630), _iso(now - 3610), 20, 1200, 0, 310, "completed", 0, "fixture command output"),
-        (turns[0][0], turns[0][1], "call-2", "apply_patch", "functions", "largest_output", 1, _iso(now - 3605), _iso(now - 3590), 15, 260, 0, 80, "completed", 0, "fixture patch output"),
-        (turns[1][0], turns[1][1], "call-3", "exec_command", "functions", "largest_output", 2, _iso(now - 7230), _iso(now - 7200), 30, 900, 0, 220, "completed", 0, "fixture second output"),
+        (turns[0][0], turns[0][1], "call-1", "exec_command", "functions", "largest_output", 1, _iso(now - 3630), _iso(now - 3610), 20, 1200, 0, 310, "completed", 0),
+        (turns[0][0], turns[0][1], "call-2", "apply_patch", "functions", "largest_output", 1, _iso(now - 3605), _iso(now - 3590), 15, 260, 0, 80, "completed", 0),
+        (turns[1][0], turns[1][1], "call-3", "exec_command", "functions", "largest_output", 2, _iso(now - 7230), _iso(now - 7200), 30, 900, 0, 220, "completed", 0),
     ]
-    con.executemany("insert into tool_call_samples values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", tool_samples)
+    con.executemany("insert into tool_call_samples values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", tool_samples)
     con.execute(
         "insert into task_rollups values (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (

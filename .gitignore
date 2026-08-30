@@ -26,4 +26,6 @@ reviews/tmp/
 
 # Local browser verification artifacts
 *.png
+!docs/assets/dashboard/*.png
+!scripts/assets/bola-icon.png
 *.log

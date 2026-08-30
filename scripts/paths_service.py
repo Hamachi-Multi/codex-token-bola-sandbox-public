@@ -141,7 +141,7 @@ def require_migration_process_result(
 def public_runtime_paths(paths: service_paths.RuntimePaths) -> dict[str, str]:
     return {
         "project_root": str(paths.project_root),
-        "config_path": str(paths.config_path),
+        "runtime_config_path": str(paths.runtime_config_path),
         "codex_dir": str(paths.codex_dir),
         "output_dir": str(paths.output_dir),
     }
@@ -209,11 +209,11 @@ def paths_report() -> dict[str, object]:
             "source_file_count": len(managed_content_files(source)),
         }
     return {
-        "config_path": str(service_paths.config_path()),
-        "exists": service_paths.config_path().exists(),
+        "runtime_config_path": str(service_paths.runtime_config_path()),
+        "exists": service_paths.runtime_config_path().exists(),
         "configured": public_config(configured),
         "effective": public_runtime_paths(effective),
-        "precedence": ["cli", "environment", "config", "defaults"],
+        "precedence": ["cli", "environment", "runtime_config", "defaults"],
         "overrides": {
             "codex_dir": "CODEX_HOME" if os.environ.get("CODEX_HOME") else None,
             "output_dir": service_paths.OUTPUT_DIR_ENV if os.environ.get(service_paths.OUTPUT_DIR_ENV) else None,
@@ -397,17 +397,20 @@ def run_paths_set(options: PathsSetOptions, dependencies: PathsSetDependencies) 
     validate_persistent_path_updates(requested)
     with service_paths.acquire_path_lock(blocking=False):
         recover_preparing_path_transition()
+        runtime_config_path = service_paths.runtime_config_path()
+        runtime_config_exists = runtime_config_path.exists()
         current = service_paths.resolve_runtime_paths()
         target_codex = pathlib.Path(requested.get("codex_dir", current.codex_dir)).expanduser().resolve(strict=False)
         requested_output = pathlib.Path(requested.get("output_dir", current.output_dir)).expanduser()
         target_output = requested_output.resolve(strict=False)
-        codex_changed = target_codex != current.codex_dir
-        output_changed = target_output != current.output_dir
-        if codex_changed:
+        codex_changed = runtime_config_exists and target_codex != current.codex_dir
+        output_changed = runtime_config_exists and target_output != current.output_dir
+        if not runtime_config_exists or "codex_dir" in requested:
             dependencies.validate_codex_dir(target_codex)
             dependencies.validate_codex_cli()
-        if output_changed:
+        if not runtime_config_exists or "output_dir" in requested:
             validate_output_dir_target(requested_output)
+        if output_changed:
             validate_migration_roots(current.output_dir, target_output)
 
         previous_transition = service_paths.load_path_transition()
@@ -431,7 +434,7 @@ def run_paths_set(options: PathsSetOptions, dependencies: PathsSetDependencies) 
         target_hook_path = target_codex / "hooks.json"
         source_hook_snapshot = source_hook_path.read_bytes() if source_hook_path.exists() else None
         target_hook_snapshot = target_hook_path.read_bytes() if target_hook_path.exists() else None
-        config_before = service_paths.read_config()
+        runtime_config_snapshot = runtime_config_path.read_bytes() if runtime_config_path.exists() else None
         transition_before = previous_transition
         handoff: dict[str, object] = {"files": 0, "bytes": 0, "created": [], "sources": []}
         next_transition: service_paths.PathTransition | None = None
@@ -456,10 +459,12 @@ def run_paths_set(options: PathsSetOptions, dependencies: PathsSetDependencies) 
                     )
                     service_paths.write_path_transition(next_transition)
 
-                next_config = dict(config_before)
-                next_config.pop("schema_version", None)
-                next_config.update({key: str(pathlib.Path(value).expanduser().resolve(strict=False)) for key, value in requested.items()})
-                service_paths.write_config(next_config)
+                service_paths.write_config(
+                    {
+                        "codex_dir": target_codex,
+                        "output_dir": target_output,
+                    }
+                )
 
                 if next_transition is not None:
                     pending_transition = next_transition.mark_pending()
@@ -485,7 +490,7 @@ def run_paths_set(options: PathsSetOptions, dependencies: PathsSetDependencies) 
                         )
                         service_paths.write_path_transition(pending)
                     raise service_paths.ConfigurationError(f"path update failed and hook state rollback requires recovery: {recovery_exc}") from exc
-                service_paths.write_config({key: value for key, value in config_before.items() if key != "schema_version"})
+                restore_file_snapshot(runtime_config_path, runtime_config_snapshot)
                 if transition_before is None:
                     service_paths.clear_path_transition()
                 else:
@@ -584,7 +589,9 @@ def raw_migration_sources(source: pathlib.Path, *, recover: bool = True) -> list
         paths.extend(raw_segments.current_segment_paths(source, kind="prompt_usage"))
     except raw_segments.ManifestError as exc:
         raise service_paths.ConfigurationError(f"invalid source raw segment state at {source}: {exc}") from exc
-    paths.extend(sorted(source.glob("prompt-usage*.jsonl")))
+    legacy_root_raw = source / raw_segments.PROMPT_RAW_NAME
+    if legacy_root_raw.is_file() and not legacy_root_raw.is_symlink():
+        paths.append(legacy_root_raw)
     raw_root = source / "raw"
     if raw_root.exists():
         paths.extend(sorted(raw_root.rglob("*.jsonl")))
@@ -893,11 +900,10 @@ def apply_output_migration(
                 dependencies.run_command(RuntimeCommand.NORMALIZE, [], destination_env),
                 allow_degraded=True,
             )
-            output = destination / "analytics" / "bola.sqlite"
             build_result = require_migration_process_result(
                 dependencies.run_command(
                     RuntimeCommand.BUILD,
-                    ["--output", str(output)],
+                    [],
                     destination_env,
                 ),
                 allow_degraded=False,

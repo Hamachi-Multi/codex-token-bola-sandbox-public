@@ -56,6 +56,84 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertEqual(queries.int_query({"page": ["-2"]}, "page", 1, 1, 100), 1)
         self.assertEqual(queries.int_query({"per_page": ["500"]}, "per_page", 25, 1, 100), 100)
 
+    def test_cost_rates_payload_prioritizes_detected_models_and_reports_coverage(self) -> None:
+        api = load_module("dashboard_cost_rates_payload_test", ROOT / "scripts" / "dashboard_cost_rates_api.py")
+        schema = load_module("dashboard_cost_rates_schema_test", ROOT / "scripts" / "build_analytics_schema.py")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = pathlib.Path(tmp_dir)
+            db_path = root / "analytics.sqlite"
+            config_path = root / "cost-rates.json"
+            con = sqlite3.connect(db_path)
+            schema.setup_db(con)
+            con.executemany(
+                """
+                insert into turns (
+                  session_id, turn_id, captured_at_unix, started_at_unix,
+                  model, estimated, weighted_credits, cost_rate_status
+                ) values (?, ?, ?, ?, ?, 0, ?, ?)
+                """,
+                [
+                    ("s1", "t1", 1_775_001_600, 1_775_001_600, "gpt-5.5", None, "unconfigured"),
+                    ("s2", "t2", 1_785_542_400, 1_785_542_400, "gpt-5.6-terra", 2.0, "configured"),
+                    ("s3", "t3", 1_785_542_400, 1_785_542_400, None, None, "unconfigured"),
+                ],
+            )
+            con.commit()
+            con.close()
+
+            payload = api.cost_rates_payload(config_path=config_path, db_path=db_path)
+            by_model = {row["model_id"]: row for row in payload["models"]}
+
+            self.assertEqual([row["model_id"] for row in payload["models"][:3]], ["gpt-5.5", "gpt-5.6-terra", "unknown"])
+            self.assertEqual(by_model["gpt-5.5"]["status"], "configured")
+            self.assertFalse(by_model["gpt-5.5"]["coverage_required"])
+            self.assertTrue(by_model["gpt-5.5"]["current"]["is_default"])
+            self.assertIsNone(by_model["gpt-5.5"]["current"]["effective_from"])
+            self.assertEqual(by_model["gpt-5.6-terra"]["status"], "configured")
+            self.assertFalse(by_model["gpt-5.6-terra"]["coverage_required"])
+            self.assertEqual(by_model["unknown"]["status"], "unavailable")
+            gpt_56_history = by_model["gpt-5.6"]["history"]
+            self.assertFalse(next(rate for rate in gpt_56_history if rate["is_default"])["deletable"])
+            self.assertTrue(next(rate for rate in gpt_56_history if rate["effective_from"] == "2026-08-21")["deletable"])
+            self.assertTrue(payload["rebuild_required"])
+
+            con = sqlite3.connect(db_path)
+            con.execute(
+                "insert or replace into run_metadata values (?, ?)",
+                ("cost_rate_catalog_digest", json.dumps(payload["catalog_digest"])),
+            )
+            con.commit()
+            con.close()
+            current = api.cost_rates_payload(config_path=config_path, db_path=db_path)
+            self.assertFalse(current["rebuild_required"])
+
+    def test_dashboard_cost_totals_use_exact_per_turn_cost_units(self) -> None:
+        queries = load_module("dashboard_queries_exact_cost_test", ROOT / "scripts" / "dashboard_queries.py")
+        schema = load_module("dashboard_schema_exact_cost_test", ROOT / "scripts" / "build_analytics_schema.py")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = pathlib.Path(tmp_dir) / "analytics.sqlite"
+            con = sqlite3.connect(db_path)
+            schema.setup_db(con)
+            con.executemany(
+                """
+                insert into turns (
+                  session_id, turn_id, started_at_unix, estimated,
+                  weighted_credits, cost_pico_usd, cost_rate_status
+                ) values (?, ?, ?, 0, ?, ?, 'configured')
+                """,
+                [
+                    ("s1", "t1", 1.0, 99.0, 1_000_001),
+                    ("s1", "t2", 2.0, 88.0, 2_000_002),
+                ],
+            )
+            con.commit()
+            con.row_factory = sqlite3.Row
+            payload = queries.DashboardQueries(con, {"days": ["0"]}).summary_payload()
+            con.close()
+
+        self.assertEqual(payload["weighted_credits"], 3.000003)
+        self.assertTrue(payload["cost_complete"])
+
     def test_turn_date_scope_and_order_use_prompt_start_not_recovery_capture(self) -> None:
         queries = load_module("dashboard_queries_prompt_time_test", ROOT / "scripts" / "dashboard_queries.py")
         schema = load_module("dashboard_schema_prompt_time_test", ROOT / "scripts" / "build_analytics_schema.py")
@@ -162,27 +240,23 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
         ):
             serve.main()
 
-    def test_server_rejects_external_analytics_db_before_bind(self) -> None:
+    def test_server_ignores_removed_analytics_db_environment_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             codex_dir = pathlib.Path(tmp_dir) / ".codex"
+            output_dir = pathlib.Path(tmp_dir) / "output"
             external_db = pathlib.Path(tmp_dir) / "outside.sqlite"
             with mock.patch.dict(
                 "os.environ",
-                {"CODEX_HOME": str(codex_dir), "BOLA_ANALYTICS_DB": str(external_db)},
+                {
+                    "CODEX_HOME": str(codex_dir),
+                    "BOLA_OUTPUT_DIR": str(output_dir),
+                    "BOLA_ANALYTICS_DB": str(external_db),
+                },
                 clear=False,
             ):
                 serve = load_module("serve_dashboard_external_db_guard_test", ROOT / "scripts" / "serve_dashboard.py")
 
-        def fail_server(*_args, **_kwargs):
-            raise AssertionError("server must not bind before analytics DB ownership check")
-
-        with (
-            mock.patch.object(serve.sys, "argv", ["serve_dashboard.py"]),
-            mock.patch.object(serve, "ThreadingHTTPServer", side_effect=fail_server),
-        ):
-            result = serve.main()
-
-        self.assertEqual(result, 2)
+        self.assertEqual(serve.DB_PATH, output_dir / "analytics" / "bola.sqlite")
 
     def test_terminate_rebuild_process_kills_after_grace_timeout(self) -> None:
         serve = load_module("serve_dashboard_cancel_kill_test", ROOT / "scripts" / "serve_dashboard.py")
@@ -1283,7 +1357,7 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
             self.assertEqual(detail["non_cached_input_tokens"], 0)
             self.assertEqual(detail["cached_ratio"], 0)
 
-    def test_session_detail_rollups_return_zero_for_null_numeric_sums(self) -> None:
+    def test_session_detail_rollups_preserve_unpriced_costs(self) -> None:
         queries = load_module("dashboard_queries_session_detail_null_rollup_test", ROOT / "scripts" / "dashboard_queries.py")
         with tempfile.TemporaryDirectory() as tmp_dir:
             db_path = pathlib.Path(tmp_dir) / "analytics.sqlite"
@@ -1302,7 +1376,7 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
             con.close()
 
         self.assertEqual(detail["workflows"][0]["raw"], 0)
-        self.assertEqual(detail["workflows"][0]["credits"], 0)
+        self.assertIsNone(detail["workflows"][0]["credits"])
         null_tool = next(row for row in detail["tools"] if row["tool_name"] == "null-tool")
         self.assertEqual(null_tool["calls"], 0)
         self.assertEqual(null_tool["output_tokens"], 0)
@@ -1388,9 +1462,9 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
             con = sqlite3.connect(db_path)
             con.row_factory = sqlite3.Row
             con.executemany(
-                "insert into tool_call_samples values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "insert into tool_call_samples values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
-                    ("s2", "t2", f"largest-{index}", "exec_command", "exec", "largest_output", 1, None, None, 20 + index, 400 + index, 0, 1000 + index, "completed", 0, "")
+                    ("s2", "t2", f"largest-{index}", "exec_command", "exec", "largest_output", 1, None, None, 20 + index, 400 + index, 0, 1000 + index, "completed", 0)
                     for index in range(12)
                 ],
             )
@@ -1422,7 +1496,9 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertEqual(payload["summary"]["calls"], 2)
         self.assertEqual(payload["summary"]["output_tokens"], 110)
         self.assertEqual([row["session_id"] for row in payload["sessions"]], ["s2", "s1"])
+        self.assertEqual(payload["sessions"][0]["project"], "beta")
         self.assertEqual(len(payload["calls"]), 10)
+        self.assertTrue(all(row["project"] == "beta" for row in payload["calls"]))
         self.assertEqual([row["output_tokens"] for row in payload["calls"]], list(range(1011, 1001, -1)))
 
     def test_tool_payload_returns_zero_for_null_numeric_sums(self) -> None:
@@ -1611,7 +1687,11 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
             ).sessions_payload()
             sessions_by_name = queries.DashboardQueries(
                 con,
-                {"days": ["0"], "session_sort": ["session"], "session_sort_dir": ["asc"], "sessions_page": ["1"], "per_page": ["2"]},
+                {"days": ["0"], "session_label_mode": ["project"], "session_sort": ["session"], "session_sort_dir": ["asc"], "sessions_page": ["1"], "per_page": ["2"]},
+            ).sessions_payload()
+            sessions_by_thread = queries.DashboardQueries(
+                con,
+                {"days": ["0"], "session_label_mode": ["thread"], "session_sort": ["session"], "session_sort_dir": ["asc"], "sessions_page": ["1"], "per_page": ["2"]},
             ).sessions_payload()
             tools_by_calls = queries.DashboardQueries(
                 con,
@@ -1625,7 +1705,8 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
 
         self.assertEqual([row["session_id"] for row in sessions_by_raw["rows"]], ["s1"])
         self.assertEqual(sessions_by_raw["total"], 2)
-        self.assertEqual([row["session_id"] for row in sessions_by_name["rows"]], ["s2", "s1"])
+        self.assertEqual([row["session_id"] for row in sessions_by_name["rows"]], ["s1", "s2"])
+        self.assertEqual([row["session_id"] for row in sessions_by_thread["rows"]], ["s2", "s1"])
         self.assertEqual([row["tool_name"] for row in tools_by_calls["rows"]], ["apply_patch", "exec_command", "view_image"])
         self.assertEqual([row["tool_name"] for row in tools_by_share["rows"]], ["apply_patch", "exec_command", "view_image"])
 
@@ -1677,11 +1758,12 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertEqual([row["session_id"] for row in payload["sessions"]["rows"]], ["s2", "s1"])
         self.assertEqual(payload["sessions"]["rows"][0]["thread_name"], "")
         self.assertEqual(payload["sessions"]["rows"][0]["cwd"], "/example/.codex/codex-token-bola")
+        self.assertEqual(payload["sessions"]["rows"][0]["project"], "beta")
         self.assertEqual(payload["sessions"]["rows"][1]["thread_name"], "zulu")
-        self.assertNotIn("project", payload["sessions"]["rows"][0])
         self.assertEqual(payload["turns"]["rows"][0]["cwd"], "/example/.codex/codex-token-bola")
         self.assertEqual(detail["summary"]["session_id"], "s2")
         self.assertEqual(detail["summary"]["thread_name"], "")
+        self.assertEqual(detail["summary"]["project"], "beta")
         self.assertEqual(detail["summary"]["cwd"], "/example/.codex/codex-token-bola")
         self.assertEqual(detail["summary"]["turns"], 1)
         self.assertIn("<h2>Overview</h2>", DASHBOARD_ASSET_BUNDLE)
@@ -1719,6 +1801,7 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertEqual(filtered["rows"][0]["session_id"], "s1")
         self.assertEqual([row["session_id"] for row in options["rows"]], ["s2", "s1"])
         self.assertEqual(options["rows"][1]["thread_name"], "zulu")
+        self.assertEqual(options["rows"][1]["project"], "alpha")
         self.assertEqual(options["limit"], 50)
         self.assertFalse(options["has_more"])
     def test_session_options_are_server_filtered_and_limited(self) -> None:
@@ -1829,12 +1912,12 @@ class DashboardApiQueryTests(DashboardFixtureMixin, unittest.TestCase):
         self.assertEqual(payload["sessions"][0]["session_id"], "parent")
         self.assertEqual(payload["sessions"][0]["thread_name"], "")
         self.assertEqual(payload["sessions"][0]["cwd"], "/example/.codex/codex-token-bola")
-        self.assertNotIn("project", payload["sessions"][0])
+        self.assertEqual(payload["sessions"][0]["project"], "alpha")
         self.assertEqual(payload["rows"][0]["parent_turn_id"], "pruned-parent")
         self.assertEqual(payload["rows"][0]["session_id"], "parent")
         self.assertEqual(payload["rows"][0]["thread_name"], "")
         self.assertEqual(payload["rows"][0]["cwd"], "/example/.codex/codex-token-bola")
-        self.assertNotIn("project", payload["rows"][0])
+        self.assertEqual(payload["rows"][0]["project"], "alpha")
         self.assertEqual(payload["rows"][0]["prompt_preview"], "")
 
     def test_subagent_payload_uses_full_filtered_scope(self) -> None:

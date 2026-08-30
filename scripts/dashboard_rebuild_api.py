@@ -16,6 +16,7 @@ import dashboard_managed_process
 import dashboard_operation_state as operation_state
 import progress_control
 import service_lock
+import service_paths
 
 
 AUTO_COMPACT_MIN_BYTES = 64 * 1024 * 1024
@@ -85,7 +86,6 @@ class DashboardRebuildApiMixin:
                 phase_progress=0.0,
             )
             script = self.dashboard_script_dir() / "bola.py"
-            output = self._dashboard_db_path().expanduser().resolve()
             cmd = [
                 sys.executable,
                 str(script),
@@ -94,15 +94,16 @@ class DashboardRebuildApiMixin:
                 str(self.dashboard_codex_dir()),
                 "--output-dir",
                 str(self.dashboard_output_dir()),
-                "--output",
-                str(output),
                 "--incremental",
                 "--recover",
             ]
             env = service_lock.scrub_lock_env(os.environ.copy())
             env["BOLA_CANCEL_FILE"] = str(cancel_file)
             env["BOLA_PROGRESS_FILE"] = str(progress_file)
-            with tempfile.TemporaryFile("w+", encoding="utf-8") as stdout_file, tempfile.TemporaryFile("w+", encoding="utf-8") as stderr_file:
+            tmp_dir = service_paths.ensure_output_tmp_dir(self.dashboard_output_dir())
+            with tempfile.TemporaryFile("w+", encoding="utf-8", dir=tmp_dir) as stdout_file, tempfile.TemporaryFile(
+                "w+", encoding="utf-8", dir=tmp_dir
+            ) as stderr_file:
                 process = dashboard_managed_process.ManagedProcess.start(
                     cmd,
                     kind="analysis",

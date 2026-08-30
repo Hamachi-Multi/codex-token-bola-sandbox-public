@@ -47,6 +47,18 @@ def assert_true(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
+def set_dashboard_select(page, selector: str, value: str) -> None:
+    page.locator(selector).evaluate(
+        """
+        (element, value) => {
+          element.value = value;
+          element.dispatchEvent(new Event('change', {bubbles: true}));
+        }
+        """,
+        value,
+    )
+
+
 def open_dashboard(page, base_url: str, *, path: str = "") -> None:
     page.goto(f"{base_url}{path}", wait_until="domcontentloaded")
     page.wait_for_function(

@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" class="scrollbar-hidden">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -8,9 +8,9 @@
 	    (() => {
 	      try {
 	        const settings = JSON.parse(localStorage.getItem('bola-dashboard-settings') || '{}') || {};
-	        const storedTheme = settings.themeMode === 'dark' || settings.themeMode === 'light' ? settings.themeMode : '';
+	        const storedTheme = ['system', 'light', 'dark'].includes(settings.themeMode) ? settings.themeMode : 'system';
 	        const systemTheme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-	        document.documentElement.dataset.theme = storedTheme || systemTheme;
+	        document.documentElement.dataset.theme = storedTheme === 'system' ? systemTheme : storedTheme;
 	      } catch {
 	        document.documentElement.dataset.theme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
 	      }
@@ -18,33 +18,22 @@
 	  </script>
   <link rel="stylesheet" href="/assets/dashboard.css">
 </head>
-<body>
+<body class="scrollbar-hidden">
   <header class="appbar">
     <div class="brand-nav">
-      <h1>Codex Token Bola</h1>
-      <nav class="page-nav" aria-label="Dashboard pages">
-        <button class="nav-btn active" data-view-target="overview">Overview</button>
-        <button class="nav-btn" data-view-target="turns">Turns</button>
-        <button class="nav-btn" data-view-target="tools">Tools</button>
-        <button class="nav-btn" data-view-target="subagents">Subagents</button>
-        <button class="nav-btn" data-view-target="cleanup">Cleanup</button>
-      </nav>
-      <div class="theme-switcher">
-        <div class="theme-toggle" role="group" aria-label="Theme mode">
-          <button id="theme-light" class="theme-toggle-button active" type="button" data-theme-mode="light" aria-pressed="true" title="Light mode" aria-label="Light mode">
-            <svg class="theme-toggle-icon theme-toggle-sun" viewBox="0 0 24 24" aria-hidden="true">
-              <circle class="theme-toggle-sun-core" cx="12" cy="12" r="3.8"></circle>
-              <path d="M12 2.25v2.4M12 19.35v2.4M4.9 4.9l1.7 1.7M17.4 17.4l1.7 1.7M2.25 12h2.4M19.35 12h2.4M4.9 19.1l1.7-1.7M17.4 6.6l1.7-1.7"></path>
-            </svg>
-            <span class="theme-toggle-text">Light</span>
-          </button>
-          <button id="theme-dark" class="theme-toggle-button" type="button" data-theme-mode="dark" aria-pressed="false" title="Dark mode" aria-label="Dark mode">
-            <svg class="theme-toggle-icon theme-toggle-moon" viewBox="0 0 24 24" aria-hidden="true">
-              <path class="theme-toggle-moon-crescent" d="M20.35 14.45A7.45 7.45 0 0 1 9.55 3.65 8.45 8.45 0 1 0 20.35 14.45Z"></path>
-            </svg>
-            <span class="theme-toggle-text">Dark</span>
-          </button>
-        </div>
+      <div class="brand-lockup">
+        <img class="brand-icon" src="/assets/bola-icon.png" alt="" width="30" height="30">
+        <h1>Bola</h1>
+      </div>
+      <div class="page-nav-frame" data-can-scroll-left="false" data-can-scroll-right="false">
+        <nav class="page-nav scrollbar-hidden" aria-label="Dashboard pages">
+          <button class="nav-btn active" data-view-target="overview">Overview</button>
+          <button class="nav-btn" data-view-target="turns">Turns</button>
+          <button class="nav-btn" data-view-target="tools">Tools</button>
+          <button class="nav-btn" data-view-target="subagents">Subagents</button>
+          <button class="nav-btn" data-view-target="cleanup">Cleanup</button>
+          <button class="nav-btn" data-view-target="settings">Settings</button>
+        </nav>
       </div>
     </div>
     <div class="toolbar">
@@ -70,16 +59,6 @@
           <button id="custom-days-apply" class="toolbar-custom-apply" type="button">Apply</button>
         </div>
       </div>
-      <div class="control">
-        <label class="sr-only" for="turn-page-size">Rows per page for Turns, Overview, and Tools</label>
-        <select id="turn-page-size" aria-label="Rows per page for Turns, Overview, and Tools" title="Rows per page for Turns, Overview, and Tools">
-          <option value="10">10 Rows</option>
-          <option value="25" selected>25 Rows</option>
-          <option value="50">50 Rows</option>
-          <option value="75">75 Rows</option>
-          <option value="100">100 Rows</option>
-        </select>
-      </div>
       <div class="control session-control">
         <label class="sr-only" for="session-search">Session filter</label>
         <div class="session-picker" id="session-picker">
@@ -90,9 +69,13 @@
           </button>
           <div id="session-picker-popover" class="session-picker-popover" hidden>
             <input id="session-search" class="session-search" type="search" autocomplete="off" role="combobox" aria-autocomplete="list" aria-controls="session-options" aria-expanded="false" aria-activedescendant="" aria-label="Search sessions" placeholder="Search sessions">
-            <div id="session-options" class="session-options" role="listbox"></div>
+            <div id="session-options" class="session-options scrollbar-hidden" role="listbox"></div>
           </div>
         </div>
+      </div>
+      <div id="service-activity" class="service-activity" role="status" aria-live="polite" hidden>
+        <span class="service-activity-dot" aria-hidden="true"></span>
+        <span data-service-activity-label></span>
       </div>
       <button id="refresh" class="primary">Refresh</button>
       <button id="rebuild" class="secondary analyze-button" data-analyze-state="idle" type="button">
@@ -107,8 +90,8 @@
     <section class="view active" data-view="overview">
       <section class="metric-strip" id="summary"></section>
       <section class="overview-grid">
-        <div class="panel"><div class="panel-head"><h2>Overview</h2><span class="hint">credits</span></div><div id="projects" class="list-panel-body"></div><div class="list-footer"><div class="pager" id="projects-pager"></div></div></div>
-        <div class="panel"><div class="panel-head"><h2>Session Detail</h2><span class="hint" id="session-detail-status">select a session</span></div><div id="session-detail" class="empty">Select a row to inspect details.</div></div>
+        <div class="panel"><div class="panel-head"><h2>Overview</h2><span class="hint">credits</span></div><div id="projects" class="list-panel-body scrollbar-hidden"></div><div class="list-footer"><div class="pager" id="projects-pager"></div></div></div>
+        <div class="panel"><div class="panel-head"><h2>Session Detail</h2><span class="hint" id="session-detail-status">select a session</span></div><div id="session-detail" class="empty scrollbar-hidden">Select a row to inspect details.</div></div>
       </section>
     </section>
 
@@ -121,7 +104,7 @@
               <span class="hint" id="turn-count"></span>
             </div>
           </div>
-          <div id="turn-list"></div>
+          <div id="turn-list" class="scrollbar-hidden"></div>
           <div class="turn-list-footer">
             <span class="status-legend" aria-label="Turn status legend">
               <span><i class="completed" aria-hidden="true"></i>Completed</span>
@@ -133,22 +116,22 @@
         </div>
         <aside class="panel inspector">
           <div class="panel-head"><h2>Selected Turn</h2><span class="hint" id="detail-status">none</span></div>
-          <div id="detail" class="empty">Select a row to inspect details.</div>
+          <div id="detail" class="empty scrollbar-hidden">Select a row to inspect details.</div>
         </aside>
       </section>
     </section>
 
     <section class="view" data-view="tools">
       <section class="two-col-layout detail-heavy-layout">
-        <div class="panel"><div class="panel-head"><h2>Tools</h2><span class="hint">tokens</span></div><div id="tool-output" class="list-panel-body"></div><div class="list-footer"><div class="pager" id="tool-output-pager"></div></div></div>
-        <div class="panel"><div class="panel-head"><h2>Tool Detail</h2><span class="hint" id="tool-detail-status">select a row</span></div><div id="tool-detail" class="empty">Select a row to inspect details.</div></div>
+        <div class="panel"><div class="panel-head"><h2>Tools</h2><span class="hint">tokens</span></div><div id="tool-output" class="list-panel-body scrollbar-hidden"></div><div class="list-footer"><div class="pager" id="tool-output-pager"></div></div></div>
+        <div class="panel"><div class="panel-head"><h2>Tool Detail</h2><span class="hint" id="tool-detail-status">select a row</span></div><div id="tool-detail" class="empty scrollbar-hidden">Select a row to inspect details.</div></div>
       </section>
     </section>
 
     <section class="view" data-view="subagents">
       <section class="two-col-layout detail-heavy-layout">
-        <div class="panel"><div class="panel-head"><h2>Subagents</h2><span class="hint">attribution method</span></div><div id="subagent-rollups" class="list-panel-body"></div></div>
-        <div class="panel"><div class="panel-head"><h2>Attribution Detail</h2><span class="hint" id="subagent-detail-status">select a row</span></div><div id="subagent-mix" class="empty">Select a row to inspect details.</div></div>
+        <div class="panel"><div class="panel-head"><h2>Subagents</h2><span class="hint">attribution method</span></div><div id="subagent-rollups" class="list-panel-body scrollbar-hidden"></div></div>
+        <div class="panel"><div class="panel-head"><h2>Attribution Detail</h2><span class="hint" id="subagent-detail-status">select a row</span></div><div id="subagent-mix" class="empty scrollbar-hidden">Select a row to inspect details.</div></div>
       </section>
     </section>
 
@@ -181,7 +164,7 @@
               </div>
               <div class="cleanup-option">
                 <div class="cleanup-retention-label">Keep Recent</div>
-                <div class="cleanup-retention-presets" role="group" aria-label="Retention presets">
+                <div class="cleanup-retention-presets scrollbar-hidden" role="group" aria-label="Retention presets">
                   <button type="button" data-cleanup-retention-preset="all" aria-pressed="false">All Logs</button>
                   <button type="button" data-cleanup-retention-preset="1" aria-pressed="false">1 Day</button>
                   <button type="button" data-cleanup-retention-preset="7" aria-pressed="true">7 Days</button>
@@ -200,7 +183,7 @@
         </div>
         <div class="panel cleanup-files-panel">
           <div class="panel-head"><h2>Retention Impact</h2><span class="hint">Service-managed files</span></div>
-          <div id="cleanup-files" class="loading"><div class="table-scroll"><div class="table-header-shadow" aria-hidden="true"></div><table aria-busy="true" aria-label="Loading cleanup data.">
+          <div id="cleanup-files" class="loading scrollbar-hidden"><div class="table-scroll scrollbar-hidden"><div class="table-header-shadow" aria-hidden="true"></div><table aria-busy="true" aria-label="Loading cleanup data.">
             <colgroup>
               <col class="cleanup-file-col">
               <col class="cleanup-size-col">
@@ -222,39 +205,148 @@
         </div>
       </section>
     </section>
+
+    <section class="view" data-view="settings" aria-label="Settings">
+      <section class="settings-layout scrollbar-hidden">
+        <div class="settings-master-detail">
+          <section class="panel settings-list-panel" aria-labelledby="settings-list-title">
+            <div class="panel-head">
+              <h2 id="settings-list-title">Settings</h2>
+            </div>
+            <div id="settings-list" class="settings-list scrollbar-hidden" data-selected-setting="general">
+              <button class="settings-list-item selected" type="button" data-settings-select="general" aria-pressed="true">
+                <span class="settings-list-name">General</span>
+              </button>
+              <button class="settings-list-item" type="button" data-settings-select="cost-rates" aria-pressed="false">
+                <span class="settings-list-name">Cost Units</span>
+              </button>
+            </div>
+          </section>
+
+          <aside class="panel settings-detail-panel" aria-labelledby="settings-detail-title">
+            <div class="panel-head">
+              <h2 id="settings-detail-title">Selected Setting</h2>
+              <span id="settings-detail-status" class="hint">General</span>
+            </div>
+            <div class="settings-detail scrollbar-hidden">
+              <section class="settings-detail-section settings-general-detail" data-settings-detail="general">
+                <div class="settings-general-row">
+                  <div class="settings-detail-copy">
+                    <h3 id="theme-mode-label">Theme</h3>
+                    <p>Follow the system appearance or use a fixed dashboard theme</p>
+                  </div>
+                  <div class="theme-switcher settings-theme-switcher">
+                    <div class="theme-toggle settings-theme-toggle" role="group" aria-labelledby="theme-mode-label">
+                      <button id="theme-system" class="theme-toggle-button active" type="button" data-theme-mode="system" aria-pressed="true" title="System theme" aria-label="System theme">
+                        <svg class="theme-toggle-icon theme-toggle-system" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="14" rx="2"></rect><path d="M8 22h8M12 18v4"></path></svg>
+                        <span class="theme-toggle-text">System</span>
+                      </button>
+                      <button id="theme-light" class="theme-toggle-button" type="button" data-theme-mode="light" aria-pressed="false" title="Light mode" aria-label="Light mode">
+                        <svg class="theme-toggle-icon theme-toggle-sun" viewBox="0 0 24 24" aria-hidden="true"><circle class="theme-toggle-sun-core" cx="12" cy="12" r="3.8"></circle><path d="M12 2.25v2.4M12 19.35v2.4M4.9 4.9l1.7 1.7M17.4 17.4l1.7 1.7M2.25 12h2.4M19.35 12h2.4M4.9 19.1l1.7-1.7M17.4 6.6l1.7-1.7"></path></svg>
+                        <span class="theme-toggle-text">Light</span>
+                      </button>
+                      <button id="theme-dark" class="theme-toggle-button" type="button" data-theme-mode="dark" aria-pressed="false" title="Dark mode" aria-label="Dark mode">
+                        <svg class="theme-toggle-icon theme-toggle-moon" viewBox="0 0 24 24" aria-hidden="true"><path class="theme-toggle-moon-crescent" d="M20.35 14.45A7.45 7.45 0 0 1 9.55 3.65 8.45 8.45 0 1 0 20.35 14.45Z"></path></svg>
+                        <span class="theme-toggle-text">Dark</span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+                <div class="settings-general-row">
+                  <div class="settings-detail-copy">
+                    <h3>Rows per page</h3>
+                    <p>Control list length in Turns, Overview, and Tools</p>
+                  </div>
+                  <select id="turn-page-size" aria-label="Rows per page for Turns, Overview, and Tools">
+                    <option value="10">10 Rows</option><option value="25" selected>25 Rows</option><option value="50">50 Rows</option><option value="75">75 Rows</option><option value="100">100 Rows</option>
+                  </select>
+                </div>
+                <div class="settings-general-row">
+                  <div class="settings-detail-copy">
+                    <h3>Session label</h3>
+                    <p>Project shows a path such as token/. Thread uses the Codex thread name</p>
+                  </div>
+                  <select id="session-label-mode" aria-label="Session label mode">
+                    <option value="project" selected>Project</option><option value="thread">Thread</option>
+                  </select>
+                </div>
+              </section>
+
+              <section class="settings-detail-section settings-cost-detail" data-settings-detail="cost-rates" hidden>
+                <div class="settings-cost-detail-head">
+                  <span id="cost-rate-model-count" class="hint"></span>
+                  <div class="cost-rate-heading-actions">
+                    <span id="cost-rate-status" class="cost-rate-status" role="status" aria-live="polite"></span>
+                    <button id="cost-rate-recalculate" class="secondary-button compact-button" type="button" disabled>Recalculate</button>
+                    <button id="cost-rate-reset-all" class="secondary-button compact-button" type="button" aria-haspopup="dialog" aria-controls="cost-rate-reset-dialog" disabled>Reset</button>
+                    <button id="cost-rate-add-model" class="secondary-button compact-button cost-rate-add-model-button" type="button" aria-label="Add model" title="Add model" aria-haspopup="dialog" aria-controls="cost-rate-model-dialog" aria-expanded="false"><span aria-hidden="true">+</span></button>
+                  </div>
+                </div>
+                <div id="cost-rate-list" class="cost-rate-list scrollbar-hidden" aria-busy="true">
+                  <div class="cost-rate-loading" aria-hidden="true"></div>
+                  <div class="cost-rate-loading" aria-hidden="true"></div>
+                  <div class="cost-rate-loading" aria-hidden="true"></div>
+                </div>
+              </section>
+            </div>
+          </aside>
+        </div>
+      </section>
+    </section>
   </main>
+  <div id="cost-rate-model-dialog" class="turn-modal" aria-hidden="true">
+    <section id="cost-rate-model-popover" class="turn-modal-dialog cost-rate-model-popover overlay-surface" role="dialog" aria-modal="true" aria-labelledby="cost-rate-model-popover-title" tabindex="-1">
+      <div class="cost-rate-model-popover-head overlay-head">
+        <h4 id="cost-rate-model-popover-title">Add model</h4>
+        <button id="cost-rate-model-popover-close" class="text-button cost-rate-model-popover-close overlay-close" type="button" aria-label="Close model editor">×</button>
+      </div>
+      <div id="cost-rate-model-popover-body" class="cost-rate-model-popover-body scrollbar-hidden"></div>
+    </section>
+  </div>
+  <div id="cost-rate-reset-dialog" class="turn-modal" aria-hidden="true">
+    <section class="turn-modal-dialog cost-rate-reset-dialog overlay-surface" role="dialog" aria-modal="true" aria-labelledby="cost-rate-reset-title" aria-describedby="cost-rate-reset-description" tabindex="-1">
+      <div class="cost-rate-reset-content">
+        <h2 id="cost-rate-reset-title">Reset model prices?</h2>
+        <p id="cost-rate-reset-description">Remove custom prices and restore the rates included with this BOLA version</p>
+      </div>
+      <div class="cost-rate-reset-actions">
+        <button id="cost-rate-reset-cancel" class="secondary-button compact-button" type="button">Cancel</button>
+        <button id="cost-rate-reset-confirm" class="danger compact-button" type="button">Reset prices</button>
+      </div>
+    </section>
+  </div>
   <div id="turn-modal" class="turn-modal" aria-hidden="true">
-    <section class="turn-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="turn-modal-title" tabindex="-1">
-      <div class="turn-modal-head">
+    <section class="turn-modal-dialog overlay-surface" role="dialog" aria-modal="true" aria-labelledby="turn-modal-title" tabindex="-1">
+      <div class="turn-modal-head overlay-head">
         <div class="turn-modal-title">
           <h2 id="turn-modal-title">Selected Turn</h2>
           <div class="turn-modal-subtitle" id="turn-modal-subtitle"></div>
         </div>
-        <button id="turn-modal-close" class="turn-modal-close" aria-label="Close turn detail">×</button>
+        <button id="turn-modal-close" class="turn-modal-close overlay-close" aria-label="Close turn detail">×</button>
       </div>
-      <div id="turn-modal-body" class="turn-modal-body"></div>
+      <div id="turn-modal-body" class="turn-modal-body scrollbar-hidden"></div>
     </section>
   </div>
   <div id="cleanup-detail-modal" class="turn-modal" aria-hidden="true">
-    <section class="turn-modal-dialog cleanup-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="cleanup-detail-modal-title" tabindex="-1">
-      <div class="turn-modal-head">
+    <section class="turn-modal-dialog cleanup-modal-dialog overlay-surface" role="dialog" aria-modal="true" aria-labelledby="cleanup-detail-modal-title" tabindex="-1">
+      <div class="turn-modal-head overlay-head">
         <div class="turn-modal-title">
           <h2 id="cleanup-detail-modal-title">File Detail</h2>
         </div>
-        <button id="cleanup-detail-modal-close" class="turn-modal-close" aria-label="Close file detail">×</button>
+        <button id="cleanup-detail-modal-close" class="turn-modal-close overlay-close" aria-label="Close file detail">×</button>
       </div>
-      <div id="cleanup-detail-modal-body" class="turn-modal-body cleanup-modal-body"></div>
+      <div id="cleanup-detail-modal-body" class="turn-modal-body cleanup-modal-body scrollbar-hidden"></div>
     </section>
   </div>
   <div id="cleanup-confirm-modal" class="turn-modal" aria-hidden="true">
-    <section class="turn-modal-dialog cleanup-confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="cleanup-confirm-title" tabindex="-1">
-      <div class="turn-modal-head">
+    <section class="turn-modal-dialog cleanup-confirm-dialog overlay-surface" role="dialog" aria-modal="true" aria-labelledby="cleanup-confirm-title" tabindex="-1">
+      <div class="turn-modal-head overlay-head">
         <div class="turn-modal-title">
           <h2 id="cleanup-confirm-title">Confirm Cleanup</h2>
           <div class="turn-modal-subtitle" id="cleanup-confirm-subtitle">review delete scope</div>
         </div>
       </div>
-      <div id="cleanup-confirm-body" class="turn-modal-body cleanup-confirm-body"></div>
+      <div id="cleanup-confirm-body" class="turn-modal-body cleanup-confirm-body scrollbar-hidden"></div>
       <div class="cleanup-confirm-actions">
         <button id="cleanup-confirm-cancel" type="button">Cancel</button>
         <button id="cleanup-confirm-delete" class="danger" type="button">Delete</button>

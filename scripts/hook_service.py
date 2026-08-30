@@ -255,24 +255,32 @@ def run_install_hook(
     options: InstallHookOptions,
     dependencies: InstallHookDependencies,
 ) -> InstallHookResult:
-    updates: dict[str, str | pathlib.Path] = {}
-    if options.codex_dir is not None:
-        updates["codex_dir"] = options.codex_dir
-    if options.output_dir is not None:
-        updates["output_dir"] = options.output_dir
-
     requested_paths = dependencies.resolve_paths(options.codex_dir, options.output_dir)
     dependencies.validate_codex_dir(requested_paths.codex_dir)
     dependencies.validate_codex_cli()
     dependencies.validate_hook_runtime()
 
-    if updates and options.persist_config:
-        dependencies.persist_paths(updates)
-        paths = dependencies.resolve_paths(None, None)
-    else:
-        paths = requested_paths
+    hooks_path = requested_paths.codex_dir / "hooks.json"
+    hooks_snapshot = hooks_path.read_bytes() if hooks_path.exists() else None
+    try:
+        hooks_json = merge_hooks_json_registration(requested_paths.codex_dir)
+        if options.persist_config:
+            dependencies.persist_paths(
+                {
+                    "codex_dir": requested_paths.codex_dir,
+                    "output_dir": requested_paths.output_dir,
+                }
+            )
+            paths = dependencies.resolve_paths(None, None)
+        else:
+            paths = requested_paths
+    except Exception:
+        if hooks_snapshot is None:
+            hooks_path.unlink(missing_ok=True)
+        else:
+            write_text_atomic_owner_only(hooks_path, hooks_snapshot.decode("utf-8"), 0o600)
+        raise
 
-    hooks_json = merge_hooks_json_registration(paths.codex_dir)
     return InstallHookResult(
         payload={
             "installed_hook": "codex_token_bola.hook",

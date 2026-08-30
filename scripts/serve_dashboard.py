@@ -23,13 +23,15 @@ SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-import dashboard_cleanup
 import dashboard_cleanup_api
+import dashboard_cost_rates_api
+import dashboard_cleanup  # noqa: F401 - compatibility patch point for handler tests
 import dashboard_freshness
 import dashboard_operation_state
 import dashboard_queries
 import dashboard_rebuild_api
 import dashboard_server_runtime
+import dashboard_service_status
 import cancel_control
 import raw_segments
 import service_paths
@@ -45,7 +47,7 @@ terminate_rebuild_process = dashboard_rebuild_api.terminate_rebuild_process
 RUNTIME_PATHS = service_paths.resolve_runtime_paths()
 CODEX_DIR = RUNTIME_PATHS.codex_dir
 OUTPUT_DIR = RUNTIME_PATHS.output_dir
-DB_PATH = pathlib.Path(os.environ.get("BOLA_ANALYTICS_DB", str(OUTPUT_DIR / "analytics" / "bola.sqlite"))).expanduser()
+DB_PATH = service_paths.OutputLayout(OUTPUT_DIR).analytics_db
 REPO_STATIC_ROOT = SCRIPT_DIR / "assets"
 STATIC_ROOT = pathlib.Path(os.environ.get("BOLA_STATIC_ROOT", str(REPO_STATIC_ROOT))).expanduser()
 MAX_JSON_BODY_BYTES = 64 * 1024
@@ -125,6 +127,8 @@ class BadJsonBody(ValueError):
 class Handler(
     dashboard_rebuild_api.DashboardRebuildApiMixin,
     dashboard_cleanup_api.DashboardCleanupApiMixin,
+    dashboard_cost_rates_api.DashboardCostRatesApiMixin,
+    dashboard_service_status.DashboardServiceStatusApiMixin,
     BaseHTTPRequestHandler,
 ):
     def dashboard_operation_manager(self) -> dashboard_operation_state.DashboardOperationManager:
@@ -144,7 +148,7 @@ class Handler(
         if server is None:
             cached = service_paths.RuntimePaths(
                 project_root=RUNTIME_PATHS.project_root,
-                config_path=RUNTIME_PATHS.config_path,
+                runtime_config_path=RUNTIME_PATHS.runtime_config_path,
                 codex_dir=CODEX_DIR,
                 output_dir=OUTPUT_DIR,
             )
@@ -159,7 +163,7 @@ class Handler(
                 "runtime_paths",
                 service_paths.RuntimePaths(
                     project_root=RUNTIME_PATHS.project_root,
-                    config_path=RUNTIME_PATHS.config_path,
+                    runtime_config_path=RUNTIME_PATHS.runtime_config_path,
                     codex_dir=CODEX_DIR,
                     output_dir=OUTPUT_DIR,
                 ),
@@ -222,6 +226,9 @@ class Handler(
             "total_tokens",
             "model_call_count",
             "weighted_credits",
+            "cost_pico_usd",
+            "cost_rate_status",
+            "cost_rate_effective_from",
         }
         turns_only = {
             "session_id",
@@ -238,6 +245,8 @@ class Handler(
             "total_tokens",
             "model_call_count",
             "weighted_credits",
+            "cost_rate_status",
+            "cost_rate_effective_from",
         }
         dashboard_schema = {
             "turns": dashboard_turns,
@@ -411,6 +420,7 @@ class Handler(
             return
         content_type = {
             ".woff2": "font/woff2",
+            ".png": "image/png",
             ".css": "text/css; charset=utf-8",
             ".js": "application/javascript; charset=utf-8",
         }.get(target.suffix, "application/octet-stream")
@@ -466,6 +476,12 @@ class Handler(
             if parsed.path == "/api/rebuild/cancel":
                 self.handle_rebuild_cancel()
                 return
+            if parsed.path == "/api/cost-rates":
+                self.handle_cost_rates_post()
+                return
+            if parsed.path == "/api/cost-rates/recalculate":
+                self.handle_cost_rates_recalculate()
+                return
             if parsed.path == "/api/log-cleanup/compact":
                 self.handle_cleanup_compact()
                 return
@@ -509,6 +525,12 @@ class Handler(
             return default
 
     def handle_api(self, path, query):
+        if path == "/api/service-status":
+            self.handle_service_status()
+            return
+        if path == "/api/cost-rates":
+            self.handle_cost_rates_get()
+            return
         if path == "/api/rebuild/progress":
             self.handle_rebuild_progress()
             return
@@ -604,17 +626,12 @@ def main() -> int:
     if not is_loopback_host(args.host):
         print("refusing to bind dashboard to an unsupported host; use localhost or an IPv4 loopback address", file=sys.stderr)
         return 2
-    runtime_paths = service_paths.resolve_runtime_paths(codex_dir=args.codex_dir, output_dir=args.output_dir)
-    module_default_db = RUNTIME_PATHS.output_dir / "analytics" / "bola.sqlite"
-    db_override = os.environ.get("BOLA_ANALYTICS_DB")
-    if not db_override and DB_PATH != module_default_db:
-        db_override = str(DB_PATH)
-    db_path = pathlib.Path(db_override).expanduser() if db_override else runtime_paths.output_dir / "analytics" / "bola.sqlite"
     try:
-        dashboard_cleanup.ensure_service_owned_output(runtime_paths.output_dir, db_path)
-    except ValueError as exc:
-        print(str(exc), file=sys.stderr)
+        service_paths.require_runtime_config()
+    except service_paths.ConfigurationError as exc:
+        print(json.dumps({"error": "runtime_config_invalid", "message": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 2
+    runtime_paths = service_paths.resolve_runtime_paths(codex_dir=args.codex_dir, output_dir=args.output_dir)
     operation_manager = dashboard_operation_state.DashboardOperationManager()
     try:
         runtime_manager = dashboard_server_runtime.DashboardRuntimeManager(
@@ -645,7 +662,7 @@ def main() -> int:
     server.dynamic_runtime_paths = not args.pin_runtime_paths
     server.runtime_manager = runtime_manager
     server.operation_manager = operation_manager
-    server.db_override = pathlib.Path(db_override).expanduser() if db_override else None
+    server.db_override = None
     server.allowed_authority = dashboard_authority(args.host, args.port)
     server.allowed_origin = f"http://{server.allowed_authority}"
     print(f"http://{args.host}:{args.port}")
