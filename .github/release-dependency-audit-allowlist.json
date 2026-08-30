@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "expires_on": "2026-09-22",
+  "allowed_node_prefix": "node_modules/npm/node_modules/",
+  "advisories": [
+    {
+      "id": "GHSA-mh99-v99m-4gvg",
+      "package": "brace-expansion",
+      "severity": "high",
+      "nodes": ["node_modules/npm/node_modules/brace-expansion"]
+    },
+    {
+      "id": "GHSA-rgw5-rvv9-x895",
+      "package": "brace-expansion",
+      "severity": "high",
+      "nodes": ["node_modules/npm/node_modules/brace-expansion"]
+    },
+    {
+      "id": "GHSA-mwp4-54f8-5fhr",
+      "package": "ip-address",
+      "severity": "high",
+      "nodes": ["node_modules/npm/node_modules/ip-address"]
+    },
+    {
+      "id": "GHSA-4xrf-jv44-h6hh",
+      "package": "ip-address",
+      "severity": "moderate",
+      "nodes": ["node_modules/npm/node_modules/ip-address"]
+    },
+    {
+      "id": "GHSA-22jq-vg5j-6vgg",
+      "package": "ip-address",
+      "severity": "moderate",
+      "nodes": ["node_modules/npm/node_modules/ip-address"]
+    },
+    {
+      "id": "GHSA-r292-9mhp-454m",
+      "package": "tar",
+      "severity": "high",
+      "nodes": ["node_modules/npm/node_modules/tar"]
+    },
+    {
+      "id": "GHSA-8xcm-r25x-g524",
+      "package": "undici",
+      "severity": "moderate",
+      "nodes": ["node_modules/npm/node_modules/undici"]
+    },
+    {
+      "id": "GHSA-m8rv-5g2x-5cg5",
+      "package": "undici",
+      "severity": "moderate",
+      "nodes": ["node_modules/npm/node_modules/undici"]
+    },
+    {
+      "id": "GHSA-v3r7-h72x-cjcm",
+      "package": "undici",
+      "severity": "moderate",
+      "nodes": ["node_modules/npm/node_modules/undici"]
+    }
+  ],
+  "meta_vulnerabilities": [
+    {
+      "package": "npm",
+      "severity": "high",
+      "nodes": ["node_modules/npm"]
+    }
+  ]
+}

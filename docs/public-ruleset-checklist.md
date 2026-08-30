@@ -2,23 +2,31 @@
 
 Use this checklist when applying `release/public-bootstrap` to the sandbox or production public repository
 
-## Required Rulesets
+The names below are recommended labels for operators. Automation does not identify rulesets by name
 
-- `public-branch-catch-all`: block create, update, and delete for unexpected `refs/heads/*` branch patterns
-- `public-main-snapshot-promotion`: allow product snapshot updates to `refs/heads/main` only from the promotion GitHub App
-- `public-main-ops-update`: allow public-only operations updates only through public ops PRs, required checks, and the public ops actor
-- `public-release-candidate-branches`: allow `release-candidate/*` create, update, and delete only from the snapshot GitHub App
-- `public-ops-branches`: allow `public-ops/*` branch create and update only from the public ops actor
-- `public-release-tags`: allow `refs/tags/v*` creation only from the release-tag GitHub App
+## Rulesets
+
+| Recommended name | Target | Rules | Always-bypass App |
+| --- | --- | --- | --- |
+| `public-branch-catch-all` | All branches except `main`, `release-candidate/*`, and `public-ops/*` | Create, update, delete, and non-fast-forward update | None |
+| `public-main-automated-updates` | `main` | Update, delete, non-fast-forward update, linear history, and configured status checks | Promotion and Ops Apply |
+| `public-release-candidate-branches` | `release-candidate/*` | Create, update, and delete | Snapshot |
+| `public-ops-candidate-branches` | `public-ops/*` | Create, update, and delete | Ops Stage |
+| `public-release-tags` | `v*` tags | Create, update, and delete | Release Tag |
+
+Set every ruleset to `active` and confirm each bypass entry points to the intended GitHub App integration
 
 ## Security Controls
 
 - Enable secret scanning push protection before the first production candidate push
-- Do not grant bypass for snapshot, promotion, or release-tag GitHub Apps
-- Add optional never-public path deny ruleset only if the public repo type and plan support repository push rulesets
-- Keep tag update and deletion blocked in production except through approved orphan tag recovery
+- Keep snapshot, promotion, release-tag, Ops Stage, and Ops Apply App identities separate
+- Restrict each App installation and token to its documented branch role
+- Treat `Always bypass` as bypassing every rule in that ruleset, including status checks and non-fast-forward restrictions
+- Let the private promotion and Ops Apply workflows verify the exact candidate SHA, base SHA, and required check conclusions before updating `main`
+- Run candidate checks after the Snapshot or Ops Stage App pushes the candidate branch; the candidate branch rulesets do not require those checks
+- Use the Release Tag App for release tag mutations. Semantic Release creates tags, and the protected orphan recovery workflow performs approved deletion; no workflow moves an existing release tag
 
 ## Baseline Tag
 
-- Create initial baseline tag `v0.1.0` on the public repo bootstrap commit before tag ruleset lock-down
-- If tag ruleset is already enabled, create the baseline tag through the release-tag GitHub App path
+- Create initial baseline tag `v0.1.0` on the public repo bootstrap commit
+- If the tag ruleset is already active, create the baseline tag through the Release Tag App

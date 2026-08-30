@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - release-candidate/*
+      - public-ops/*
   pull_request:
     branches:
       - main
@@ -18,8 +19,8 @@ jobs:
     name: codeql
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: github/codeql-action/init@v3
+      - uses: actions/checkout@v7
+      - uses: github/codeql-action/init@v4
         with:
           languages: python
-      - uses: github/codeql-action/analyze@v3
+      - uses: github/codeql-action/analyze@v4
