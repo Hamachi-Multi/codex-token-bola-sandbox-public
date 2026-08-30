@@ -19,12 +19,7 @@ TURN_SORT_COLUMNS = {
     "time": "started_at_unix",
     "clock": "coalesce(substr(started_at, 12, 8), substr(captured_at, 12, 8), '')",
     "project": "coalesce(project,'') collate nocase",
-    "session": (
-        "coalesce(nullif(thread_name,''), "
-        "nullif(case when length(replace(session_id,'-','')) >= 16 "
-        "then substr(replace(session_id,'-',''),9,8) "
-        "else substr(replace(session_id,'-',''),1,8) end,''), '') collate nocase"
-    ),
+    "session": "coalesce(nullif(project,''), 'Unknown') collate nocase",
     "prompt": "coalesce(prompt_preview,'') collate nocase",
     "credits": "weighted_credits",
     "raw": "total_tokens",
@@ -66,6 +61,8 @@ def empty_summary() -> dict[str, Any]:
         "model_calls": 0,
         "tool_calls": 0,
         "weighted_credits": 0.0,
+        "unpriced_turns": 0,
+        "cost_complete": True,
         "cached_ratio": 0.0,
     }
 
@@ -86,6 +83,7 @@ def empty_session_detail_payload(query) -> dict[str, Any]:
     summary = {
         "session_id": session_id,
         "thread_name": "",
+        "project": "",
         "turns": 0,
         "raw": 0,
         "credits": 0.0,
@@ -147,22 +145,24 @@ def complete_subagent_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     completed = []
     for confidence in SUBAGENT_CONFIDENCE_ORDER:
         row = by_confidence.get(confidence, {})
+        child_credits = None if row and row.get("child_credits") is None else float(row.get("child_credits") or 0.0)
         completed.append(
             {
                 "confidence": confidence,
                 "rows": int(row.get("rows") or 0),
                 "child_raw": int(row.get("child_raw") or 0),
-                "child_credits": float(row.get("child_credits") or 0.0),
+                "child_credits": child_credits,
             }
         )
     for confidence, row in sorted(by_confidence.items()):
         if confidence not in SUBAGENT_CONFIDENCE_ORDER:
+            child_credits = None if row.get("child_credits") is None else float(row.get("child_credits") or 0.0)
             completed.append(
                 {
                     "confidence": confidence or "unknown",
                     "rows": int(row.get("rows") or 0),
                     "child_raw": int(row.get("child_raw") or 0),
-                    "child_credits": float(row.get("child_credits") or 0.0),
+                    "child_credits": child_credits,
                 }
             )
     return completed

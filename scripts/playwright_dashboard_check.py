@@ -39,6 +39,7 @@ from playwright_dashboard_desktop import (
     check_desktop_turns,
 )
 from playwright_dashboard_mobile import check_mobile
+from playwright_dashboard_settings import check_cost_rate_settings
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_TIMEOUT_MS = 10_000
@@ -69,6 +70,7 @@ SCENARIOS = (
     BrowserScenario("stale-sort", check_stale_dashboard_cannot_overwrite_sort, (1440, 1000)),
     BrowserScenario("local-failures", check_stale_failure_and_detail_failure_are_local, (1440, 1000)),
     BrowserScenario("analyze-cancel", check_analyze_cancel_failure_is_local, (1440, 900)),
+    BrowserScenario("settings-cost-rates", check_cost_rate_settings, (1280, 900)),
 )
 SCENARIO_NAMES = tuple(scenario.name for scenario in SCENARIOS)
 
@@ -209,13 +211,18 @@ def run_fixture_checks(scenarios: tuple[BrowserScenario, ...], *, repeat: int = 
         codex_dir = pathlib.Path(tmp) / "codex-dir"
         output_dir = pathlib.Path(tmp) / "data"
         copy_dashboard_assets(output_dir)
-        db_path = write_dashboard_fixture(output_dir)
+        write_dashboard_fixture(output_dir)
         port = free_loopback_port()
         base_url = f"http://127.0.0.1:{port}"
         env = os.environ.copy()
         env["CODEX_HOME"] = str(codex_dir)
         env[service_paths.OUTPUT_DIR_ENV] = str(output_dir)
-        env["BOLA_ANALYTICS_DB"] = str(db_path)
+        config_home = pathlib.Path(tmp) / "config"
+        env["XDG_CONFIG_HOME"] = str(config_home)
+        service_paths.write_config(
+            {"codex_dir": codex_dir, "output_dir": output_dir},
+            config_home / "bola" / "runtime.conf",
+        )
         log_path = pathlib.Path(tmp) / "dashboard-server.log"
         with log_path.open("w+", encoding="utf-8") as log:
             process = subprocess.Popen(

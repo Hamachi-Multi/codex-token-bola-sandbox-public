@@ -18,6 +18,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import transcript_parser
+import cost_rates
 import turn_lifecycle
 
 NORMALIZE_LOGIC_VERSION = 5
@@ -550,7 +551,17 @@ def freshness_payload(token_usage_root: pathlib.Path | str, db_path: pathlib.Pat
     pending_recovery_files = _pending_recovery_files(base)
     pending_analysis_rows = pending_rows + pending_normalized_rows
     has_db = db.is_file()
-    needs_analyze = has_db and (pending_analysis_rows > 0 or pending_recovery_files > 0)
+    metadata = _run_metadata(db)
+    cost_rate_catalog_changed = False
+    try:
+        catalog, _revision = cost_rates.load_catalog()
+        applied_catalog_digest = metadata.get("cost_rate_catalog_digest")
+        cost_rate_catalog_changed = has_db and bool(applied_catalog_digest) and applied_catalog_digest != catalog.digest
+    except cost_rates.CostRateError as exc:
+        state["warnings"].append({"code": exc.error, "path": str(cost_rates.config_path())})
+    if cost_rate_catalog_changed:
+        state["warnings"].append({"code": "cost_rate_catalog_changed", "path": str(cost_rates.config_path())})
+    needs_analyze = has_db and (pending_analysis_rows > 0 or pending_recovery_files > 0 or cost_rate_catalog_changed)
     data_health = "degraded" if state["warnings"] else "ok"
     if not has_db:
         status = "missing_db"
@@ -570,6 +581,7 @@ def freshness_payload(token_usage_root: pathlib.Path | str, db_path: pathlib.Pat
         "pending_normalized_rows": pending_normalized_rows if has_db else 0,
         "pending_analysis_rows": pending_analysis_rows if has_db else 0,
         "pending_recovery_files": pending_recovery_files if has_db else 0,
+        "cost_rate_catalog_changed": cost_rate_catalog_changed,
         "analytics_db_mtime_unix": db_mtime,
         "analytics_db_mtime_iso": _iso_time(db_mtime),
         "latest_raw_mtime_unix": latest_raw,

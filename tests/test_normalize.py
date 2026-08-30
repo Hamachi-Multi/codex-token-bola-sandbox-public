@@ -7,6 +7,19 @@ except ModuleNotFoundError:
 
 
 class NormalizeTests(unittest.TestCase):
+    def test_normalize_drops_obsolete_instruction_excerpt_fields(self) -> None:
+        normalize = load_module("normalize_prompt_metadata_test", ROOT / "scripts" / "normalize.py")
+        row = _turn_raw("s-prompt", "t-prompt", total=20)
+        row["prompt"] = dict(row["prompt"])
+        row["prompt"]["instruction_excerpt"] = "secret prompt"
+        row["prompt"]["instruction_excerpt_chars"] = 13
+
+        normalized = normalize.normalize_row(row)
+
+        self.assertNotIn("instruction_excerpt", normalized["prompt"])
+        self.assertNotIn("instruction_excerpt_chars", normalized["prompt"])
+        self.assertIn("instruction_excerpt", row["prompt"])
+
     def test_pending_resolution_stays_pending_until_transcript_has_terminal_event(self) -> None:
         normalize = load_module("normalize_pending_terminal_test", ROOT / "scripts" / "normalize.py")
         with tempfile.TemporaryDirectory() as tmp:

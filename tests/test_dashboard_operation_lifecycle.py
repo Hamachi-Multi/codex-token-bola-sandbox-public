@@ -103,13 +103,116 @@ class DashboardOperationManagerTests(unittest.TestCase):
             manager.begin("cleanup", "/tmp/output")
         lease.close()
 
+    def test_service_status_reports_idle_without_exposing_lock_details(self) -> None:
+        serve = load_module("serve_dashboard_service_status_idle_test", SCRIPTS / "serve_dashboard.py")
+        with tempfile.TemporaryDirectory() as temporary:
+            payload = serve.dashboard_service_status.service_status_payload(
+                manager=serve.dashboard_operation_state.DashboardOperationManager(),
+                output_dir=pathlib.Path(temporary),
+            )
+
+        self.assertEqual(
+            payload,
+            {
+                "running": False,
+                "operation": None,
+                "status": "idle",
+                "progress_available": False,
+                "phase": "",
+                "checkpoint": "",
+                "overall_progress": None,
+                "operation_id": None,
+            },
+        )
+        self.assertNotIn("pid", payload)
+        self.assertNotIn("lock_path", payload)
+
+    def test_service_status_reports_dashboard_progress(self) -> None:
+        serve = load_module("serve_dashboard_service_status_progress_test", SCRIPTS / "serve_dashboard.py")
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = pathlib.Path(temporary)
+            progress_file = output_dir / "progress.json"
+            operation_id = "11111111-1111-4111-8111-111111111111"
+            manager = serve.dashboard_operation_state.DashboardOperationManager()
+            lease = manager.begin("analysis", output_dir, operation_id=operation_id)
+            manager.set_files(operation_id, progress_file=progress_file)
+            serve.dashboard_service_status.progress_control.write_progress_to_path(
+                progress_file,
+                operation_id=operation_id,
+                status="running",
+                phase="build",
+                checkpoint="turns",
+                overall_progress=42.5,
+            )
+            try:
+                payload = serve.dashboard_service_status.service_status_payload(manager=manager, output_dir=output_dir)
+            finally:
+                lease.close()
+
+        self.assertTrue(payload["running"])
+        self.assertEqual(payload["operation"], "analysis")
+        self.assertEqual(payload["phase"], "build")
+        self.assertEqual(payload["checkpoint"], "turns")
+        self.assertEqual(payload["overall_progress"], 42.5)
+        self.assertTrue(payload["progress_available"])
+        self.assertEqual(payload["operation_id"], operation_id)
+
+    def test_service_status_reports_external_cleanup_without_progress(self) -> None:
+        serve = load_module("serve_dashboard_service_status_external_test", SCRIPTS / "serve_dashboard.py")
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = pathlib.Path(temporary)
+            manager = serve.dashboard_operation_state.DashboardOperationManager()
+            with serve.dashboard_service_status.service_lock.acquire_service_lock(
+                reason="retention-prune",
+                output_dir=output_dir,
+            ):
+                payload = serve.dashboard_service_status.service_status_payload(manager=manager, output_dir=output_dir)
+
+        self.assertTrue(payload["running"])
+        self.assertEqual(payload["operation"], "cleanup")
+        self.assertFalse(payload["progress_available"])
+        self.assertIsNone(payload["overall_progress"])
+        self.assertIsNone(payload["operation_id"])
+        self.assertNotIn("pid", payload)
+        self.assertNotIn("lock_path", payload)
+
+    def test_service_status_reports_cost_recalculation_without_progress(self) -> None:
+        serve = load_module("serve_dashboard_service_status_cost_recalculation_test", SCRIPTS / "serve_dashboard.py")
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = pathlib.Path(temporary)
+            manager = serve.dashboard_operation_state.DashboardOperationManager()
+            lease = manager.begin("cost_recalculation", output_dir)
+            try:
+                payload = serve.dashboard_service_status.service_status_payload(manager=manager, output_dir=output_dir)
+            finally:
+                lease.close()
+
+        self.assertTrue(payload["running"])
+        self.assertEqual(payload["operation"], "cost_recalculation")
+        self.assertFalse(payload["progress_available"])
+
+    def test_external_cost_recalculation_lock_is_classified(self) -> None:
+        serve = load_module("serve_dashboard_external_cost_recalculation_test", SCRIPTS / "serve_dashboard.py")
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = pathlib.Path(temporary)
+            manager = serve.dashboard_operation_state.DashboardOperationManager()
+            with serve.dashboard_service_status.service_lock.acquire_service_lock(
+                reason="cost-recalculation",
+                output_dir=output_dir,
+            ):
+                payload = serve.dashboard_service_status.service_status_payload(manager=manager, output_dir=output_dir)
+
+        self.assertTrue(payload["running"])
+        self.assertEqual(payload["operation"], "cost_recalculation")
+        self.assertFalse(payload["progress_available"])
+
 
 class DashboardServerRuntimeTests(unittest.TestCase):
     @staticmethod
     def paths(root: pathlib.Path, name: str) -> service_paths.RuntimePaths:
         return service_paths.RuntimePaths(
             project_root=root,
-            config_path=root / "config.json",
+            runtime_config_path=root / "runtime.conf",
             codex_dir=root / ".codex",
             output_dir=root / name,
         )
@@ -279,7 +382,14 @@ class DashboardProcessSupervisorTests(unittest.TestCase):
             root = pathlib.Path(temporary)
             codex_dir = root / "codex"
             output_dir = root / "output"
+            config_home = root / "config"
             codex_dir.mkdir()
+            service_paths.write_config(
+                {"codex_dir": codex_dir, "output_dir": output_dir},
+                config_home / "bola" / "runtime.conf",
+            )
+            environment = os.environ.copy()
+            environment["XDG_CONFIG_HOME"] = str(config_home)
             with socket.socket() as listener:
                 listener.bind(("127.0.0.1", 0))
                 port = int(listener.getsockname()[1])
@@ -304,6 +414,7 @@ class DashboardProcessSupervisorTests(unittest.TestCase):
                     cwd=str(ROOT),
                     stdout=log,
                     stderr=log,
+                    env=environment,
                     start_new_session=True,
                 )
                 try:

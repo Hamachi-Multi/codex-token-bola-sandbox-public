@@ -65,7 +65,7 @@ const CLEANUP_TABLE_HEADERS = [
 function renderCleanupTableFrame(body, rowCount, options = {}) {
   const busyAttr = options.ariaBusy ? ' aria-busy="true"' : '';
   const labelAttr = options.ariaLabel ? ` aria-label="${esc(options.ariaLabel)}"` : '';
-  return `<div class="table-scroll"><div class="table-header-shadow" aria-hidden="true"></div><table${busyAttr}${labelAttr}>
+  return `<div class="table-scroll scrollbar-hidden"><div class="table-header-shadow" aria-hidden="true"></div><table${busyAttr}${labelAttr}>
     <colgroup>
       <col class="cleanup-file-col">
       <col class="cleanup-size-col">
@@ -348,7 +348,7 @@ function bindCleanupAffectedFilePager() {
 function renderCleanupAffectedFileLedger(row, files, pageState = cleanupAffectedFilePageState(files, row)) {
   return `<section class="cleanup-affected-file-ledger">
     ${renderCleanupAffectedFileLedgerHeader(row, files)}
-    <div class="cleanup-affected-file-list">${renderCleanupAffectedFileLedgerRows(row, pageState.pageFiles)}</div>
+    <div class="cleanup-affected-file-list scrollbar-hidden">${renderCleanupAffectedFileLedgerRows(row, pageState.pageFiles)}</div>
   </section>`;
 }
 
@@ -397,7 +397,7 @@ function renderCleanupAffectedFileLedgerLoading(row, files, pageState = cleanupA
     : renderCleanupAffectedFileLedgerRows(row, []);
   return `<section class="cleanup-affected-file-ledger">
     ${renderCleanupAffectedFileLedgerHeader(row, files, headerSummary)}
-    <div class="cleanup-affected-file-list" aria-hidden="true">${loadingRows}</div>
+    <div class="cleanup-affected-file-list scrollbar-hidden" aria-hidden="true">${loadingRows}</div>
   </section>`;
 }
 
@@ -435,9 +435,9 @@ function renderCleanupTable(rows) {
 	      const label = cleanupFileGroupDisplay(row.label || '');
 	      return `<tr data-cleanup-index="${index}" data-cleanup-file="${esc(row.group_id || '')}">
 	        <td class="truncate-cell cleanup-file-cell" title="${esc(cleanupRetentionEffect(row) + ' · ' + (row.path || ''))}"><button type="button" class="row-select-button" aria-pressed="false" aria-haspopup="dialog" aria-label="Open ${esc(label)} file detail">${esc(label)}</button></td>
-	        <td class="num cleanup-size-cell">${formatBytes(row.bytes || 0)}</td>
-	        <td class="num cleanup-affected-size-cell">${formatBytes(summary.deleteSize)}</td>
-        <td class="cleanup-affected-files-cell" title="${esc(cleanupAffectedFilesSummaryTitle(row, stats))}">${renderCleanupAffectedFilesSummaryCell(row, stats)}</td>
+	        <td class="num cleanup-size-cell" data-label="Total Size">${formatBytes(row.bytes || 0)}</td>
+	        <td class="num cleanup-affected-size-cell" data-label="Affected Size">${formatBytes(summary.deleteSize)}</td>
+        <td class="cleanup-affected-files-cell" data-label="Affected Files" title="${esc(cleanupAffectedFilesSummaryTitle(row, stats))}">${renderCleanupAffectedFilesSummaryCell(row, stats)}</td>
       </tr>`;
     }).join('');
   return renderCleanupTableFrame(body, rows.length);
@@ -512,7 +512,7 @@ function renderCleanupFileDetailError(row, message) {
     </section>
     <section class="cleanup-affected-file-ledger">
       <div class="cleanup-affected-file-header"><div class="cleanup-affected-file-title">Affected Files</div></div>
-      <div class="cleanup-affected-file-list"><div class="cleanup-affected-file-empty">${esc(message || 'Cleanup detail failed.')}</div></div>
+      <div class="cleanup-affected-file-list scrollbar-hidden"><div class="cleanup-affected-file-empty">${esc(message || 'Cleanup detail failed.')}</div></div>
     </section>
   </div>`;
 }

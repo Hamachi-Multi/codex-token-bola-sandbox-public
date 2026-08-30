@@ -24,7 +24,6 @@ class PipelineOptions:
     codex_dir: str | None = None
     output_dir: str | None = None
     state_db: str | None = None
-    output: str | None = None
     project_roots: tuple[str, ...] = ()
     incremental: bool = False
     recover: bool = False
@@ -41,7 +40,7 @@ class PipelineResult:
 @dataclass(frozen=True)
 class PipelineDependencies:
     resolve_paths: Callable[[str | None, str | None], service_paths.RuntimePaths]
-    output_path: Callable[[str | None, str | None, str | None], pathlib.Path]
+    output_path: Callable[[str | None, str | None], pathlib.Path]
     run_command: Callable[[RuntimeCommand, list[str], dict[str, str]], ProcessResult]
     read_analytics_metadata: Callable[[str], dict[str, object]]
 
@@ -75,10 +74,10 @@ def run_pipeline(options: PipelineOptions, dependencies: PipelineDependencies) -
         "CODEX_HOME": str(paths.codex_dir),
         service_paths.OUTPUT_DIR_ENV: str(paths.output_dir),
     }
-    effective_output = str(dependencies.output_path(str(paths.codex_dir), options.output, str(paths.output_dir)))
+    effective_output = str(dependencies.output_path(str(paths.codex_dir), str(paths.output_dir)))
     with service_lock.acquire_service_lock(reason="pipeline", output_dir=paths.output_dir) as lock:
         child_env = service_lock.child_lock_env(env, lock.path, lock.fd)
-        build_args = ["--output", effective_output]
+        build_args: list[str] = []
         if options.state_db:
             build_args.extend(["--state-db", options.state_db])
         for value in options.project_roots:

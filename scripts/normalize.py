@@ -26,15 +26,17 @@ import progress_control
 import quarantine_health
 import normalize_publish
 import transcript_parser
+import turn_capture
 import turn_lifecycle
 import turn_resolution
 
 RUNTIME_PATHS = service_paths.resolve_runtime_paths()
 CODEX_DIR = RUNTIME_PATHS.codex_dir
 BASE_DIR = RUNTIME_PATHS.output_dir
-NORMALIZED_LOG = BASE_DIR / "normalized" / "prompt-usage.normalized.jsonl"
-BAD_LOG = BASE_DIR / "bad" / "prompt-usage.bad.jsonl"
-STATE_FILE = BASE_DIR / "normalized" / "normalize-state.json"
+OUTPUT_LAYOUT = service_paths.OutputLayout(BASE_DIR)
+NORMALIZED_LOG = OUTPUT_LAYOUT.normalized_log
+BAD_LOG = OUTPUT_LAYOUT.bad_dir / "prompt-usage.bad.jsonl"
+STATE_FILE = OUTPUT_LAYOUT.normalize_state
 USAGE_KEYS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens")
 NORMALIZE_LOGIC_VERSION = 7
 TRANSCRIPT_LIFECYCLE_CACHE_MAXSIZE = 256
@@ -559,6 +561,8 @@ def normalize_row(row: dict[str, Any]) -> dict[str, Any]:
     normalized.setdefault("aborted_at", None)
     normalized.setdefault("aborted_event", None)
     normalized["usage"] = normalize_usage(row.get("usage"))
+    if "prompt" in normalized:
+        normalized["prompt"] = turn_capture.without_instruction_excerpt(row.get("prompt"))
     if normalized.get("start_token_usage") is None:
         normalized["start_token_usage"] = None
     else:

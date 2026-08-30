@@ -126,74 +126,27 @@ export function cleanupRawSegmentRows(rows = state.cleanupRows || []) {
   return row ? Number(retentionStatsForRow(row).deletableRows || 0) : 0;
 }
 
-export function updateCleanupActionState(summary = {}) {
-  const button = document.getElementById('cleanup-delete');
+export function cleanupSummaryViewModel() {
   const retention = (state.cleanupRetention || {}).selected || {};
   const allMode = cleanupAllMode();
   const totals = cleanupImpactTotals();
   const rawSegmentRows = cleanupRawSegmentRows();
   const cutoff = Number(retention.cutoff_unix || 0);
   const cutoffDate = String(retention.cutoff_date || '');
-  const selectedLabelEl = document.getElementById('cleanup-selected-label');
-  const selectedBytesEl = document.getElementById('cleanup-selected-bytes');
-  const cutoffLabelEl = document.getElementById('cleanup-selected-cutoff-label');
-  const selectedCountEl = document.getElementById('cleanup-selected-count');
-  const affectedFilesEl = document.getElementById('cleanup-retention-files');
-  if (selectedLabelEl) selectedLabelEl.textContent = 'Segment Rows';
-  if (cutoffLabelEl) cutoffLabelEl.textContent = 'Delete Through';
-  if (selectedBytesEl) {
-    selectedBytesEl.textContent = cleanupCountLabel(rawSegmentRows, 'row');
-    selectedBytesEl.title = exactNumber(rawSegmentRows);
-  }
-  if (selectedCountEl) selectedCountEl.textContent = allMode ? 'all logs' : (cutoff > 0 && cutoffDate ? cleanupCutoffLabel() : 'cutoff unavailable');
-  if (affectedFilesEl) {
-    affectedFilesEl.textContent = cleanupCountLabel(totals.affectedFiles, 'file');
-    affectedFilesEl.title = exactNumber(totals.affectedFiles);
-  }
-  if (button) {
-    button.textContent = allMode ? 'Delete All Logs' : 'Delete Logs';
-    button.disabled = !state.cleanupRetentionAvailable;
-    button.title = state.cleanupRetentionAvailable ? '' : 'Preview unavailable';
-  }
-}
-
-export function disableCleanupAction(message = '') {
-  state.cleanupRetentionAvailable = false;
-  const button = document.getElementById('cleanup-delete');
-  if (!button) return;
-  button.disabled = true;
-  button.title = message;
-}
-
-export function markCleanupPreviewUnavailable(message = 'Preview unavailable') {
-  disableCleanupAction(message);
-}
-
-export function setCleanupActionLoading() {
-  const selectedLabelEl = document.getElementById('cleanup-selected-label');
-  const selectedBytesEl = document.getElementById('cleanup-selected-bytes');
-  const cutoffLabelEl = document.getElementById('cleanup-selected-cutoff-label');
-  const selectedCountEl = document.getElementById('cleanup-selected-count');
-  const affectedFilesEl = document.getElementById('cleanup-retention-files');
-  const button = document.getElementById('cleanup-delete');
-  if (selectedLabelEl) selectedLabelEl.textContent = 'Segment Rows';
-  if (cutoffLabelEl) cutoffLabelEl.textContent = 'Delete Through';
-  if (selectedBytesEl) {
-    selectedBytesEl.innerHTML = '<span class="sr-only">Loading cleanup rows.</span><span class="cleanup-summary-loading-cell value" aria-hidden="true"></span>';
-    selectedBytesEl.removeAttribute('title');
-  }
-  if (selectedCountEl) {
-    selectedCountEl.innerHTML = '<span class="sr-only">Loading cleanup cutoff.</span><span class="cleanup-summary-loading-cell hint" aria-hidden="true"></span>';
-    selectedCountEl.removeAttribute('title');
-  }
-  if (affectedFilesEl) {
-    affectedFilesEl.innerHTML = '<span class="sr-only">Loading affected files.</span><span class="cleanup-summary-loading-cell hint short" aria-hidden="true"></span>';
-    affectedFilesEl.removeAttribute('title');
-  }
-  if (button) {
-    button.disabled = true;
-    button.title = 'Loading cleanup preview';
-  }
+  return {
+    selectedLabel: 'Segment Rows',
+    selectedValue: cleanupCountLabel(rawSegmentRows, 'row'),
+    selectedTitle: exactNumber(rawSegmentRows),
+    cutoffLabel: 'Delete Through',
+    cutoffValue: allMode ? 'all logs' : (cutoff > 0 && cutoffDate ? cleanupCutoffLabel() : 'cutoff unavailable'),
+    affectedFilesValue: cleanupCountLabel(totals.affectedFiles, 'file'),
+    affectedFilesTitle: exactNumber(totals.affectedFiles),
+    action: {
+      label: allMode ? 'Delete All Logs' : 'Delete Logs',
+      enabled: state.cleanupRetentionAvailable,
+      title: state.cleanupRetentionAvailable ? '' : 'Preview unavailable',
+    },
+  };
 }
 
 export function cleanupRowPaths(row) {

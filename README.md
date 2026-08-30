@@ -1,397 +1,362 @@
-# Codex Token Bola
+<h1 align="center">Codex Token Bola</h1>
 
-Codex Token Bola captures Codex turn-level token usage, normalizes raw hook logs,
-builds a SQLite analytics database, and serves a dashboard for optimization work.
+<p align="center"><strong>Local-first token observability for Codex</strong></p>
 
-## Data Model
+<p align="center">
+  Capture turn-level usage, trace model, tool, and subagent cost, and explore it
+  through a loopback-only dashboard.
+</p>
 
-- `turns`: one user prompt / Codex turn, with token totals, cache ratio, prompt metadata, category, and workflow.
-- `model_call_summaries`: per-turn model call counts, token totals, maxima, and weighted cost units.
-- `tool_call_summaries` and `tool_call_samples`: tool output size, failure counts, samples, and timing. `issued_by_model_call_index` and `consumed_by_model_call_index` describe the step interval where tool output moved into the next model input.
-- `task_rollups`: parent turn to subagent usage attribution.
+<p align="center">
+  <img alt="Python 3.10–3.14" src="https://img.shields.io/badge/Python-3.10%E2%80%933.14-3776AB?style=flat-square&logo=python&logoColor=white">
+  <img alt="WSL2 Ubuntu verified" src="https://img.shields.io/badge/verified-WSL2%20Ubuntu-E95420?style=flat-square&logo=ubuntu&logoColor=white">
+  <a href="./LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-111827?style=flat-square"></a>
+</p>
 
-## Capture Defaults
+Codex Token Bola converts local Codex hook events into searchable analytics
+without sending transcripts to another service.
 
-The hook preserves a bounded copy of the user's submitted prompt for new turn logs while
-keeping tool output previews off by default:
+![Codex Token Bola dashboard overview with sample data](./docs/assets/dashboard/overview.png)
 
-- user prompt preview text: enabled, first 800 characters by default
-- instruction excerpt text: enabled, first 600 non-code-block characters by default
-- tool output preview text in analytics DB: disabled
-- log and analytics files are written with owner-only mode where Codex Token Bola writes the file
+*All screenshots use synthetic sample data.*
 
-Codex Token Bola does not provide secret detection, masking, or scrub/export
-features. Treat generated service artifacts as local private data.
+<details>
+<summary>More dashboard views</summary>
 
-Disable user prompt text capture when working with sensitive prompts:
+#### Turns
 
-```bash
-BOLA_STORE_TEXT=0
-```
+![Turn list and selected turn details with sample data](./docs/assets/dashboard/turns.png)
 
-Limit stored user prompt text or tool output previews when needed:
+#### Tools
 
-```bash
-BOLA_PROMPT_PREVIEW_CHARS=800
-BOLA_INSTRUCTION_EXCERPT_CHARS=600
-BOLA_TOOL_OUTPUT_PREVIEW_CHARS=500
-```
+![Tool usage and tool details with sample data](./docs/assets/dashboard/tools.png)
 
-Tune hook path bounds when needed:
+#### Subagents
 
-```bash
-BOLA_HOOK_TAIL_SCAN_BYTES=1048576
-BOLA_HOOK_FORWARD_SCAN_BYTES=16777216
-BOLA_HOOK_APPEND_LOCK_TIMEOUT_MS=500
-```
+![Subagent attribution and detail views with sample data](./docs/assets/dashboard/subagents.png)
 
-## CLI
+#### Cleanup
 
-From the root of a cloned checkout, create and activate a repository-local
-virtual environment, then install the package into it:
+![Cleanup retention preview with sample data](./docs/assets/dashboard/cleanup.png)
+
+#### Settings
+
+![Dashboard settings](./docs/assets/dashboard/settings.png)
+
+</details>
+
+## Highlights
+
+- Compare estimated model cost from input, cached input, and output tokens
+- Find expensive sessions, model calls, tool activity, and failed tool calls
+- Attribute usage from spawned subagents back to their parent work
+- Recover interrupted turns and surface malformed records instead of silently
+  dropping them
+- Analyze and delete local logs from a responsive loopback-only dashboard
+- Keep raw captures as evidence while rebuilding derived analytics when needed
+
+## Quick start
+
+### Requirements
+
+- Python 3.10 through 3.14
+- an initialized Codex CLI with a working `codex --version`
+- WSL2 Ubuntu for the verified runtime path
+
+### 1. Install BOLA
+
+From the cloned repository root:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install .
-```
-
-Keep this virtual environment active for the remaining commands in this
-section. The `.venv` directory is local to the checkout and is not committed.
-
-Confirm the installed package version:
-
-```bash
 bola --version
 ```
 
-Release builds derive this version from the Git tag. An exact `vX.Y.Z` tag
-produces package version `X.Y.Z`; ordinary commits after a tag produce a
-development version.
+### 2. Register and verify the hook
+
+#### Codex hooks
+
+BOLA uses `UserPromptSubmit` for the turn baseline and `Stop` for the completed
+token usage.
+
+Register the hook with the effective paths, then verify the installation:
 
 ```bash
-bola install-hook --codex-dir "${CODEX_HOME:-$HOME/.codex}"
+bola install-hook
+bola doctor
 ```
 
-`install-hook` requires an existing, initialized, writable Codex directory and a
-working `codex --version` command. It does not create a missing Codex directory. A
-custom directory must contain Codex-created configuration, authentication,
-state, history, or session data. Initialize a new custom directory by running Codex with
-the same environment before installing the hook:
+#### `install-hook` options
+
+| Option | Purpose | Environment override | Default on WSL/Linux |
+| --- | --- | --- | --- |
+| `--codex-dir` | Codex state input and hook registration | `CODEX_HOME` | `~/.codex` |
+| `--output-dir` | BOLA-generated data | `BOLA_OUTPUT_DIR` | `~/.local/share/bola` |
+
+Path priority: CLI option, environment variable, `runtime.conf`, platform
+default.
+
+To use custom paths:
 
 ```bash
-CODEX_HOME=~/private/codex-dir codex
-bola install-hook --codex-dir ~/private/codex-dir
+bola install-hook \
+  --codex-dir ~/private/codex-dir \
+  --output-dir ~/private/codex-token-data
+bola doctor
 ```
 
-An `--output-dir` does not need to exist during installation. Codex Token Bola
-creates it on the first hook or pipeline write.
+Explicit paths are saved for later BOLA commands.
 
-The hook is not copied into `~/.codex`. `install-hook` records the exact Python
-interpreter used to run `install-hook` and invokes `codex_token_bola.hook` as a
-module. Rerun `install-hook` after replacing `.venv`, moving the checkout, or
-otherwise moving that Python environment.
+A successful `bola install-hook` writes the complete runtime configuration to
+`~/.config/bola/runtime.conf` with resolved absolute paths:
 
-Verify the configured paths and Codex event registration:
+```ini
+schema_version=1
+codex_dir=/path/to/codex-dir
+output_dir=/path/to/bola-data
+```
+
+The file uses `key=value` entries and optional full-line `#` comments.
+Installing with `pip install .` does not create it, and `bola serve` requires
+it.
+
+> [!IMPORTANT]
+> Run `bola install-hook` again after moving the checkout or replacing its
+> Python environment.
+
+### 3. Capture a Codex turn
+
+Start or restart Codex after hook registration, then complete one prompt.
+
+### 4. Open the dashboard
 
 ```bash
-bola doctor --codex-dir "${CODEX_HOME:-$HOME/.codex}"
+bola serve
 ```
 
-`doctor` reports a top-level `health` status in addition to the Codex directory,
-CLI, hook, recovery, and analytics checks. Exit status `0` means healthy, `1`
-means degraded by unresolved runtime signals, and `2` means failed or recovery
-is required.
+Open [http://127.0.0.1:8766](http://127.0.0.1:8766), select **Analyze**, and
+wait for the first build.
 
-Malformed raw rows and recovery state are quarantined instead of being counted
-as a clean success. Normalization and analysis still apply valid rows, then
-exit with status `1` and a JSON `status` of `degraded`. Inspect unresolved
-quarantine events without exposing their stored payloads:
+To use a custom loopback address or port:
+
+```bash
+bola serve --host 127.0.0.1 --port 9000
+```
+
+Open **Settings** to choose the theme, rows per page, session label mode, and
+model price history. Display preferences use browser local storage and are
+scoped to the exact host and port. Cost rates are saved by BOLA.
+
+## How it works
+
+1. Codex invokes the BOLA hook when a prompt starts and when the turn stops
+2. The hook stores raw events and pending state
+3. **Analyze** recovers pending turns, normalizes raw records, and builds SQLite analytics
+4. The dashboard exposes Overview, Turns, Tools, Subagents, Cleanup, and Settings views
+
+Raw captures are the evidence layer. Normalized JSONL and SQLite analytics are
+derived outputs that BOLA can rebuild after recovery, retention, or migration.
+
+<details>
+<summary>Internal processing details</summary>
+
+<br>
+
+| Step | Stage | Operation | State or output |
+| ---: | --- | --- | --- |
+| 1 | Prompt start | `UserPromptSubmit` records transcript position and token baseline | pending turn state |
+| 2 | Turn stop | `Stop` scans the bounded transcript suffix and calculates the token delta | raw turn row |
+| 3 | Segment handoff | Analyze closes the current segment and switches hook writes to a new segment | closed raw segment |
+| 4 | Reconcile | terminal transcript evidence resolves recoverable pending turns | recovered raw rows or unresolved state |
+| 5 | Normalize | new raw rows are validated and converted incrementally | normalized JSONL and source offsets |
+| 6 | Build | normalized rows are joined with Codex session, thread, and transcript metadata | `<output-dir>/analytics/bola.sqlite` |
+| 7 | Query | dashboard endpoints read SQLite without rescanning raw transcripts | dashboard payloads |
+| 8 | Rebuild | retention, migration, or interrupted publication invalidates derived state | regenerated normalized data and analytics |
+
+Execution constraints:
+
+- hook capture does not run normalization or analytics builds
+- pipeline, cleanup, retention, and migration mutations share an
+  output-directory service lock
+- malformed or excluded input is reported through quarantine health
+- raw segments remain the recoverable evidence layer
+
+</details>
+
+## Command guide
+
+Analysis and cleanup are available in the dashboard. CLI-only operations are:
+
+| Command | Purpose |
+| --- | --- |
+| `bola install-hook` | Register the BOLA hook in a Codex directory |
+| `bola serve` | Serve the local dashboard |
+| `bola doctor` | Check configuration, hook registration, recovery, and analytics health |
+| `bola paths show` | Show configured and effective runtime paths |
+| `bola paths set` | Change the Codex or output directory |
+| `bola paths migrate` | Preview or apply a pending output-data migration |
+| `bola quarantine list` | Inspect malformed or excluded input records |
+| `bola quarantine acknowledge` | Mark reviewed quarantine records as acknowledged |
+
+`doctor`, `quarantine list`, and `quarantine acknowledge` support `--json`.
+
+Run `bola COMMAND --help` for command-specific options.
+
+## Change paths later
+
+Inspect or update saved paths:
+
+```bash
+bola paths show
+bola paths set \
+  --codex-dir ~/.codex \
+  --output-dir ~/private/codex-token-data
+```
+
+`--codex-dir` updates the hook registration. `--output-dir` switches new writes
+immediately; migrate existing output separately:
+
+```bash
+bola paths migrate --output-dir
+bola paths migrate --output-dir --apply
+```
+
+> [!IMPORTANT]
+> Migrate only while Codex is stopped and no BOLA data operation is running.
+
+## Privacy and capture policy
+
+BOLA stores the first 800 characters of each new user prompt by default.
+Configure the limit in the environment used to launch Codex:
+
+```bash
+export BOLA_PROMPT_PREVIEW_CHARS=800
+```
+
+Set the value to `0` to disable prompt text storage for new captures.
+
+BOLA does not detect or mask secrets and does not provide a scrub/export
+workflow.
+
+## Measured storage footprint
+
+Measured from one user's actual BOLA usage: 6,318 analyzed turns, 7,910 raw
+rows, 8,317 tool summaries, and 8,317 samples.
+
+| Stored data | Measured size |
+| --- | ---: |
+| Raw segments | 25.26 MiB |
+| Normalized JSONL | 22.39 MiB |
+| Rebuilt analytics database | 15.18 MiB |
+| Non-lock state files | 0.47 MiB |
+| **Total** | **63.29 MiB** |
+
+Observed average: **10.26 KiB per analyzed turn**. At the same workload mix:
+
+| Analyzed turns | Projected BOLA output |
+| ---: | ---: |
+| 1,000 | about 10.0 MiB |
+| 10,000 | about 100 MiB |
+| 100,000 | about 0.98 GiB |
+
+These are observations, not a storage guarantee. Workload content changes the
+size; Codex transcripts and transient database files are excluded.
+
+BOLA does not delete old output automatically. Use **Cleanup** to preview and
+remove it.
+
+## Operations and analytics
+
+### Health and quarantine
+
+| Exit | Meaning |
+| ---: | --- |
+| `0` | Healthy |
+| `1` | Degraded by unresolved runtime signals |
+| `2` | Failed or recovery required |
+
+Quarantined input makes `doctor` degraded while valid rows remain analyzable.
 
 ```bash
 bola quarantine list
-```
-
-The list command exits `1` while unresolved events remain and `0` after all
-current events are acknowledged.
-
-Acknowledgement records that the exclusion was reviewed; it does not delete or
-repair the evidence under `bad/`:
-
-```bash
+bola quarantine list --include-acknowledged
 bola quarantine acknowledge --event-id <EVENT_ID>
 bola quarantine acknowledge --all
 ```
 
-Acknowledged repeats of the same source/content/error signature are reported as
-informational occurrences. A changed source, payload, or error signature creates
-a new unresolved event and degrades `doctor` again.
+`list` exits with `1` when records need review; this is not a command failure.
+Acknowledgement marks review only and retains the `bad/` evidence.
 
-Run the full offline pipeline:
+### Cost Units
 
-```bash
-bola pipeline
+Cost Units use each model's default price, then apply the latest dated price
+change for the UTC turn date. Built-in defaults cover the supported GPT-5.1,
+GPT-5.4, GPT-5.5, and GPT-5.6 families. Add new models, overrides, and dated
+price changes in **Settings**.
+
+```text
+Cost Units = non-cached input tokens * input price
+           + cached input tokens     * cached-input price
+           + output tokens           * output price
 ```
 
-Run the default incremental analysis path:
+Prices use USD per one million tokens, so one million Cost Units represents
+one estimated US dollar. BOLA stores custom schedules in
+`~/.config/bola/cost-rates.json`. Saving a change marks Cost Units for
+recalculation. Use **Recalculate** to update stored turns and task rollups without
+running Normalize or the full Analyze pipeline. Use **Analyze** when the raw or
+normalized inputs also need to be refreshed. If a model has no default or
+applicable dated rate, cost remains unavailable instead of being reported as zero.
 
-```bash
-bola pipeline --incremental
-```
+<details>
+<summary>Analytics data and attribution details</summary>
 
-The default incremental path does not recover pending hook states. Run recovery
-explicitly when you want to scan saved pending states before analysis:
+| Table | Contents |
+| --- | --- |
+| `turns` | One prompt/turn with token totals, cache ratio, metadata, category, and workflow |
+| `model_call_summaries` | Per-turn call counts, token totals, maxima, and weighted cost |
+| `tool_call_summaries` | Aggregated tool size, failures, and timing |
+| `tool_call_samples` | Bounded tool samples and model-step intervals |
+| `task_rollups` | Parent-turn to subagent usage attribution |
 
-```bash
-bola pipeline --incremental --recover
-```
+Tool timing uses step intervals. `2 -> 3` means model step 2 requested the tool,
+the tool ran, and its output was available to model step 3.
 
-## Runtime Paths
+Subagent attribution confidence values:
 
-`codex_dir` is read-only input for Codex state and hook registration. It
-defaults to `~/.codex`. The output directory owns every file generated by
-Codex Token Bola, including raw logs, normalized data, analytics, state,
-temporary files, and reports. By default it uses the operating system's user
-data directory: `${XDG_DATA_HOME:-~/.local/share}/bola` on WSL2 Ubuntu and
-native Linux.
+- `spawn_call_turn_context` — direct parent transcript context
+- `child_task_time_overlap` — child start overlaps a parent turn
+- `spawn_edge_nearest_parent_turn` — nearest earlier parent-turn fallback
 
-Path precedence is CLI option, environment variable, persistent config, then
-the default. The supported environment variables are `CODEX_HOME` and
-`BOLA_OUTPUT_DIR`. Persistent configuration is stored at
-`${XDG_CONFIG_HOME:-~/.config}/bola/config.json` on WSL2 Ubuntu and native
-Linux, only after an explicit configuration or install command writes it.
+</details>
 
-Names from the pre-BOLA runtime are intentionally not accepted. Legacy
-`CODEX_TOKEN_USAGE_*` variables fail with exit code `2` and report their
-`BOLA_*` replacements. A legacy `codex-token-bola/config.json` also fails
-closed; BOLA does not move it or neighboring files automatically.
+## Local service boundary
 
-Show effective paths:
+The dashboard accepts only `localhost` or IPv4 loopback addresses and requires
+same-origin JSON mutations. IPv6 and network-facing binds are rejected.
 
-```bash
-bola paths show
-```
+Only one server may own an output directory. Shutdown terminates its child
+command groups; servers with separate output directories may run independently.
 
-Store custom paths. An output-directory change immediately hands off in-flight
-hook recovery state, then new hook and dashboard work uses the new directory:
-
-```bash
-bola paths set --codex-dir ~/.codex --output-dir ~/private/codex-token-data
-```
-
-Changing `--codex-dir` validates the initialized Codex directory and CLI,
-registers the hook in the new directory, and removes only this application's
-registration from the previous directory. It never moves Codex sessions or
-configuration data.
-
-Commands that perform work also accept `--codex-dir` and `--output-dir` for
-one invocation. `install-hook` persists path options supplied to that command.
-
-## Data Migration
-
-Changing the output directory does not move completed historical files. The
-application keeps running from the new output directory while a pending
-migration is shown by `paths show`. Preview merging the previous output into
-the active output directory:
-
-```bash
-bola paths migrate --output-dir
-```
-
-Apply the reviewed migration:
-
-```bash
-bola paths migrate --output-dir --apply
-```
-
-The migration imports old raw evidence as verified closed segments, preserves
-diagnostic evidence under `reports/migrations/`, and rebuilds normalized data
-and analytics from the combined raw inputs. Only after verification does it
-remove the previous service-owned files. Source code, `.git`, unrelated files,
-and Codex CLI data are never moved or removed. Data from older application
-names is ignored and is never migrated or deleted automatically.
-
-Before scanning source logs, migration completes any physical deletion already
-committed by retention. If a source file still cannot be removed, migration
-returns exit code 2 with `source_physical_delete_pending`, preserves the pending
-transition, and imports nothing. Fix the reported filesystem or permission
-error and repeat the same `paths migrate` command.
-
-Migration also merges retention-pruned parent-turn attribution by
-`session_id` and `turn_id` before rebuilding analytics. Identical rows are
-deduplicated. Conflicting rows return exit code 2 with
-`retention_pruned_turn_conflict` before any import begins, preserving both
-directories for inspection.
-
-Only one output transition can be pending. Repeating the active path is a
-no-op, returning to the immediately previous path reverses the pending
-migration, and selecting a third path is rejected until migration completes.
-
-## Raw Log Rotation and Retention
-
-Analyze closes the current raw segment by pointer handoff before normalize/build.
-New hook writes go to the next current segment selected by
-`state/current-raw-segments.json`:
-
-```bash
-bola pipeline --incremental
-```
-
-Preview dashboard-visible data older than a cutoff without writing service data:
-
-```bash
-bola retention-preview --cutoff 2026-05-20T00:00:00+00:00
-```
-
-Review the returned counts, then pass its `preview_signature` to prune and
-rebuild derived outputs:
-
-```bash
-bola retention-prune --cutoff 2026-05-20T00:00:00+00:00 --preview-signature <signature-from-retention-preview>
-```
-
-Dashboard retention uses the browser's IANA time zone, such as `Asia/Seoul`,
-and calendar-day boundaries instead of rolling 24-hour windows. `Keep Recent 1
-Day` keeps the browser's current local date and deletes through the previous
-local date. A directly selected `Delete Through` date is also included in the
-deletion range. Internally, the server converts the following local midnight
-to an exclusive UTC Unix cutoff; stored log timestamps and raw segment indexes
-remain UTC.
-
-Date-based retention never deletes pending turn state because an old start can
-still belong to a running Codex turn. `bola doctor` reports stale recovery
-state and `bola reconcile` recovers turns with terminal transcript evidence.
-The explicit `All Logs` cleanup remains the only dashboard action that removes
-pending turn state.
-
-Python's `zoneinfo` reads the operating-system time-zone database when one is
-available. The project also declares `tzdata==2026.3` for minimal environments
-that do not provide an IANA database. WSL2 Ubuntu is the verified runtime
-target. Native Linux is expected to be compatible but is not yet verified.
-macOS and native Windows are outside the supported runtime scope.
-
-`retention-preview` never creates or refreshes the retention index. A preview
-can become stale as hooks append data, so `retention-prune` always revalidates
-the explicit signature and fails closed instead of previewing automatically.
-
-Retention source pruning only mutates service-owned raw files under the active
-output directory; the command also removes and rebuilds derived normalized
-state and analytics outputs. `retention-prune --cutoff` remains a low-level
-exclusive instant. Its `--preview-signature` must match the current
-`/api/log-cleanup` retention preview, and `--output` must stay under
-`<output-dir>/analytics/`. It does not delete Codex CLI transcripts or internal
-CLI logs.
-
-Manually rotate current raw segments with the same pointer handoff used by
-Analyze:
-
-```bash
-bola compact
-```
-
-Build analytics only:
-
-```bash
-bola build
-```
-
-Use custom project roots when your repositories are not under `~/src`:
-
-```bash
-bola build --project-root ~/work
-```
-
-Serve the dashboard:
-
-```bash
-bola serve --host 127.0.0.1 --port 8766
-```
-
-Only one dashboard server may own an output directory. A second server for the
-same output directory exits with status `2`; servers using different output
-directories may run concurrently. During shutdown, the server stops accepting
-new operations and terminates every Dashboard-owned command group before it
-exits. Linux parent-death supervision also cleans up those groups if the server
-is killed abruptly.
-
-The dashboard accepts only `localhost` or IPv4 loopback bind addresses and
-rejects IPv6 or network-facing addresses before bind. Every request must target
-the configured local host and port, and mutation requests must be same-origin
-JSON requests. To use a dashboard running on another machine, keep it bound to
-`127.0.0.1` there and open an SSH tunnel:
+For remote access, keep the server on loopback and use an SSH tunnel:
 
 ```bash
 ssh -N -L 8766:127.0.0.1:8766 user@remote-host
 ```
 
-Then open `http://127.0.0.1:8766` locally. This forwards the local port through
-SSH without exposing the dashboard as a network service.
+Then open `http://127.0.0.1:8766` locally.
 
-Install browser verification dependencies:
+## Platform support
 
-```bash
-python -m pip install '.[ui]'
-python -m playwright install chromium
-```
+| Platform | Status |
+| --- | --- |
+| WSL2 Ubuntu | Verified runtime target |
+| Native Linux | Expected compatible, not yet verified |
+| macOS | Unsupported |
+| Native Windows | Unsupported |
 
-## Dashboard Semantics
+## License
 
-The top-right analysis scope selects the highest-cost turns within the active
-time range and optional session filter. Expensive turns are paginated in fixed
-25-row pages.
-Weighted cost units are non-cached-input-equivalent tokens:
-
-```text
-non_cached_input_tokens * 1.0
-+ cached_input_tokens * 0.1
-+ output_tokens * 6.0
-```
-
-The default weights mirror GPT-5.5 token price ratios while keeping the result
-in token-sized units instead of dollars or per-million-token pricing units.
-
-Dashboard route payloads are documented in
-`docs/dashboard-api-contract.md`. Treat fields not listed there as internal
-implementation details.
-
-Dashboard responsive layout and component sizing guidelines are documented in
-`docs/dashboard-responsive-layout.md`.
-
-Tool timing uses step intervals:
-
-```text
-2 -> 3
-```
-
-This means model step 2 requested the tool call, the tool ran, and the output
-was available to step 3 as input context.
-
-Subagent attribution confidence values:
-
-- `spawn_call_turn_context`: direct parent transcript `spawn_agent` turn context was found.
-- `child_task_time_overlap`: child start time overlaps a parent turn range.
-- `spawn_edge_nearest_parent_turn`: fallback to nearest earlier parent turn.
-
-## Verification
-
-```bash
-make compile && make test
-make ui-check
-```
-
-With the repository virtual environment active, build the distribution wheel
-with isolated build dependencies:
-
-```bash
-python -m pip install '.[dev]'
-python -m build --wheel
-```
-
-For a running local dashboard, restart the server first, then run `make ui-check-live` against the live instance.
-
-UI checks run in isolated browser contexts. To reproduce one scenario or stress it repeatedly:
-
-```bash
-python scripts/playwright_dashboard_check.py --scenario desktop-tools-subagents
-python scripts/playwright_dashboard_check.py --scenario desktop-tools-subagents --repeat 10
-```
+Codex Token Bola is released under the [MIT License](./LICENSE).

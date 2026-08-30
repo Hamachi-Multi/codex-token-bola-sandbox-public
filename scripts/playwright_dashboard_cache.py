@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from playwright_dashboard_helpers import assert_true, open_dashboard
+from playwright_dashboard_helpers import assert_true, open_dashboard, set_dashboard_select
 
 
 def check_query_cache_runtime(page, base_url: str) -> None:
@@ -108,7 +108,7 @@ def check_atomic_turn_pagination(page, base_url: str) -> None:
         }
         """
     )
-    page.locator("#turn-page-size").select_option("10")
+    set_dashboard_select(page, "#turn-page-size", "10")
     page.wait_for_function("() => document.querySelectorAll('#turn-list tr[data-turn]').length === 10", timeout=10_000)
     total = int((page.locator("#turn-pager .page-status").inner_text().split("/")[-1]).replace(",", "").strip())
     if total <= 10:
@@ -191,7 +191,7 @@ def check_stale_dashboard_cannot_overwrite_sort(page, base_url: str) -> None:
         """
         async () => {
           const cache = await import('/assets/dashboard/query-cache.js');
-          const hit = cache.peekCachedJSON('/api/turns?days=7&page=1&per_page=25&sort=credits&sort_dir=desc');
+          const hit = cache.peekCachedJSON('/api/turns?days=7&session_label_mode=project&page=1&per_page=25&sort=credits&sort_dir=desc');
           return hit.hit ? (hit.data.rows || []).map(row => row.turn_id) : [];
         }
         """
@@ -204,7 +204,7 @@ def check_stale_dashboard_cannot_overwrite_sort(page, base_url: str) -> None:
 def check_stale_failure_and_detail_failure_are_local(page, base_url: str) -> None:
     open_dashboard(page, base_url)
     page.locator('button[data-view-target="turns"]').click()
-    page.locator("#turn-page-size").select_option("10")
+    set_dashboard_select(page, "#turn-page-size", "10")
     page.wait_for_function("() => document.querySelectorAll('#turn-list tr[data-turn]').length === 10", timeout=10_000)
     page.evaluate(
         """

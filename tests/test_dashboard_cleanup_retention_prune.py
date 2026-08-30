@@ -494,8 +494,6 @@ print(after - before)
                     str(codex_dir),
                     "--output-dir",
                     str(base),
-                    "--output",
-                    str(db_path),
                 ],
                 check=True,
                 capture_output=True,
@@ -515,8 +513,6 @@ print(after - before)
                     str(codex_dir),
                     "--output-dir",
                     str(base),
-                    "--output",
-                    str(db_path),
                     "--cutoff",
                     cutoff_text,
                     "--preview-signature",
@@ -663,7 +659,7 @@ print(after - before)
                 text=True,
             )
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("retention output must be under", result.stderr)
+            self.assertIn("unrecognized arguments: --output", result.stderr)
             self.assertEqual(raw_file.read_bytes(), before_raw)
             self.assertEqual(manifest.read_bytes(), before_manifest)
             self.assertFalse((state_dir / "retention-pruned-turns.json").exists())
@@ -698,7 +694,7 @@ print(after - before)
                 text=True,
             )
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("retention output must be a database file", result.stderr)
+            self.assertIn("unrecognized arguments: --output", result.stderr)
             self.assertEqual(raw_file.read_bytes(), before_raw)
 
     def test_retention_prune_keyboard_interrupt_restores_checkpoint_and_marks_progress(self) -> None:

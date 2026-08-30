@@ -6,7 +6,6 @@ import {
   focusActiveViewRow,
   handleListArrowFocus,
   refreshScrollFades,
-  setActiveModal,
   setInteractiveRowSelected,
   setPanelContent,
 } from './dom.js';
@@ -17,20 +16,50 @@ import {
   cleanupAllMode,
   cleanupRetentionDate,
   cleanupRetentionTimezone,
-  disableCleanupAction,
   emptyCleanupRetention,
-  setCleanupActionLoading,
   setCleanupRetentionMode,
-  updateCleanupActionState,
+  cleanupSummaryViewModel,
 } from './cleanup-retention.js';
 
 export { normalizeCleanupRetentionMode } from './cleanup-retention.js';
 
-export function createCleanupController({ load, loadSessionOptions, prepareAnalyticsReload, setAnalyticsUnavailable }) {
+export function createCleanupController({ load, loadSessionOptions, prepareAnalyticsReload, setAnalyticsUnavailable, dialogManager, cleanupSummary }) {
 let cleanupConfirmResolve = null;
-let cleanupConfirmTrigger = null;
 let cleanupStatusClearTimer = null;
 let cleanupDetailSeq = 0;
+
+function updateCleanupSummary() {
+  cleanupSummary.renderReady(cleanupSummaryViewModel());
+}
+
+function invalidateCleanupPreview(message = 'Preview unavailable') {
+  state.cleanupRetentionAvailable = false;
+  cleanupSummary.renderUnavailable(message);
+}
+const cleanupDetailDialog = dialogManager.register({
+  rootId: 'cleanup-detail-modal',
+  initialFocus: () => document.getElementById('cleanup-detail-modal-close'),
+  closeSelectors: ['#cleanup-detail-modal-close'],
+  onClose: () => {
+    state.cleanupModalTrigger = null;
+    cleanupDetailSeq += 1;
+  },
+});
+const cleanupConfirmDialog = dialogManager.register({
+  rootId: 'cleanup-confirm-modal',
+  initialFocus: () => document.getElementById('cleanup-confirm-cancel'),
+  closeSelectors: ['#cleanup-confirm-close', '#cleanup-confirm-cancel'],
+  canClose: () => document.getElementById('cleanup-confirm-modal').dataset.busy !== 'true',
+  fallbackFocus: () => cleanupDetailDialog.isOpen()
+    ? document.getElementById('cleanup-detail-modal-close')
+    : document.getElementById('cleanup-delete'),
+  onClose: ({ result }) => {
+    if (!cleanupConfirmResolve) return;
+    const resolve = cleanupConfirmResolve;
+    cleanupConfirmResolve = null;
+    resolve(result);
+  },
+});
 
 function cleanupRowId(row) {
   return String((row || {}).group_id || '');
@@ -86,22 +115,19 @@ function openCleanupDetailModal(rowEl) {
   state.cleanupSelectedFile = cleanupRowId(selected);
   updateCleanupFileSelection();
   const modal = document.getElementById('cleanup-detail-modal');
-  state.cleanupModalTrigger = rowEl?.querySelector?.('.row-select-button') || document.activeElement;
   state.cleanupDetailPage = 1;
   state.cleanupDetailRow = null;
   state.cleanupDetailKey = '';
   document.getElementById('cleanup-detail-modal-title').textContent = 'File Detail';
   document.getElementById('cleanup-detail-modal-body').innerHTML = renderCleanupFileDetailLoading(selected);
-  modal.classList.add('open');
-  setActiveModal('cleanup-detail-modal');
-  document.getElementById('cleanup-detail-modal-close').focus();
+  cleanupDetailDialog.open({ trigger: rowEl?.querySelector?.('.row-select-button') || document.activeElement });
   refreshScrollFades(modal);
   loadCleanupDetail(selected);
 }
 
 function updateOpenCleanupDetailModal() {
   const modal = document.getElementById('cleanup-detail-modal');
-  if (!modal.classList.contains('open')) return;
+  if (!cleanupDetailDialog.isOpen()) return;
   const rows = state.cleanupRows || [];
   const selected = rows.find(row => cleanupRowId(row) === state.cleanupSelectedFile) || null;
   if (!selected) {
@@ -121,40 +147,11 @@ function updateOpenCleanupDetailModal() {
 }
 
 function closeCleanupDetailModal() {
-  const modal = document.getElementById('cleanup-detail-modal');
-  const confirmOpen = document.getElementById('cleanup-confirm-modal')?.classList.contains('open');
-  modal.classList.remove('open');
-  modal.setAttribute('aria-hidden', 'true');
-  if (!confirmOpen) {
-    setActiveModal();
-    state.cleanupModalTrigger?.focus?.();
-  } else {
-    setActiveModal('cleanup-confirm-modal');
-  }
-  state.cleanupModalTrigger = null;
-  cleanupDetailSeq++;
+  cleanupDetailDialog.close({ force: true });
 }
 
 function closeCleanupConfirmModal(result = false) {
-  const modal = document.getElementById('cleanup-confirm-modal');
-  if (modal.dataset.busy === 'true') return;
-  const detailOpen = document.getElementById('cleanup-detail-modal')?.classList.contains('open');
-  modal.classList.remove('open');
-  delete modal.dataset.busy;
-  modal.querySelector('[role="dialog"]')?.removeAttribute('aria-busy');
-  setActiveModal(detailOpen ? 'cleanup-detail-modal' : '');
-  const exactTrigger = cleanupConfirmTrigger;
-  const exactTriggerVisible = exactTrigger?.isConnected && exactTrigger.offsetParent !== null && !exactTrigger.disabled;
-  const focusTarget = exactTriggerVisible
-    ? exactTrigger
-    : (detailOpen ? document.getElementById('cleanup-detail-modal-close') : document.getElementById('cleanup-delete'));
-  focusTarget?.focus?.();
-  cleanupConfirmTrigger = null;
-  if (cleanupConfirmResolve) {
-    const resolve = cleanupConfirmResolve;
-    cleanupConfirmResolve = null;
-    resolve(result);
-  }
+  cleanupConfirmDialog.close({ result });
 }
 
 function resolveCleanupConfirmModal(result = false) {
@@ -166,7 +163,6 @@ function resolveCleanupConfirmModal(result = false) {
 
 function confirmCleanupAction({title, subtitle, body, confirmLabel}) {
   const modal = document.getElementById('cleanup-confirm-modal');
-  cleanupConfirmTrigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   document.getElementById('cleanup-confirm-title').textContent = title;
   document.getElementById('cleanup-confirm-subtitle').textContent = subtitle;
   document.getElementById('cleanup-confirm-body').innerHTML = body;
@@ -180,9 +176,7 @@ function confirmCleanupAction({title, subtitle, body, confirmLabel}) {
   deleteButton.textContent = confirmLabel;
   deleteButton.hidden = false;
   deleteButton.disabled = false;
-  modal.classList.add('open');
-  setActiveModal('cleanup-confirm-modal');
-  cancelButton.focus();
+  cleanupConfirmDialog.open({ trigger: document.activeElement });
   return new Promise(resolve => {
     cleanupConfirmResolve = resolve;
   });
@@ -357,14 +351,14 @@ async function loadCleanupDetail(row) {
     q.set('page', String(Math.max(1, Number(state.cleanupDetailPage || 1))));
     q.set('page_size', String(CLEANUP_AFFECTED_FILE_PAGE_SIZE));
     const detail = await getJSON('/api/log-cleanup/detail?' + q);
-    if (seq !== cleanupDetailSeq || !modal.classList.contains('open') || key !== cleanupDetailKey(row)) return;
+    if (seq !== cleanupDetailSeq || !cleanupDetailDialog.isOpen() || key !== cleanupDetailKey(row)) return;
     state.cleanupDetailKey = key;
     state.cleanupDetailRow = mergeCleanupDetailRow(row, detail.row || {});
     document.getElementById('cleanup-detail-modal-body').innerHTML = renderCleanupFileDetail(row, state.cleanupDetailRow || row);
     bindCleanupAffectedFilePager();
     refreshScrollFades(modal);
   } catch (err) {
-    if (seq !== cleanupDetailSeq || !modal.classList.contains('open')) return;
+    if (seq !== cleanupDetailSeq || !cleanupDetailDialog.isOpen()) return;
     if (String((err || {}).code || '') === 'cleanup_preview_stale') {
       document.getElementById('cleanup-detail-modal-body').innerHTML = renderCleanupFileDetailError(row, 'Cleanup preview changed. Refreshing cleanup data.');
       await loadCleanup({keepStatus: true});
@@ -386,7 +380,7 @@ function cleanupPreviewKey() {
 
 function commitCleanupView({summary, rows, previousSignature, nextSignature, tableExists, options}) {
   state.cleanupRetentionAvailable = true;
-  updateCleanupActionState(summary);
+  updateCleanupSummary();
   if (options.preserveRows && tableExists && previousSignature === nextSignature) {
     updateCleanupFileRows();
     updateCleanupFileSelection();
@@ -424,7 +418,7 @@ async function loadCleanup(options = {}) {
   const expectedPreviewKey = cleanupPreviewKey();
   if (!options.keepStatus) clearCleanupStatus();
   if (!options.preserveRows || !tableExists) {
-    setCleanupActionLoading();
+    cleanupSummary.renderLoading();
     setPanelContent('cleanup-files', renderCleanupTableLoading(), 'loading');
   }
   try {
@@ -450,7 +444,7 @@ async function loadCleanup(options = {}) {
     setPanelContent('cleanup-files', esc(err.message || err), 'error');
     setCleanupStatus('cleanup data failed', 'error');
     document.querySelectorAll('[data-cleanup-modal-delete]').forEach(modalButton => { modalButton.disabled = true; });
-    disableCleanupAction('Preview unavailable');
+    cleanupSummary.renderUnavailable('Preview unavailable');
     refreshScrollFades();
   }
 }
@@ -488,7 +482,7 @@ async function refreshDashboardAfterCleanup(request, detail) {
     tone: 'error',
     done: true,
   });
-  updateCleanupActionState(state.cleanupSummary || {});
+  updateCleanupSummary();
   refreshScrollFades();
   return false;
 }
@@ -518,7 +512,7 @@ async function deleteCleanupFiles() {
       tone: 'success',
       done: true,
     });
-    updateCleanupActionState(state.cleanupSummary || {});
+    updateCleanupSummary();
     return;
   }
   button.disabled = true;
@@ -571,7 +565,7 @@ async function deleteCleanupFiles() {
         tone: 'error',
         done: true,
       });
-      updateCleanupActionState(state.cleanupSummary || {});
+      updateCleanupSummary();
       return;
     }
     if ((err || {}).error === 'cleanup_preview_stale') {
@@ -585,7 +579,7 @@ async function deleteCleanupFiles() {
         done: true,
       });
       await loadCleanup({keepStatus: true});
-      updateCleanupActionState(state.cleanupSummary || {});
+      updateCleanupSummary();
       return;
     }
     if ((err || {}).partial_mutation) {
@@ -601,7 +595,7 @@ async function deleteCleanupFiles() {
       });
       await reloadAnalyticsAfterCleanup();
       await loadCleanup({keepStatus: true});
-      updateCleanupActionState(state.cleanupSummary || {});
+      updateCleanupSummary();
       return;
     }
     finishCleanupProgress(request);
@@ -614,12 +608,12 @@ async function deleteCleanupFiles() {
       done: true,
     });
     state.cleanupRetention = emptyCleanupRetention();
-    updateCleanupActionState(state.cleanupSummary || {});
+    updateCleanupSummary();
     setPanelContent('cleanup-files', esc(err.message || err), 'error');
     refreshScrollFades();
   } finally {
     finishCleanupProgress(request);
-    updateCleanupActionState(state.cleanupSummary || {});
+    updateCleanupSummary();
     modalDeleteButtons.forEach(modalButton => { modalButton.disabled = !retentionDeleteSucceeded; });
   }
 }
@@ -700,7 +694,7 @@ async function deleteAllLogs() {
     }
   } finally {
     finishCleanupProgress(request);
-    updateCleanupActionState(state.cleanupSummary || {});
+    updateCleanupSummary();
   }
 }
 
@@ -709,6 +703,7 @@ return {
   closeCleanupConfirmModal,
   closeCleanupDetailModal,
   deleteCleanupFiles,
+  invalidateCleanupPreview,
   loadCleanup,
   resolveCleanupConfirmModal,
   renderCleanup,

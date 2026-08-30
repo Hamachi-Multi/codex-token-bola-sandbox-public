@@ -54,6 +54,11 @@ __all__ = [
 ]
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+TEST_RUNTIME = tempfile.TemporaryDirectory(prefix="bola-test-runtime-")
+TEST_RUNTIME_ROOT = pathlib.Path(TEST_RUNTIME.name)
+os.environ["BOLA_OUTPUT_DIR"] = str(TEST_RUNTIME_ROOT / "output")
+os.environ["CODEX_HOME"] = str(TEST_RUNTIME_ROOT / "codex")
+os.environ["XDG_CONFIG_HOME"] = str(TEST_RUNTIME_ROOT / "config")
 
 def dashboard_asset_bundle() -> str:
     assets = ROOT / "scripts" / "assets"
@@ -226,8 +231,7 @@ class DashboardFixtureMixin:
               output_reported_tokens integer,
               output_tokens integer,
               status text,
-              exit_code integer,
-              output_preview text
+              exit_code integer
             );
             create table task_rollups (
               parent_session_id text,
@@ -262,10 +266,10 @@ class DashboardFixtureMixin:
             ],
         )
         con.executemany(
-            "insert into tool_call_samples values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "insert into tool_call_samples values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
-                ("s1", "t1", "c1", "exec_command", "exec", "largest_output", 1, None, None, 10, 40, 0, 10, "completed", 0, ""),
-                ("s2", "t2", "c2", "exec_command", "exec", "largest_output", 1, None, None, 20, 400, 0, 100, "completed", 0, ""),
+                ("s1", "t1", "c1", "exec_command", "exec", "largest_output", 1, None, None, 10, 40, 0, 10, "completed", 0),
+                ("s2", "t2", "c2", "exec_command", "exec", "largest_output", 1, None, None, 20, 400, 0, 100, "completed", 0),
             ],
         )
         con.commit()

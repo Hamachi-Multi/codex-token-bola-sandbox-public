@@ -13,6 +13,7 @@ SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+import cost_rates
 from dashboard_query_helpers import (
     SUBAGENT_CONFIDENCE_ORDER,
     TURN_SORT_COLUMNS,
@@ -38,7 +39,7 @@ __all__ = [
 ]
 
 SESSION_SORT_COLUMNS = {
-    "session": "lower(coalesce(nullif(thread_name,''), nullif(cwd,''), session_id))",
+    "session": "lower(coalesce(nullif(project,''), 'Unknown'))",
     "credits": "credits",
     "raw": "raw",
     "turns": "turns",
@@ -75,6 +76,20 @@ class DashboardQueries:
         reason = "token_resolution_reason" if "token_resolution_reason" in self.turn_columns else "null"
         available = "analytics_eligible" if "analytics_eligible" in self.turn_columns else "case when token_resolution_status='resolved' then 1 else 0 end"
         return f"token_resolution_status, {reason} token_resolution_reason, {available} token_data_available"
+
+    def cost_sum_expression(self, *, alias: str = "", zero_when_empty: bool = False) -> str:
+        prefix = f"{alias}." if alias else ""
+        weighted = f"{prefix}weighted_credits"
+        aggregate = f"sum({weighted})"
+        if "cost_pico_usd" in self.turn_columns:
+            pico = f"{prefix}cost_pico_usd"
+            aggregate = (
+                f"case when count({pico})=count({weighted}) "
+                f"then sum({pico})/{cost_rates.PICO_USD_PER_COST_UNIT}.0 else sum({weighted}) end"
+            )
+        if zero_when_empty:
+            aggregate = f"coalesce({aggregate}, 0)"
+        return f"case when count({weighted})=count(*) then {aggregate} end"
 
     def filters(self, alias=None):
         prefix = f"{alias}." if alias else ""
@@ -154,11 +169,22 @@ class DashboardQueries:
     def turn_order_clause(self) -> str:
         sort_key = (self.query.get("sort") or ["date"])[0]
         sort_dir = (self.query.get("sort_dir") or ["desc"])[0]
-        expression = TURN_SORT_COLUMNS.get(sort_key, TURN_SORT_COLUMNS["date"])
+        expression = self.session_label_sort_expression() if sort_key == "session" else TURN_SORT_COLUMNS.get(sort_key, TURN_SORT_COLUMNS["date"])
         direction = "asc" if str(sort_dir).lower() == "asc" else "desc"
+        if sort_key == "credits":
+            return f"weighted_credits is null asc, weighted_credits {direction}, started_at_unix desc, session_id desc, turn_id desc"
         if sort_key in {"date", "time"}:
             return f"{expression} {direction}, session_id {direction}, turn_id {direction}"
         return f"{expression} {direction}, started_at_unix desc, session_id desc, turn_id desc"
+
+    def session_label_mode(self) -> str:
+        value = str((self.query.get("session_label_mode") or ["project"])[0] or "")
+        return value if value in {"project", "thread"} else "project"
+
+    def session_label_sort_expression(self) -> str:
+        if self.session_label_mode() == "thread":
+            return "lower(coalesce(nullif(thread_name,''), 'Unnamed'))"
+        return "lower(coalesce(nullif(project,''), 'Unknown'))"
 
     def rollup_order_clause(self, sort_param: str, dir_param: str, columns: dict[str, str], default_key: str, tie_breaker: str) -> str:
         sort_key = (self.query.get(sort_param) or [default_key])[0]
@@ -168,10 +194,11 @@ class DashboardQueries:
         return f"{expression} {direction}, {tie_breaker}"
 
     def session_order_clause(self) -> str:
+        columns = {**SESSION_SORT_COLUMNS, "session": self.session_label_sort_expression()}
         return self.rollup_order_clause(
             "session_sort",
             "session_sort_dir",
-            SESSION_SORT_COLUMNS,
+            columns,
             "credits",
             "latest_started_at_unix desc, session_id desc",
         )
@@ -206,10 +233,13 @@ class DashboardQueries:
         focus_session_id = (self.query.get("focus_session_id") or [""])[0]
         focus_turn_id = (self.query.get("focus_turn_id") or [""])[0]
         focused = bool(focus_session_id and focus_turn_id)
+        cost_rate_status = "cost_rate_status" if "cost_rate_status" in self.turn_columns else "'configured' cost_rate_status"
+        cost_rate_effective_from = "cost_rate_effective_from" if "cost_rate_effective_from" in self.turn_columns else "null cost_rate_effective_from"
         select_cols = f"""
             session_id, turn_id, captured_at, started_at, prompt_preview, cwd, project, thread_name, turn_status,
             {self.resolution_list_columns()},
-            weighted_credits credits, total_tokens raw, model_call_count calls
+            weighted_credits credits, {cost_rate_status}, {cost_rate_effective_from},
+            total_tokens raw, model_call_count calls
         """
         if focused:
             focus_where = f"{where} and session_id=? and turn_id=?"
@@ -272,6 +302,7 @@ class DashboardQueries:
                 where lower(
                     coalesce(session_id,'') || ' ' ||
                     coalesce(thread_name,'') || ' ' ||
+                    coalesce(project,'') || ' ' ||
                     coalesce(cwd,'')
                 ) like ?
             """
@@ -288,6 +319,13 @@ class DashboardQueries:
                   select s.session_id,
                          coalesce(max(nullif(thread_name,'')), '') thread_name,
                          coalesce(
+                           (select t2.project from scoped_turns t2
+                            where t2.session_id = s.session_id
+                            order by t2.started_at_unix desc, t2.turn_id desc
+                            limit 1),
+                           ''
+                         ) project,
+                         coalesce(
                            (select t2.cwd from scoped_turns t2
                             where t2.session_id = s.session_id
                             order by t2.started_at_unix desc, t2.turn_id desc
@@ -296,7 +334,7 @@ class DashboardQueries:
                          ) cwd,
                          count(*) turns,
                          max(started_at_unix) latest_started_at_unix,
-                         sum(weighted_credits) credits
+                         {cost_sum} credits
                   from scoped_turns s
                   group by s.session_id
                 )
@@ -305,7 +343,12 @@ class DashboardQueries:
                 {where}
                 order by latest_started_at_unix desc, session_id desc
                 limit ?
-                """.format(turn_where=turn_where, eligible=self.analytics_eligible_predicate(), where=where),
+                """.format(
+                    turn_where=turn_where,
+                    eligible=self.analytics_eligible_predicate(),
+                    where=where,
+                    cost_sum=self.cost_sum_expression(),
+                ),
                 [*turn_args, *args, limit + 1],
             )
         )
@@ -328,7 +371,7 @@ class DashboardQueries:
         turns = self.turns_payload()
         summary = dict(
             self.con.execute(
-                """
+                f"""
                 select count(*) turns,
                        coalesce(sum(total_tokens), 0) total_tokens,
                        coalesce(sum(input_tokens), 0) input_tokens,
@@ -342,16 +385,18 @@ class DashboardQueries:
                          from tool_call_summaries c
                          join selected_turns st on st.session_id = c.session_id and st.turn_id = c.turn_id
                        ), 0) tool_calls,
-                       coalesce(sum(weighted_credits), 0) weighted_credits,
+                       {self.cost_sum_expression(zero_when_empty=True)} weighted_credits,
+                       sum(case when weighted_credits is null then 1 else 0 end) unpriced_turns,
                        case when sum(input_tokens) > 0 then cast(sum(cached_input_tokens) as real) / sum(input_tokens) else 0 end cached_ratio
                 from selected_turns
                 """
             ).fetchone()
         )
         summary["unavailable_turns"] = self.unavailable_turn_count()
+        summary["cost_complete"] = int(summary.get("unpriced_turns") or 0) == 0
         projects = rows_to_dicts(
             self.con.execute(
-                "select coalesce(project,'') project, count(*) turns, sum(total_tokens) raw, sum(weighted_credits) credits from selected_turns group by coalesce(project,'') order by credits desc limit 20"
+                f"select coalesce(project,'') project, count(*) turns, sum(total_tokens) raw, {self.cost_sum_expression()} credits from selected_turns group by coalesce(project,'') order by credits is null, credits desc limit 20"
             )
         )
         session_total = int(
@@ -377,6 +422,13 @@ class DashboardQueries:
                   select s.session_id,
                          coalesce(max(nullif(thread_name,'')), '') thread_name,
                          coalesce(
+                           (select st.project from selected_turns st
+                            where st.session_id = s.session_id
+                            order by st.started_at_unix desc, st.turn_id desc
+                            limit 1),
+                           ''
+                         ) project,
+                         coalesce(
                            (select st.cwd from selected_turns st
                             where st.session_id = s.session_id
                             order by st.started_at_unix desc, st.turn_id desc
@@ -385,7 +437,7 @@ class DashboardQueries:
                          ) cwd,
                          count(*) turns,
                          sum(total_tokens) raw,
-                         sum(weighted_credits) credits,
+                         {self.cost_sum_expression()} credits,
                          max(started_at_unix) latest_started_at_unix
                   from selected_turns s
                   group by s.session_id
@@ -445,7 +497,7 @@ class DashboardQueries:
                 select r.confidence,
                        count(*) rows,
                        sum(r.child_total_tokens) child_raw,
-                       sum(r.child_weighted_credits) child_credits
+                       case when count(r.child_weighted_credits)=count(*) then sum(r.child_weighted_credits) end child_credits
                 from task_rollups r
                 join selected_turns t on t.session_id = r.parent_session_id and t.turn_id = r.parent_turn_id
                 group by r.confidence
@@ -477,7 +529,7 @@ class DashboardQueries:
                 select session_id
                 from selected_turns
                 group by session_id
-                order by sum(weighted_credits) desc, max(started_at_unix) desc, session_id desc
+                order by sum(weighted_credits) is null, sum(weighted_credits) desc, max(started_at_unix) desc, session_id desc
                 limit 1
                 """
             ).fetchone()
@@ -493,9 +545,15 @@ class DashboardQueries:
         category_expr = "coalesce(category,'')" if "category" in session_turn_columns else "''"
         summary = dict(
             self.con.execute(
-                """
+                f"""
                 select ? session_id,
                        coalesce(max(nullif(thread_name,'')), '') thread_name,
+                       coalesce(
+                         (select st.project from session_turns st
+                          order by st.started_at_unix desc, st.turn_id desc
+                          limit 1),
+                         ''
+                       ) project,
                        coalesce(
                          (select st.cwd from session_turns st
                           order by st.started_at_unix desc, st.turn_id desc
@@ -504,7 +562,7 @@ class DashboardQueries:
                        ) cwd,
                        count(*) turns,
                        coalesce(sum(total_tokens), 0) raw,
-                       coalesce(sum(weighted_credits), 0) credits,
+                       {self.cost_sum_expression(zero_when_empty=True)} credits,
                        coalesce(sum(model_call_count), 0) model_calls,
                        coalesce(sum(non_cached_input_tokens), 0) non_cached_input_tokens,
                        case when sum(input_tokens) > 0 then cast(sum(cached_input_tokens) as real) / sum(input_tokens) else 0 end cached_ratio
@@ -520,7 +578,7 @@ class DashboardQueries:
                        {category_expr} category,
                        count(*) turns,
                        coalesce(sum(total_tokens), 0) raw,
-                       coalesce(sum(weighted_credits), 0) credits
+                       {self.cost_sum_expression(zero_when_empty=True)} credits
                 from session_turns
                 group by {workflow_expr}, {category_expr}
                 order by credits desc
@@ -559,7 +617,7 @@ class DashboardQueries:
                 select r.confidence,
                        count(*) rows,
                        sum(r.child_total_tokens) child_raw,
-                       sum(r.child_weighted_credits) child_credits
+                       case when count(r.child_weighted_credits)=count(*) then sum(r.child_weighted_credits) end child_credits
                 from task_rollups r
                 join session_turns t on t.session_id = r.parent_session_id and t.turn_id = r.parent_turn_id
                 group by r.confidence
@@ -593,7 +651,8 @@ class DashboardQueries:
                      from tool_call_summaries c
                      join selected_turns st on st.session_id = c.session_id and st.turn_id = c.turn_id
                    ), 0) tool_calls,
-                   coalesce(sum(weighted_credits), 0) weighted_credits,
+                   {self.cost_sum_expression(zero_when_empty=True)} weighted_credits,
+                   sum(case when weighted_credits is null then 1 else 0 end) unpriced_turns,
                    case when sum(input_tokens) > 0 then cast(sum(cached_input_tokens) as real) / sum(input_tokens) else 0 end cached_ratio
             from selected_turns
             """,
@@ -601,6 +660,7 @@ class DashboardQueries:
         ).fetchone()
         result = dict(row)
         result["unavailable_turns"] = self.unavailable_turn_count()
+        result["cost_complete"] = int(result.get("unpriced_turns") or 0) == 0
         return result
 
     def unavailable_turn_count(self) -> int:
@@ -619,7 +679,7 @@ class DashboardQueries:
         cte, selected_args = self.selected_turns_cte()
         rows = rows_to_dicts(
             self.con.execute(
-                f"{cte} select coalesce(project,'') project, count(*) turns, sum(total_tokens) raw, sum(weighted_credits) credits from selected_turns group by coalesce(project,'') order by credits desc limit 20",
+                f"{cte} select coalesce(project,'') project, count(*) turns, sum(total_tokens) raw, {self.cost_sum_expression()} credits from selected_turns group by coalesce(project,'') order by credits is null, credits desc limit 20",
                 selected_args,
             )
         )
@@ -650,6 +710,13 @@ class DashboardQueries:
                   select s.session_id,
                          coalesce(max(nullif(thread_name,'')), '') thread_name,
                          coalesce(
+                           (select st.project from selected_turns st
+                            where st.session_id = s.session_id
+                            order by st.started_at_unix desc, st.turn_id desc
+                            limit 1),
+                           ''
+                         ) project,
+                         coalesce(
                            (select st.cwd from selected_turns st
                             where st.session_id = s.session_id
                             order by st.started_at_unix desc, st.turn_id desc
@@ -658,7 +725,7 @@ class DashboardQueries:
                          ) cwd,
                          count(*) turns,
                          sum(total_tokens) raw,
-                         sum(weighted_credits) credits,
+                         {self.cost_sum_expression()} credits,
                          max(started_at_unix) latest_started_at_unix
                   from selected_turns s
                   group by s.session_id
@@ -677,12 +744,15 @@ class DashboardQueries:
                 """
                 select coalesce(project,'') project,
                        count(*) turns,
-                       sum(weighted_credits) credits
+                       {cost_sum} credits
                 from turns
                 where {eligible}
                 group by coalesce(project,'')
                 order by credits desc
-                """.format(eligible=self.analytics_eligible_predicate())
+                """.format(
+                    eligible=self.analytics_eligible_predicate(),
+                    cost_sum=self.cost_sum_expression(),
+                )
             )
         )
         return {"rows": rows}
@@ -691,7 +761,7 @@ class DashboardQueries:
         cte, selected_args = self.selected_turns_cte()
         rows = rows_to_dicts(
             self.con.execute(
-                f"{cte} select category, workflow, count(*) turns, sum(total_tokens) raw, sum(weighted_credits) credits from selected_turns group by category, workflow order by credits desc limit 24",
+                f"{cte} select category, workflow, count(*) turns, sum(total_tokens) raw, {self.cost_sum_expression()} credits from selected_turns group by category, workflow order by credits is null, credits desc limit 24",
                 selected_args,
             )
         )
@@ -748,6 +818,7 @@ class DashboardQueries:
                    c.session_id,
                    c.turn_id,
                    coalesce(t.thread_name,'') thread_name,
+                   coalesce(t.project,'') project,
                    coalesce(t.cwd,'') cwd,
                    t.started_at_unix,
                    coalesce(c.calls,0) calls,
@@ -768,6 +839,7 @@ class DashboardQueries:
             create temp table selected_tool_detail_sessions as
             select d.session_id,
                    coalesce(max(nullif(d.thread_name,'')), '') thread_name,
+                   coalesce(max(nullif(d.project,'')), '') project,
                    coalesce(
                      (select latest.cwd from selected_tool_detail_summaries latest
                       where latest.session_id = d.session_id
@@ -791,6 +863,7 @@ class DashboardQueries:
             select c.session_id,
                    c.turn_id,
                    coalesce(t.thread_name,'') thread_name,
+                   coalesce(t.project,'') project,
                    coalesce(t.cwd,'') cwd,
                    t.prompt_preview,
                    c.output_chars,
@@ -826,6 +899,7 @@ class DashboardQueries:
                 """
                 select session_id,
                        thread_name,
+                       project,
                        cwd,
                        calls,
                        output_chars,
@@ -840,7 +914,7 @@ class DashboardQueries:
         calls = rows_to_dicts(
             self.con.execute(
                 """
-                select session_id, turn_id, thread_name, cwd, prompt_preview, output_chars,
+                select session_id, turn_id, thread_name, project, cwd, prompt_preview, output_chars,
                        output_reported_tokens,
                        output_tokens,
                        status, duration_ms
@@ -861,7 +935,7 @@ class DashboardQueries:
                 select confidence,
                        count(*) rows,
                        sum(child_total_tokens) child_raw,
-                       sum(child_weighted_credits) child_credits
+                       case when count(child_weighted_credits)=count(*) then sum(child_weighted_credits) end child_credits
                 from selected_rollups
                 group by confidence
                 order by child_credits desc
@@ -883,7 +957,7 @@ class DashboardQueries:
                 select ? confidence,
                        count(*) rows,
                        coalesce(sum(child_total_tokens),0) child_raw,
-                       coalesce(sum(child_weighted_credits),0) child_credits
+                       case when count(child_weighted_credits)=count(*) then coalesce(sum(child_weighted_credits),0) end child_credits
                 from selected_rollups
                 where confidence = ?
                 """,
@@ -896,10 +970,11 @@ class DashboardQueries:
                 {cte}
                 select session_id,
                        coalesce(max(nullif(thread_name,'')), '') thread_name,
+                       coalesce(max(nullif(project,'')), '') project,
                        coalesce(max(cwd), '') cwd,
                        count(*) rows,
                        coalesce(sum(child_total_tokens),0) child_raw,
-                       coalesce(sum(child_weighted_credits),0) child_credits
+                       case when count(child_weighted_credits)=count(*) then coalesce(sum(child_weighted_credits),0) end child_credits
                 from selected_rollups
                 where confidence = ?
                 group by session_id
@@ -913,7 +988,7 @@ class DashboardQueries:
             self.con.execute(
                 f"""
                 {cte}
-                select session_id, thread_name, cwd, parent_session_id, parent_turn_id, child_session_id, child_agent_role,
+                select session_id, thread_name, project, cwd, parent_session_id, parent_turn_id, child_session_id, child_agent_role,
                        child_agent_nickname, child_started_at,
                        prompt_preview, child_total_tokens child_raw,
                        child_weighted_credits child_credits
@@ -932,6 +1007,8 @@ class DashboardQueries:
         turn_id = (self.query.get("turn_id") or [""])[0]
         turn_where, turn_args = self.filters()
         resolution_columns = self.resolution_list_columns()
+        cost_rate_status = "cost_rate_status" if "cost_rate_status" in self.turn_columns else "'configured' cost_rate_status"
+        cost_rate_effective_from = "cost_rate_effective_from" if "cost_rate_effective_from" in self.turn_columns else "null cost_rate_effective_from"
         turn = self.con.execute(
             f"""
             select session_id, turn_id, captured_at, started_at, stopped_at, cwd, project, thread_name, model, reasoning_effort,
@@ -939,7 +1016,7 @@ class DashboardQueries:
                    estimated, prompt_preview, prompt_chars, prompt_lines, code_block_chars,
                    assistant_chars, input_tokens, cached_input_tokens, non_cached_input_tokens, output_tokens,
                    reasoning_output_tokens, total_tokens, cached_ratio, model_call_count,
-                   weighted_credits, uncached_input_equivalent, category, workflow
+                   weighted_credits, {cost_rate_status}, {cost_rate_effective_from}, category, workflow
             from turns
             where session_id=? and turn_id=? and {turn_where}
             """,
@@ -965,7 +1042,7 @@ class DashboardQueries:
             "output_tokens": int(turn["output_tokens"] or 0),
             "reasoning_output_tokens": int(turn["reasoning_output_tokens"] or 0),
             "total_tokens": int(turn["total_tokens"] or 0),
-            "weighted_credits": float(turn["weighted_credits"] or 0.0),
+            "weighted_credits": None if turn["weighted_credits"] is None else float(turn["weighted_credits"]),
             "max_total_tokens": 0,
             "max_output_tokens": 0,
             "first_call_index": None,

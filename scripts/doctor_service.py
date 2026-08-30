@@ -304,7 +304,14 @@ def doctor_health(report: dict[str, object]) -> dict[str, object]:
 
     dir_status = report["codex_dir"]
     cli_status = report["codex_cli"]
+    config_status = report.get("config")
     runtime = report["runtime"]
+    if isinstance(config_status, dict) and not config_status.get("configured"):
+        add_issue(
+            "runtime_config_missing",
+            "failed",
+            path=config_status.get("path") if isinstance(config_status, dict) else None,
+        )
     if isinstance(dir_status, dict) and not dir_status.get("valid"):
         add_issue("codex_dir_invalid", "failed", reason=dir_status.get("reason"))
     if isinstance(cli_status, dict) and not cli_status.get("valid"):
@@ -435,7 +442,7 @@ def run_doctor(options: DoctorOptions, dependencies: DoctorDependencies) -> Doct
         "codex_dir": codex_dir,
         "output_dir": base,
         "project_root": paths.project_root,
-        "config": paths.config_path,
+        "config": paths.runtime_config_path,
         "normalized_log": base / "normalized" / "prompt-usage.normalized.jsonl",
         "analytics_db": base / "analytics" / "bola.sqlite",
         "state_db": codex_dir / "state_5.sqlite",
@@ -452,7 +459,7 @@ def run_doctor(options: DoctorOptions, dependencies: DoctorDependencies) -> Doct
     report["codex_cli"] = dependencies.codex_cli_status()
     config = report["config"]
     assert isinstance(config, dict)
-    config["configured"] = paths.config_path.exists()
+    config["configured"] = paths.runtime_config_path.exists()
     report["installed_hook"] = dependencies.hook_install_status(codex_dir)
     now_unix = dependencies.now()
     error_summary = error_log_summary(base, now_unix=now_unix)

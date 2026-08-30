@@ -106,14 +106,15 @@ class BuildAnalyticsContextTests(unittest.TestCase):
                 {
                     "context_snapshot_version": build.build_analytics_context.CONTEXT_SNAPSHOT_VERSION,
                     "analytics_schema_version": build.ANALYTICS_SCHEMA_VERSION,
+                    "cost_rate_catalog_digest": build.COST_RATE_CATALOG.digest,
                 },
             )
             con.commit()
             con.close()
 
             current_threads = {
-                "parent": {"thread_name": "new parent", "model": "new-context"},
-                "child": {"thread_name": "new child", "model": "new-context"},
+                "parent": {"thread_name": "new parent", "model": "old-context"},
+                "child": {"thread_name": "new child", "model": "old-context"},
             }
             with mock.patch.object(build, "read_threads", return_value=current_threads), mock.patch.object(build, "read_edges", return_value=[]):
                 result = build.incremental_build(type("Args", (), {"turns_offset": 0})())
@@ -132,12 +133,52 @@ class BuildAnalyticsContextTests(unittest.TestCase):
         self.assertEqual(
             rows,
             [
-                ("child", "new child", "new-context", 1),
+                ("child", "new child", "old-context", 1),
                 ("parent", "new parent", "normalized-model", 0),
             ],
         )
         self.assertEqual(rollup_count, 0)
         self.assertEqual(edge_count, 0)
+
+    def test_context_model_change_requires_full_cost_rebuild(self) -> None:
+        build = load_module("build_analytics_context_model_cost_test", ROOT / "scripts" / "build_analytics.py")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = pathlib.Path(tmp_dir)
+            build.NORMALIZED_LOG = base / "normalized.jsonl"
+            build.NORMALIZED_LOG.write_text("", encoding="utf-8")
+            build.ANALYTICS_DB = base / "analytics.sqlite"
+            build.STATE_DB = base / "missing-state.sqlite"
+            build.SESSION_INDEX = base / "session-index.jsonl"
+            build.RETENTION_PRUNED_TURNS_FILE = base / "retention.json"
+            con = sqlite3.connect(build.ANALYTICS_DB)
+            build.setup_db(con)
+            old_threads = {"child": {"thread_name": "child", "model": "gpt-5.5"}}
+            build.upsert_turn_row(
+                con,
+                {"session_id": "child", "turn_id": "c1", "captured_at": "2026-06-01T00:00:00Z", "usage": {"total_tokens": 20}},
+                old_threads,
+            )
+            build.build_analytics_context.replace_snapshot(
+                con,
+                build.build_analytics_context.thread_projection(old_threads),
+                {},
+            )
+            build.write_metadata(
+                con,
+                {
+                    "context_snapshot_version": build.build_analytics_context.CONTEXT_SNAPSHOT_VERSION,
+                    "analytics_schema_version": build.ANALYTICS_SCHEMA_VERSION,
+                    "cost_rate_catalog_digest": build.COST_RATE_CATALOG.digest,
+                },
+            )
+            con.commit()
+            con.close()
+
+            current_threads = {"child": {"thread_name": "child", "model": "gpt-5.6-sol"}}
+            with mock.patch.object(build, "read_threads", return_value=current_threads), mock.patch.object(build, "read_edges", return_value=[]):
+                result = build.incremental_build(type("Args", (), {"turns_offset": 0})())
+
+        self.assertIsNone(result)
 
     def test_incremental_build_falls_back_once_without_snapshot_version(self) -> None:
         build = load_module("build_analytics_context_upgrade_fallback_test", ROOT / "scripts" / "build_analytics.py")
@@ -180,6 +221,7 @@ class BuildAnalyticsContextTests(unittest.TestCase):
                 {
                     "context_snapshot_version": build.build_analytics_context.CONTEXT_SNAPSHOT_VERSION,
                     "analytics_schema_version": build.ANALYTICS_SCHEMA_VERSION,
+                    "cost_rate_catalog_digest": build.COST_RATE_CATALOG.digest,
                     "applied_retention_fingerprint": "same",
                 },
             )
@@ -220,6 +262,7 @@ class BuildAnalyticsContextTests(unittest.TestCase):
                 {
                     "context_snapshot_version": build.build_analytics_context.CONTEXT_SNAPSHOT_VERSION,
                     "analytics_schema_version": build.ANALYTICS_SCHEMA_VERSION,
+                    "cost_rate_catalog_digest": build.COST_RATE_CATALOG.digest,
                     "applied_retention_fingerprint": "old",
                 },
             )

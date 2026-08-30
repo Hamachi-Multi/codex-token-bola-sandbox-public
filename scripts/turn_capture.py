@@ -223,15 +223,13 @@ def safe_name(value: str) -> str:
     return sha256_text(value)[:32]
 
 
-def prompt_metadata(text: str, *, preview_chars: int, instruction_excerpt_chars: int) -> dict[str, Any]:
+def prompt_metadata(text: str, *, preview_chars: int) -> dict[str, Any]:
     code_blocks = list(CODE_FENCE_RE.finditer(text))
     code_chars = sum(len(match.group(0)) for match in code_blocks)
     code_lines = sum(match.group(0).count("\n") + 1 for match in code_blocks)
     languages = sorted({match.group(1).strip().lower() for match in code_blocks if match.group(1).strip()})
-    instruction_text = CODE_FENCE_RE.sub("", text).strip()
     chars = len(text)
-    preview = text if preview_chars < 0 else (text[:preview_chars] if preview_chars > 0 else "")
-    excerpt = instruction_text[:instruction_excerpt_chars] if instruction_excerpt_chars > 0 else ""
+    preview = text[:preview_chars] if preview_chars > 0 else ""
     return {
         "prompt_preview": preview,
         "prompt_preview_chars": len(preview),
@@ -239,8 +237,6 @@ def prompt_metadata(text: str, *, preview_chars: int, instruction_excerpt_chars:
         "prompt_lines": text.count("\n") + 1 if text else 0,
         "prompt_sha256": sha256_text(text) if text else None,
         "prompt_truncated": len(preview) < chars,
-        "instruction_excerpt": excerpt,
-        "instruction_excerpt_chars": min(len(instruction_text), instruction_excerpt_chars),
         "payload_stats": {
             "code_block_count": len(code_blocks),
             "code_block_chars": code_chars,
@@ -250,6 +246,15 @@ def prompt_metadata(text: str, *, preview_chars: int, instruction_excerpt_chars:
             "payload_ratio": round(code_chars / chars, 4) if chars else 0.0,
         },
     }
+
+
+def without_instruction_excerpt(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    sanitized = dict(value)
+    sanitized.pop("instruction_excerpt", None)
+    sanitized.pop("instruction_excerpt_chars", None)
+    return sanitized
 
 
 def assistant_metadata(data: dict[str, Any]) -> dict[str, Any]:

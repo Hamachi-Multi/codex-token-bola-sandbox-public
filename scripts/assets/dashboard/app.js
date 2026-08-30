@@ -5,7 +5,6 @@ import {
   SETTINGS_KEY,
   TURN_SORT_KEYS,
   TURN_SORT_LABELS,
-  fmt,
   state,
   views,
 } from './core.js';
@@ -20,11 +19,8 @@ import {
 } from './query-cache.js';
 import { esc } from './ui.js';
 import { createCleanupController, normalizeCleanupRetentionMode } from './cleanup.js';
-import { markCleanupPreviewUnavailable } from './cleanup-retention.js';
 import {
-  clearInteractiveRowSelection,
   focusActiveViewRow,
-  handleListArrowFocus,
   detailGridLoadingPanel,
   metric,
   refreshScrollFades,
@@ -32,13 +28,10 @@ import {
   sessionDetailLoadingPanel,
   clearQueryStatus,
   setGlobalError,
-  setActiveModal,
-  setInteractiveRowSelected,
   setPanelContent,
   showQueryError,
   table,
   tableLoadingPanel,
-  trapModalFocus,
 } from './dom.js';
 import {
   compactDateTime,
@@ -46,15 +39,23 @@ import {
   compactNumberSpan,
   exactNumber,
   formatBytes,
+  normalizeSessionLabelMode,
   sessionLabel,
   sessionLabelMarkup,
   turnStatusClass,
 } from './formatters.js';
 import { createSelectedTurnController } from './selected-turn.js';
 import { createAnalyzeController } from './analyze.js';
+import { createCostRatesController } from './cost-rates.js';
+import { createSettingsView } from './settings-view.js';
 import { createSessionPickerController } from './session-picker.js';
+import { createServiceActivityController } from './service-activity.js';
 import { createToolbarController, selectHasValue } from './toolbar.js';
 import { createOverviewRenderers } from './overview-render.js';
+import { createPager } from './components/pager.js';
+import { createDialogManager } from './components/dialog.js';
+import { createCleanupSummary } from './components/cleanup-summary.js';
+import { createListDetailView } from './components/list-detail-view.js';
 
 export function initDashboard() {
 
@@ -74,6 +75,24 @@ const THEME_TRANSITION_MS = 160;
 let themeCommitTimer = 0;
 let systemThemeMedia = null;
 let systemThemeSync = null;
+let initialDataLoadStarted = false;
+let settingsAnalyticsRefreshPending = false;
+const pageNav = document.querySelector('.page-nav');
+const pageNavFrame = document.querySelector('.page-nav-frame');
+
+function updatePageNavOverflow() {
+  if (!pageNav || !pageNavFrame) return;
+  const maxScrollLeft = Math.max(0, pageNav.scrollWidth - pageNav.clientWidth);
+  pageNavFrame.dataset.canScrollLeft = String(pageNav.scrollLeft > 1);
+  pageNavFrame.dataset.canScrollRight = String(pageNav.scrollLeft < maxScrollLeft - 1);
+}
+
+function revealActivePageNav() {
+  const activeButton = pageNav?.querySelector('.nav-btn.active');
+  if (!activeButton) return;
+  activeButton.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  requestAnimationFrame(updatePageNavOverflow);
+}
 
 function normalizeTurnSortKey(value) {
   if (value === 'time' || value === 'clock') return 'date';
@@ -99,11 +118,11 @@ function normalizeListSortDir(value) {
 }
 
 function normalizeThemeMode(value) {
-  return value === 'dark' ? 'dark' : 'light';
+  return value === 'dark' || value === 'light' ? value : 'system';
 }
 
 function storedThemeMode(settings = {}) {
-  return settings.themeMode === 'dark' || settings.themeMode === 'light' ? settings.themeMode : '';
+  return normalizeThemeMode(settings.themeMode);
 }
 
 function systemThemeMode() {
@@ -111,7 +130,7 @@ function systemThemeMode() {
 }
 
 function resolveInitialThemeMode(settings = {}) {
-  return storedThemeMode(settings) || systemThemeMode();
+  return storedThemeMode(settings);
 }
 
 function unbindSystemThemePreference() {
@@ -125,16 +144,16 @@ function unbindSystemThemePreference() {
   systemThemeSync = null;
 }
 
-function bindSystemThemePreference(settings = readSettings()) {
+function bindSystemThemePreference() {
   unbindSystemThemePreference();
-  if (storedThemeMode(settings) || typeof window.matchMedia !== 'function') return;
+  if (state.themeMode !== 'system' || typeof window.matchMedia !== 'function') return;
   systemThemeMedia = window.matchMedia('(prefers-color-scheme: dark)');
   const sync = () => {
-    if (storedThemeMode(readSettings())) {
+    if (state.themeMode !== 'system') {
       unbindSystemThemePreference();
       return;
     }
-    applyThemeMode(systemThemeMode(), {suppressTransitions: true});
+    applyThemeMode('system', {suppressTransitions: true});
   };
   systemThemeSync = sync;
   if (typeof systemThemeMedia.addEventListener === 'function') {
@@ -160,7 +179,7 @@ function commitThemeMode(normalized, {suppressTransitions = false} = {}) {
     button.classList.toggle('active', active);
     button.setAttribute('aria-pressed', active ? 'true' : 'false');
   });
-  root.dataset.theme = normalized;
+  root.dataset.theme = normalized === 'system' ? systemThemeMode() : normalized;
   if (suppressTransitions) {
     themeCommitTimer = window.setTimeout(releaseThemeCommit, THEME_TRANSITION_MS);
   } else {
@@ -170,9 +189,10 @@ function commitThemeMode(normalized, {suppressTransitions = false} = {}) {
 
 function applyThemeMode(mode, {transition = false, suppressTransitions = false} = {}) {
   const normalized = normalizeThemeMode(mode);
+  const resolved = normalized === 'system' ? systemThemeMode() : normalized;
   const canViewTransition = transition
     && !suppressTransitions
-    && state.themeMode !== normalized
+    && document.documentElement.dataset.theme !== resolved
     && typeof document.startViewTransition === 'function'
     && !window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   document.documentElement.style.setProperty('--theme-transition-duration', `${THEME_TRANSITION_MS}ms`);
@@ -180,14 +200,17 @@ function applyThemeMode(mode, {transition = false, suppressTransitions = false} 
     const viewTransition = document.startViewTransition(() => commitThemeMode(normalized, {suppressTransitions: true}));
     return viewTransition.updateCallbackDone.catch(() => {});
   }
-  commitThemeMode(normalized, {suppressTransitions: suppressTransitions || (transition && state.themeMode !== normalized)});
+  commitThemeMode(normalized, {suppressTransitions: suppressTransitions || (transition && document.documentElement.dataset.theme !== resolved)});
   return Promise.resolve();
 }
 
 function applyThemeModeAndSave(mode) {
-  state.themeModeExplicit = true;
+  const normalized = normalizeThemeMode(mode);
   unbindSystemThemePreference();
-  applyThemeMode(mode, {transition: true}).then(saveSettings);
+  applyThemeMode(normalized, {transition: true}).then(() => {
+    bindSystemThemePreference();
+    saveSettings();
+  });
 }
 
 function defaultTurnSortDir(key) {
@@ -248,16 +271,18 @@ function saveSettings() {
     listSorts: state.listSorts,
     cleanupRetentionMode: state.cleanupRetentionMode,
     cleanupRetentionDate: document.getElementById('cleanup-retention-date').value,
+    sessionLabelMode: state.sessionLabelMode,
   };
-  if (state.themeModeExplicit) payload.themeMode = state.themeMode;
+  payload.themeMode = state.themeMode;
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(payload));
 }
 
 function restoreSettings() {
   const settings = readSettings();
-  state.themeModeExplicit = Boolean(storedThemeMode(settings));
+  state.sessionLabelMode = normalizeSessionLabelMode(settings.sessionLabelMode);
+  document.getElementById('session-label-mode').value = state.sessionLabelMode;
   applyThemeMode(resolveInitialThemeMode(settings), {suppressTransitions: true});
-  bindSystemThemePreference(settings);
+  bindSystemThemePreference();
   restoreToolbarSettings(settings);
   restoreSessionFilter(settings);
   if (selectHasValue('turn-page-size', settings.turnPageSize)) {
@@ -285,6 +310,7 @@ function restoreSettings() {
 function setView(name, updateHash = true, { focusContent = true } = {}) {
   const view = views.has(name) ? name : 'overview';
   state.view = view;
+  document.body.dataset.activeView = view;
   document.querySelectorAll('.view').forEach(section => {
     section.classList.toggle('active', section.dataset.view === view);
   });
@@ -292,6 +318,7 @@ function setView(name, updateHash = true, { focusContent = true } = {}) {
     button.classList.toggle('active', button.dataset.viewTarget === view);
     button.setAttribute('aria-current', button.dataset.viewTarget === view ? 'page' : 'false');
   });
+  requestAnimationFrame(revealActivePageNav);
   if (updateHash && location.hash.slice(1) !== view) {
     history.replaceState(null, '', '#' + view);
   }
@@ -301,7 +328,15 @@ function setView(name, updateHash = true, { focusContent = true } = {}) {
     ? document.activeElement
     : null;
   if (view === 'cleanup') loadCleanup();
-  if (view !== 'cleanup' && state.requestSeq > 0) loadVisibleRollupData(state.requestSeq);
+  if (view !== 'cleanup' && view !== 'settings' && settingsAnalyticsRefreshPending) {
+    settingsAnalyticsRefreshPending = false;
+    initialDataLoadStarted = true;
+    safeLoadWithSessionOptions();
+  } else if (view !== 'cleanup' && view !== 'settings' && state.requestSeq > 0) {
+    loadVisibleRollupData(state.requestSeq);
+  } else if (view !== 'cleanup' && view !== 'settings' && state.requestSeq === 0) {
+    ensureInitialDataLoad();
+  }
   if (view !== 'cleanup' && focusContent) focusActiveViewRow();
   refreshScrollFades();
   requestAnimationFrame(updateSelectedTurnPromptOverflow);
@@ -310,6 +345,7 @@ function setView(name, updateHash = true, { focusContent = true } = {}) {
 function params() {
   const sessionId = sessionFilterValue();
   const q = new URLSearchParams({ days: timeRangeDaysValue() });
+  q.set('session_label_mode', state.sessionLabelMode);
   if (sessionId) q.set('session_id', sessionId);
   return q;
 }
@@ -504,56 +540,18 @@ function freshnessIndicator(freshness) {
   const pendingRecoveryFiles = Number(data.pending_recovery_files || 0);
   let title = '';
   if (status === 'needs_analyze' && pendingAnalysisRows > 0) {
-    title = `global pending · ${compactNumber(pendingAnalysisRows)} rows`;
-    if (data.data_health === 'degraded') title = `${title} · freshness degraded`;
+    title = `${compactNumber(pendingAnalysisRows)} rows pending`;
   } else if (status === 'needs_analyze' && pendingRecoveryFiles > 0) {
-    title = `global recovery pending · ${compactNumber(pendingRecoveryFiles)} files`;
-    if (data.data_health === 'degraded') title = `${title} · freshness degraded`;
+    title = `${compactNumber(pendingRecoveryFiles)} files pending recovery`;
   } else if (status === 'degraded' || data.data_health === 'degraded') {
-    title = 'global freshness degraded';
     const warnings = Array.isArray(data.warnings) ? data.warnings : [];
     const firstWarning = warnings.length ? String(warnings[0].code || '') : '';
-    if (firstWarning) title = `${title} · ${firstWarning}`;
+    title = firstWarning || 'Data warning';
   } else {
     if (status !== 'current') return '';
     title = 'global current';
   }
   return `<span class="metric-freshness-dot" data-freshness-state="${esc(status)}" data-tooltip="${esc(title)}" aria-label="${esc(title)}" tabindex="0"></span>`;
-}
-
-function setPagerBusy(id, busy) {
-  const pager = document.getElementById(id);
-  if (!pager) return;
-  pager.setAttribute('aria-busy', busy ? 'true' : 'false');
-  pager.querySelectorAll('button').forEach(button => {
-    if (busy) {
-      button.dataset.wasDisabled = button.disabled ? 'true' : 'false';
-      button.disabled = true;
-    } else if (button.dataset.wasDisabled === 'false') {
-      button.disabled = false;
-    }
-  });
-}
-
-function renderPager(total, page, perPage) {
-  const pageCount = Math.max(1, Math.ceil(total / perPage));
-  const start = total ? (page - 1) * perPage + 1 : 0;
-  const end = Math.min(total, page * perPage);
-  document.getElementById('turn-pager').innerHTML = `
-    <button id="prev-page" ${page <= 1 ? 'disabled' : ''}>Prev</button>
-    <span class="page-status">${fmt.format(start)}-${fmt.format(end)} / ${fmt.format(total)}</span>
-    <button id="next-page" ${page >= pageCount ? 'disabled' : ''}>Next</button>
-  `;
-  document.getElementById('prev-page')?.addEventListener('click', () => {
-    if (state.turnPage > 1) {
-      safeLoadTurnPage(state.turnPage - 1);
-    }
-  });
-  document.getElementById('next-page')?.addEventListener('click', () => {
-    if (state.turnPage < pageCount) {
-      safeLoadTurnPage(state.turnPage + 1);
-    }
-  });
 }
 
 function pageRows(payload) {
@@ -612,7 +610,7 @@ function prefetchNextPage(payload, pathForPage, detailPathForRow) {
 async function loadOverviewData(seq = state.requestSeq, page = state.listPages.projects || 1, busy = false) {
   const listSeq = ++state.sessionListSeq;
   const path = sessionsPath(page);
-  if (busy && !peekCachedJSON(path).hit) setPagerBusy('projects-pager', true);
+  if (busy && !peekCachedJSON(path).hit) setListPagerBusy('projects', true);
   try {
     const sessions = await cachedValue(path);
     const prepared = await prepareSessionDetail(sessions);
@@ -626,14 +624,14 @@ async function loadOverviewData(seq = state.requestSeq, page = state.listPages.p
     if (seq !== state.requestSeq || listSeq !== state.sessionListSeq) return false;
     throw error;
   } finally {
-    if (listSeq === state.sessionListSeq) setPagerBusy('projects-pager', false);
+    if (listSeq === state.sessionListSeq) setListPagerBusy('projects', false);
   }
 }
 
 async function loadToolsData(seq = state.requestSeq, page = state.listPages.tools || 1, busy = false) {
   const listSeq = ++state.toolListSeq;
   const path = toolsPath(page);
-  if (busy && !peekCachedJSON(path).hit) setPagerBusy('tool-output-pager', true);
+  if (busy && !peekCachedJSON(path).hit) setListPagerBusy('tools', true);
   try {
     const tools = await cachedValue(path);
     const prepared = await prepareToolDetail(tools);
@@ -647,7 +645,7 @@ async function loadToolsData(seq = state.requestSeq, page = state.listPages.tool
     if (seq !== state.requestSeq || listSeq !== state.toolListSeq) return false;
     throw error;
   } finally {
-    if (listSeq === state.toolListSeq) setPagerBusy('tool-output-pager', false);
+    if (listSeq === state.toolListSeq) setListPagerBusy('tools', false);
   }
 }
 
@@ -737,8 +735,6 @@ function targetTurnRow(turns) {
 }
 
 function commitTurnRow(row, detail) {
-  clearInteractiveRowSelection('#turn-list tr[data-turn]');
-  setInteractiveRowSelected(row, true);
   state.selected = { session: row.dataset.session, turn: row.dataset.turn };
   state.promptExpanded = false;
   state.toolSummaryExpanded = false;
@@ -748,47 +744,28 @@ function commitTurnRow(row, detail) {
   refreshScrollFades();
 }
 
-async function selectTurnRow(row, preparedDetail) {
-  clearQueryStatus();
-  const path = turnDetailPath(row.dataset.session || '', row.dataset.turn || '');
-  const detailSeq = ++state.detailSeq;
-  if (preparedDetail !== undefined) {
-    commitTurnRow(row, preparedDetail);
-    return;
-  }
-  const cached = peekCachedJSON(path);
-  if (cached.hit) {
-    commitTurnRow(row, cached.data);
-    return;
-  }
-  const previous = document.querySelector('#turn-list tr.selected');
-  const previousStatus = document.getElementById('detail-status').textContent;
-  clearInteractiveRowSelection('#turn-list tr[data-turn]');
-  setInteractiveRowSelected(row, true);
-  row.setAttribute('aria-busy', 'true');
-  try {
-    const detail = await getCachedJSON(path);
-    if (detailSeq !== state.detailSeq || !row.isConnected) return;
-    commitTurnRow(row, detail);
-  } catch (err) {
-    if (detailSeq === state.detailSeq && row.isConnected) {
-      setInteractiveRowSelected(row, false);
-      if (previous && previous.isConnected) {
-        setInteractiveRowSelected(previous, true);
-      }
-      document.getElementById('detail-status').textContent = previousStatus;
-      if (!previous || !previous.isConnected) {
-        state.selected = null;
-        state.detailData = null;
-        document.getElementById('detail-status').textContent = 'error';
-        setPanelContent('detail', esc(err.message || err), 'error');
-      }
-      showQueryError(err.message || err);
-      refreshScrollFades();
-    }
-  } finally {
-    if (row.isConnected) row.removeAttribute('aria-busy');
-  }
+const turnDetailView = createListDetailView({
+  rowSelector: '#turn-list tr[data-turn]',
+  buttonSelector: '#turn-list tr[data-turn] .row-select-button',
+  detailId: 'detail',
+  statusId: 'detail-status',
+  keyForRow: row => `${row.dataset.session || ''}\u0000${row.dataset.turn || ''}`,
+  pathForRow: row => turnDetailPath(row.dataset.session || '', row.dataset.turn || ''),
+  nextRequestSequence: () => ++state.detailSeq,
+  isCurrentRequest: sequence => sequence === state.detailSeq,
+  commit: commitTurnRow,
+  reset: () => {
+    state.selected = null;
+    state.detailData = null;
+  },
+  getCachedJSON,
+  peekCachedJSON,
+  clearQueryStatus,
+  showQueryError,
+});
+
+function selectTurnRow(row, preparedDetail) {
+  return turnDetailView.select(row, preparedDetail);
 }
 
 function renderTurnPage(turns, prepared = null) {
@@ -805,7 +782,9 @@ function renderTurnPage(turns, prepared = null) {
       const resolutionReason = r.token_resolution_reason || 'Token data unavailable';
       const resolutionMeta = tokenAvailable ? '' : `<span class="status token-unavailable" title="${esc(resolutionReason)}">Token unavailable</span>`;
       const rawValue = tokenAvailable ? compactNumberSpan(r.raw) : `<span class="token-unavailable-value" title="${esc(resolutionReason)}">—</span>`;
-      const creditValue = tokenAvailable ? compactNumberSpan(r.credits, 'money') : `<span class="token-unavailable-value" title="${esc(resolutionReason)}">—</span>`;
+      const costAvailable = tokenAvailable && r.credits !== null && r.credits !== undefined;
+      const costReason = costAvailable ? '' : (tokenAvailable ? 'Cost rate is not configured for this model and date' : resolutionReason);
+      const creditValue = costAvailable ? compactNumberSpan(r.credits, 'money') : `<span class="token-unavailable-value" title="${esc(costReason)}">—</span>`;
       const promptLabel = r.prompt_preview || 'No prompt preview';
       const promptAt = r.started_at || r.captured_at || '';
       const turnLabel = ['Turn', status, compactDateTime(promptAt), label, promptLabel].filter(Boolean).join(' · ');
@@ -818,33 +797,19 @@ function renderTurnPage(turns, prepared = null) {
       setTurnSort(button.dataset.turnSort, button);
     });
   });
-  document.querySelectorAll('#turn-list tr[data-turn]').forEach(row => {
-    row.addEventListener('click', () => selectTurnRow(row));
+  turnDetailView.bindRows();
+  turnDetailView.activateRendered({
+    isSelected: row => state.selected
+      && row.dataset.session === state.selected.session
+      && row.dataset.turn === state.selected.turn,
+    prepared,
   });
-  document.querySelectorAll('#turn-list tr[data-turn] .row-select-button').forEach(button => {
-    button.addEventListener('keydown', event => handleListArrowFocus(event, '#turn-list tr[data-turn] .row-select-button', true));
-  });
-  const visibleTurn = [...document.querySelectorAll('#turn-list tr[data-turn]')]
-    .find(row => state.selected && row.dataset.session === state.selected.session && row.dataset.turn === state.selected.turn);
-  const target = visibleTurn || document.querySelector('#turn-list tr[data-turn]');
-  const targetKey = target ? `${target.dataset.session}\u0000${target.dataset.turn}` : '';
-  if (target && prepared?.error && prepared.key === targetKey) {
-    state.selected = null;
-    state.detailData = null;
-    document.getElementById('detail-status').textContent = 'error';
-    setPanelContent('detail', esc(prepared.error.message || prepared.error), 'error');
-  } else if (target && prepared && prepared.key === targetKey) {
-    selectTurnRow(target, prepared.data);
-  } else if (target) {
-    selectTurnRow(target);
-  } else {
-    state.selected = null;
-    state.detailData = null;
-    document.getElementById('detail-status').textContent = 'none';
-    setPanelContent('detail', 'No rows for the current filter.', 'empty');
-  }
   focusActiveViewRow();
-  renderPager(turns.total || 0, turns.page || 1, turns.per_page || state.turnPageSize);
+  turnPager.render({
+    total: turns.total || 0,
+    page: turns.page || 1,
+    perPage: turns.per_page || state.turnPageSize,
+  });
   refreshScrollFades();
 }
 
@@ -856,12 +821,12 @@ async function loadTurnPage(page) {
   const requestSeq = state.requestSeq;
   const listSeq = ++state.turnListSeq;
   const path = turnsPath(page);
-  if (!peekCachedJSON(path).hit) setPagerBusy('turn-pager', true);
+  if (!peekCachedJSON(path).hit) turnPager.setBusy(true);
   try {
     const turns = await cachedValue(path);
     const first = targetTurnRow(turns);
     if (first && !peekCachedJSON(turnDetailPath(first.session_id || '', first.turn_id || '')).hit) {
-      setPagerBusy('turn-pager', true);
+      turnPager.setBusy(true);
     }
     const prepared = await prepareTurnDetail(turns);
     if (requestSeq !== state.requestSeq || listSeq !== state.turnListSeq) return false;
@@ -873,7 +838,7 @@ async function loadTurnPage(page) {
     if (requestSeq !== state.requestSeq || listSeq !== state.turnListSeq) return false;
     throw error;
   } finally {
-    if (listSeq === state.turnListSeq) setPagerBusy('turn-pager', false);
+    if (listSeq === state.turnListSeq) turnPager.setBusy(false);
   }
 }
 
@@ -909,7 +874,7 @@ async function load() {
     const { summary, turns } = dashboard;
     document.getElementById('summary').innerHTML = [
       metric('Analyzed Turns', compactNumber(summary.turns || 0), '', `${exactNumber(summary.turns || 0)} eligible · ${exactNumber(summary.unavailable_turns || 0)} unavailable`, freshnessIndicator(dashboard.freshness)),
-      metric('Cost Units', compactNumber(summary.weighted_credits || 0, 'money'), '', exactNumber(summary.weighted_credits || 0, 'money')),
+      metric('Cost Units', summary.cost_complete === false ? '—' : compactNumber(summary.weighted_credits || 0, 'money'), '', summary.cost_complete === false ? `${exactNumber(summary.unpriced_turns || 0)} turns need a cost rate` : exactNumber(summary.weighted_credits || 0, 'money')),
       metric('Total Tokens', compactNumber(summary.total_tokens || 0), '', exactNumber(summary.total_tokens || 0)),
       metric('Cached Input', compactNumber(summary.cached_input_tokens || 0), '', exactNumber(summary.cached_input_tokens || 0)),
       metric('Non-Cached Input', compactNumber(summary.non_cached_input_tokens || 0), '', exactNumber(summary.non_cached_input_tokens || 0)),
@@ -986,6 +951,12 @@ function safeLoadWithSessionOptions() {
   loadSessionOptions();
 }
 
+function ensureInitialDataLoad() {
+  if (initialDataLoadStarted || state.requestSeq > 0) return;
+  initialDataLoadStarted = true;
+  loadSessionOptions().then(() => safeLoad());
+}
+
 const toolbarController = createToolbarController({
   saveSettings,
   resetAllPages,
@@ -1012,17 +983,24 @@ const {
   sessionFilterValue,
 } = sessionPickerController;
 
+const dialogManager = createDialogManager();
+const cleanupSummary = createCleanupSummary();
+let costRatesController = null;
+const settingsViewController = createSettingsView({
+  onSelectionChange: key => costRatesController?.setActive(key === 'cost-rates'),
+});
+
 const cleanupController = createCleanupController({
   load,
   loadSessionOptions,
   prepareAnalyticsReload,
   setAnalyticsUnavailable,
+  dialogManager,
+  cleanupSummary,
 });
 const {
-  clearCleanupStatus,
-  closeCleanupConfirmModal,
-  closeCleanupDetailModal,
   deleteCleanupFiles,
+  invalidateCleanupPreview,
   loadCleanup,
   resolveCleanupConfirmModal,
   setCleanupRetentionMode,
@@ -1038,19 +1016,36 @@ const analyzeController = createAnalyzeController({
   refreshScrollFades,
 });
 const {
+  applyServiceActivity,
   rebuildAndRefresh,
   setAnalyzeButtonState,
 } = analyzeController;
 
+async function refreshAnalyticsAfterCostRecalculation() {
+  invalidateAnalyticsQueries();
+  resetAllPages();
+  settingsAnalyticsRefreshPending = true;
+  await loadSessionOptions();
+}
+
+costRatesController = createCostRatesController({
+  refreshAnalytics: refreshAnalyticsAfterCostRecalculation,
+  dialogManager,
+  onModelSelected: () => settingsViewController.select('cost-rates'),
+});
+const serviceActivityController = createServiceActivityController();
+serviceActivityController.subscribe(applyServiceActivity);
+serviceActivityController.subscribe(costRatesController.applyServiceActivity);
+costRatesController.setServiceActivityRefresh(serviceActivityController.refresh);
+
 const selectedTurnController = createSelectedTurnController({
   params,
   refreshScrollFades,
-  setActiveModal,
+  dialogManager,
 });
 const {
   bindDetailControls,
   bindToolTurnLinks,
-  closeTurnModal,
   openTurnModalFromToolLink,
   renderDetailSummary,
   turnPromptPreviewMarkup,
@@ -1073,7 +1068,15 @@ const {
   renderSessionList,
   renderToolList,
   renderSubagentList,
+  setListPagerBusy,
 } = overviewRenderers;
+
+const turnPager = createPager({
+  rootId: 'turn-pager',
+  previousButtonId: 'prev-page',
+  nextButtonId: 'next-page',
+  onPageChange: page => safeLoadTurnPage(page),
+});
 
 document.getElementById('refresh').addEventListener('click', () => {
   saveSettings();
@@ -1088,22 +1091,31 @@ document.querySelectorAll('[data-cleanup-retention-preset]').forEach(button => {
   button.addEventListener('click', () => {
     setCleanupRetentionMode(button.dataset.cleanupRetentionPreset);
     saveSettings();
-    markCleanupPreviewUnavailable('Preview loading');
+    invalidateCleanupPreview('Preview loading');
     loadCleanup({preserveRows: true});
   });
 });
 document.getElementById('cleanup-retention-date').addEventListener('change', () => {
   setCleanupRetentionMode('custom');
   saveSettings();
-  markCleanupPreviewUnavailable('Preview loading');
+  invalidateCleanupPreview('Preview loading');
   loadCleanup({preserveRows: true});
 });
 bindToolbarControls();
+document.getElementById('session-label-mode').addEventListener('change', event => {
+  state.sessionLabelMode = normalizeSessionLabelMode(event.target.value);
+  event.target.value = state.sessionLabelMode;
+  saveSettings();
+  resetAllPages();
+  if (state.view === 'settings') settingsAnalyticsRefreshPending = true;
+  else safeLoadWithSessionOptions();
+});
 document.getElementById('turn-page-size').addEventListener('change', event => {
   state.turnPageSize = Number(event.target.value || DEFAULT_TURN_PAGE_SIZE);
   saveSettings();
   resetAllPages();
-  safeLoad();
+  if (state.view === 'settings') settingsAnalyticsRefreshPending = true;
+  else safeLoad();
 });
 document.querySelectorAll('[data-theme-mode]').forEach(button => {
   button.addEventListener('click', () => {
@@ -1111,50 +1123,20 @@ document.querySelectorAll('[data-theme-mode]').forEach(button => {
   });
 });
 bindSessionPickerControls();
-document.getElementById('turn-modal-close').addEventListener('click', closeTurnModal);
-document.getElementById('turn-modal').addEventListener('click', event => {
-  if (event.target.id === 'turn-modal') closeTurnModal();
-});
-document.getElementById('cleanup-detail-modal-close').addEventListener('click', closeCleanupDetailModal);
 document.getElementById('cleanup-detail-modal').addEventListener('click', event => {
   if (event.target.closest('[data-cleanup-modal-delete]')) {
     deleteCleanupFiles();
     return;
   }
-  if (event.target.id === 'cleanup-detail-modal') closeCleanupDetailModal();
 });
-document.getElementById('cleanup-confirm-close')?.addEventListener('click', () => closeCleanupConfirmModal(false));
-document.getElementById('cleanup-confirm-cancel').addEventListener('click', () => closeCleanupConfirmModal(false));
 document.getElementById('cleanup-confirm-delete').addEventListener('click', () => resolveCleanupConfirmModal(true));
-document.getElementById('cleanup-confirm-modal').addEventListener('click', event => {
-  if (event.target.id === 'cleanup-confirm-modal') closeCleanupConfirmModal(false);
-});
-window.addEventListener('keydown', event => {
-  if (document.getElementById('cleanup-confirm-modal').classList.contains('open')) {
-    if (event.key === 'Escape') {
-      closeCleanupConfirmModal(false);
-    } else if (event.key === 'Tab') {
-      trapModalFocus(event, 'cleanup-confirm-modal');
-    }
-  } else if (document.getElementById('turn-modal').classList.contains('open')) {
-    if (event.key === 'Escape') {
-      closeTurnModal();
-    } else if (event.key === 'Tab') {
-      trapModalFocus(event);
-    }
-  } else if (document.getElementById('cleanup-detail-modal').classList.contains('open')) {
-    if (event.key === 'Escape') {
-      closeCleanupDetailModal();
-    } else if (event.key === 'Tab') {
-      trapModalFocus(event, 'cleanup-detail-modal');
-    }
-  }
-});
 document.querySelectorAll('.nav-btn').forEach(button => {
   button.addEventListener('click', () => setView(button.dataset.viewTarget));
 });
+pageNav?.addEventListener('scroll', updatePageNavOverflow, { passive: true });
 window.addEventListener('hashchange', () => setView(location.hash.slice(1), false));
 window.addEventListener('resize', () => {
+  revealActivePageNav();
   refreshScrollFades();
   updateSelectedTurnPromptOverflow();
   requestAnimationFrame(updateSelectedTurnPromptOverflow);
@@ -1165,5 +1147,4 @@ const restoredView = restoreSettings();
 const hashView = location.hash.slice(1);
 setView(views.has(hashView) ? hashView : restoredView, false, {focusContent: false});
 requestAnimationFrame(() => window.scrollTo(0, 0));
-loadSessionOptions().then(() => safeLoad());
 }

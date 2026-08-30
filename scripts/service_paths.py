@@ -29,7 +29,7 @@ SERVICE_DIR_NAME = "bola"
 LEGACY_CONFIG_DIR_NAME = "codex-token-bola"
 OUTPUT_DIR_ENV = "BOLA_OUTPUT_DIR"
 LEGACY_ENV_PREFIX = "CODEX_TOKEN_USAGE_"
-CONFIG_SCHEMA_VERSION = 3
+CONFIG_SCHEMA_VERSION = 1
 PATH_TRANSITION_SCHEMA_VERSION = 1
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 MANAGED_DIRECTORY_NAMES = ("analytics", "bad", "normalized", "raw", "reports", "state", "tmp")
@@ -251,32 +251,83 @@ class PathTransition(Mapping[str, object]):
 @dataclass(frozen=True)
 class RuntimePaths:
     project_root: pathlib.Path
-    config_path: pathlib.Path
+    runtime_config_path: pathlib.Path
     codex_dir: pathlib.Path
     output_dir: pathlib.Path
 
     def as_dict(self) -> dict[str, str]:
         return {
             "project_root": str(self.project_root),
-            "config_path": str(self.config_path),
+            "runtime_config_path": str(self.runtime_config_path),
             "codex_dir": str(self.codex_dir),
             "output_dir": str(self.output_dir),
         }
+
+
+@dataclass(frozen=True)
+class OutputLayout:
+    """Canonical paths for files owned by one BOLA output directory."""
+
+    root: pathlib.Path
+
+    @property
+    def analytics_dir(self) -> pathlib.Path:
+        return self.root / "analytics"
+
+    @property
+    def analytics_db(self) -> pathlib.Path:
+        return self.analytics_dir / "bola.sqlite"
+
+    @property
+    def bad_dir(self) -> pathlib.Path:
+        return self.root / "bad"
+
+    @property
+    def normalized_dir(self) -> pathlib.Path:
+        return self.root / "normalized"
+
+    @property
+    def normalized_log(self) -> pathlib.Path:
+        return self.normalized_dir / "prompt-usage.normalized.jsonl"
+
+    @property
+    def normalize_state(self) -> pathlib.Path:
+        return self.normalized_dir / "normalize-state.json"
+
+    @property
+    def raw_dir(self) -> pathlib.Path:
+        return self.root / "raw"
+
+    @property
+    def reports_dir(self) -> pathlib.Path:
+        return self.root / "reports"
+
+    @property
+    def state_dir(self) -> pathlib.Path:
+        return self.root / "state"
+
+    @property
+    def tmp_dir(self) -> pathlib.Path:
+        return self.root / "tmp"
+
+    @property
+    def error_log(self) -> pathlib.Path:
+        return self.root / "prompt-usage-errors.jsonl"
 
 
 def _expanded_absolute(value: str | pathlib.Path) -> pathlib.Path:
     return pathlib.Path(value).expanduser().resolve(strict=False)
 
 
-def config_path(env: Mapping[str, str] | None = None) -> pathlib.Path:
+def runtime_config_path(env: Mapping[str, str] | None = None) -> pathlib.Path:
     source = os.environ if env is None else env
     config_home = source.get("XDG_CONFIG_HOME")
     base = _expanded_absolute(config_home) if config_home else pathlib.Path(user_config_path(appname=None, appauthor=False))
-    return base / SERVICE_DIR_NAME / "config.json"
+    return base / SERVICE_DIR_NAME / "runtime.conf"
 
 
 def legacy_config_path(env: Mapping[str, str] | None = None) -> pathlib.Path:
-    return config_path(env).parent.parent / LEGACY_CONFIG_DIR_NAME / "config.json"
+    return runtime_config_path(env).parent.parent / LEGACY_CONFIG_DIR_NAME / "config.json"
 
 
 def default_output_dir(env: Mapping[str, str] | None = None) -> pathlib.Path:
@@ -302,7 +353,7 @@ def reject_legacy_names(env: Mapping[str, str] | None = None) -> None:
     mappings = legacy_environment_mappings(source)
     if mappings:
         raise LegacyNameUnsupported(kind="environment", names=list(mappings), mappings=mappings)
-    current = config_path(source)
+    current = runtime_config_path(source)
     legacy = legacy_config_path(source)
     if not current.exists() and legacy.is_file():
         raise LegacyNameUnsupported(
@@ -314,11 +365,11 @@ def reject_legacy_names(env: Mapping[str, str] | None = None) -> None:
 
 
 def path_lock_path(env: Mapping[str, str] | None = None) -> pathlib.Path:
-    return config_path(env).with_name("paths.lock")
+    return runtime_config_path(env).with_name("paths.lock")
 
 
 def path_transition_path(env: Mapping[str, str] | None = None) -> pathlib.Path:
-    return config_path(env).with_name("path-transition.json")
+    return runtime_config_path(env).with_name("path-transition.json")
 
 
 @contextlib.contextmanager
@@ -389,56 +440,91 @@ def clear_path_transition(path: str | pathlib.Path | None = None) -> None:
     target.unlink(missing_ok=True)
 
 
+def _parse_runtime_config(text: str, target: pathlib.Path) -> dict[str, object]:
+    values: dict[str, str] = {}
+    allowed = {"schema_version", "codex_dir", "output_dir"}
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise ConfigurationError(f"invalid BOLA runtime config line {line_number} at {target}: expected key=value")
+        key, value = (part.strip() for part in line.split("=", 1))
+        if not key or key not in allowed:
+            label = key or "<empty>"
+            raise ConfigurationError(f"unsupported BOLA runtime config key at {target}:{line_number}: {label}")
+        if key in values:
+            raise ConfigurationError(f"duplicate BOLA runtime config key at {target}:{line_number}: {key}")
+        if not value:
+            raise ConfigurationError(f"BOLA runtime config value must not be empty at {target}:{line_number}: {key}")
+        values[key] = value
+
+    missing = sorted(allowed - set(values))
+    if missing:
+        raise ConfigurationError(f"missing BOLA runtime config keys at {target}: {', '.join(missing)}")
+    try:
+        schema_version = int(values["schema_version"])
+    except ValueError as exc:
+        raise ConfigurationError(
+            f"invalid BOLA runtime config schema at {target}: {values['schema_version']!r}"
+        ) from exc
+    if schema_version != CONFIG_SCHEMA_VERSION:
+        raise ConfigurationError(
+            f"unsupported BOLA runtime config schema at {target}: "
+            f"expected {CONFIG_SCHEMA_VERSION}, got {schema_version}"
+        )
+
+    payload: dict[str, object] = {"schema_version": schema_version}
+    for key in ("codex_dir", "output_dir"):
+        value = pathlib.Path(values[key]).expanduser()
+        if not value.is_absolute():
+            raise ConfigurationError(f"BOLA runtime config path must be absolute at {target}: {key}={values[key]}")
+        payload[key] = str(value.resolve(strict=False))
+    return payload
+
+
 def read_config(path: str | pathlib.Path | None = None) -> dict[str, object]:
-    target = _expanded_absolute(path) if path is not None else config_path()
+    target = _expanded_absolute(path) if path is not None else runtime_config_path()
     if path is None:
         reject_legacy_names()
     try:
-        raw = json.loads(target.read_text(encoding="utf-8"))
+        text = target.read_text(encoding="utf-8")
     except FileNotFoundError:
         return {}
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ConfigurationError(f"invalid Codex Token Bola config at {target}: {exc}") from exc
-    if not isinstance(raw, dict):
-        raise ConfigurationError(f"Codex Token Bola config must be a JSON object: {target}")
-    if "data_root" in raw:
-        raise LegacyNameUnsupported(
-            kind="config",
-            names=["data_root"],
-            mappings={"data_root": "output_dir"},
-            path=target,
-        )
-    allowed = {"schema_version", "codex_dir", "output_dir"}
-    unknown = sorted(set(raw) - allowed)
-    if unknown:
-        raise ConfigurationError(f"unsupported Codex Token Bola config keys at {target}: {', '.join(unknown)}")
-    if raw.get("schema_version") != CONFIG_SCHEMA_VERSION:
+    except (OSError, UnicodeError) as exc:
+        raise ConfigurationError(f"invalid BOLA runtime config at {target}: {exc}") from exc
+    return _parse_runtime_config(text, target)
+
+
+def require_runtime_config(path: str | pathlib.Path | None = None) -> dict[str, object]:
+    target = _expanded_absolute(path) if path is not None else runtime_config_path()
+    configured = read_config(target)
+    if not configured:
         raise ConfigurationError(
-            f"unsupported Codex Token Bola config schema at {target}: "
-            f"expected {CONFIG_SCHEMA_VERSION}, got {raw.get('schema_version')!r}"
+            f"BOLA runtime config is missing at {target}; run bola install-hook first"
         )
-    for key in ("codex_dir", "output_dir"):
-        value = raw.get(key)
-        if value is not None and (not isinstance(value, str) or not value.strip()):
-            raise ConfigurationError(f"Codex Token Bola config field {key} must be a non-empty path string: {target}")
-    return raw
+    return configured
 
 
 def write_config(config: Mapping[str, object], path: str | pathlib.Path | None = None) -> pathlib.Path:
-    target = _expanded_absolute(path) if path is not None else config_path()
-    payload: dict[str, object] = {"schema_version": CONFIG_SCHEMA_VERSION}
-    for key in ("codex_dir", "output_dir"):
-        value = config.get(key)
-        if value is not None:
-            payload[key] = str(_expanded_absolute(str(value)))
+    target = _expanded_absolute(path) if path is not None else runtime_config_path()
+    payload: dict[str, str] = {"schema_version": str(CONFIG_SCHEMA_VERSION)}
+    defaults: dict[str, object] = {
+        "codex_dir": _expanded_absolute("~/.codex"),
+        "output_dir": default_output_dir(),
+    }
+    for key, default in defaults.items():
+        value = config.get(key, default)
+        if value is None or not str(value).strip():
+            raise ConfigurationError(f"BOLA runtime config requires {key}: {target}")
+        payload[key] = str(_expanded_absolute(str(value)))
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     target.parent.chmod(0o700)
     temporary = target.with_name(f".{target.name}.{os.getpid()}.{time.time_ns()}.tmp")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
+            handle.write("\n".join(f"{key}={value}" for key, value in payload.items()) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, target)
@@ -455,9 +541,13 @@ def update_config(
     unset: tuple[str, ...] = (),
     path: str | pathlib.Path | None = None,
 ) -> dict[str, object]:
-    target = _expanded_absolute(path) if path is not None else config_path()
+    target = _expanded_absolute(path) if path is not None else runtime_config_path()
     current = read_config(target)
-    current.pop("schema_version", None)
+    if not current:
+        current = {
+            "codex_dir": _expanded_absolute("~/.codex"),
+            "output_dir": default_output_dir(),
+        }
     for key in unset:
         if key not in {"codex_dir", "output_dir"}:
             raise ConfigurationError(f"unsupported Codex Token Bola config field: {key}")
@@ -480,13 +570,13 @@ def resolve_runtime_paths(
 ) -> RuntimePaths:
     source = os.environ if env is None else env
     reject_legacy_names(source)
-    persistent = dict(config) if config is not None else read_config(config_path(source))
+    persistent = dict(config) if config is not None else read_config(runtime_config_path(source))
     resolved_project = _expanded_absolute(project_root or PROJECT_ROOT)
     codex_value = codex_dir if codex_dir is not None else source.get("CODEX_HOME") or persistent.get("codex_dir") or "~/.codex"
     data_value = output_dir if output_dir is not None else source.get(OUTPUT_DIR_ENV) or persistent.get("output_dir") or default_output_dir(source)
     return RuntimePaths(
         project_root=resolved_project,
-        config_path=config_path(source),
+        runtime_config_path=runtime_config_path(source),
         codex_dir=_expanded_absolute(str(codex_value)),
         output_dir=_expanded_absolute(str(data_value)),
     )
@@ -498,6 +588,23 @@ def codex_dir_path(codex_dir: str | pathlib.Path | None = None) -> pathlib.Path:
 
 def output_dir_path(output_dir: str | pathlib.Path | None = None) -> pathlib.Path:
     return resolve_runtime_paths(output_dir=output_dir).output_dir
+
+
+def output_layout(output_dir: str | pathlib.Path | None = None) -> OutputLayout:
+    """Resolve the canonical output layout without creating directories."""
+
+    return OutputLayout(root=output_dir_path(output_dir))
+
+
+def ensure_output_tmp_dir(output_dir: str | pathlib.Path | None = None) -> pathlib.Path:
+    """Create the service-owned temporary directory for a writer."""
+
+    target = output_layout(output_dir).tmp_dir
+    target.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if target.is_symlink() or not target.is_dir():
+        raise ConfigurationError(f"BOLA temporary path must be a directory: {target}")
+    target.chmod(0o700)
+    return target
 
 
 def service_root(

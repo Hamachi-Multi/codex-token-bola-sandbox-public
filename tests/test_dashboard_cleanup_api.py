@@ -481,8 +481,8 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
         handler.server = types.SimpleNamespace(db_path=str(output))
         handler.read_json_body = lambda: {"cutoff_date": "2026-05-20", "timezone": "Asia/Seoul", "preview_signature": "fresh"}
         handler.cleanup_payload = lambda db_path=None, retention_cutoff_unix=None: cleanup_payload | {"retention_cutoff_unix": retention_cutoff_unix}
-        handler.run_retention_prune_command = lambda db_path, cutoff, preview_signature: (
-            calls.append((db_path, cutoff, preview_signature))
+        handler.run_retention_prune_command = lambda cutoff, preview_signature: (
+            calls.append((cutoff, preview_signature))
             or {
                 "returncode": 0,
                 "stdout": '{"deleted_rows":0,"deleted_state_files":1}',
@@ -528,7 +528,7 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
             "rows": [],
             "retention": {"selected": {"preview_signature": "fresh", "deletable_rows": 1}},
         }
-        handler.run_retention_prune_command = lambda _db_path, _cutoff, _preview_signature: {
+        handler.run_retention_prune_command = lambda _cutoff, _preview_signature: {
             "returncode": 2,
             "stdout": '{"error":"cleanup_preview_stale"}',
             "stderr": "",
@@ -550,7 +550,7 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
         handler.cleanup_payload = lambda db_path=None, retention_cutoff_unix=None: {
             "retention": {"selected": {"preview_signature": "fresh", "deletable_rows": 1}}
         }
-        handler.run_retention_prune_command = lambda _db_path, _cutoff, _preview_signature: {
+        handler.run_retention_prune_command = lambda _cutoff, _preview_signature: {
             "returncode": 1,
             "stdout": '{"partial_mutation":true,"stage":"build","deleted_rows":3}',
             "stderr": "build failed",
@@ -586,7 +586,7 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
         handler.server = types.SimpleNamespace(db_path="/tmp/bola.sqlite")
         handler.read_json_body = lambda: {"cutoff_date": "2026-05-20", "timezone": "Asia/Seoul", "preview_signature": "fresh"}
         handler.cleanup_payload = lambda db_path=None, retention_cutoff_unix=None: cleanup_payload
-        handler.run_retention_prune_command = lambda _db_path, _cutoff, _preview_signature: {
+        handler.run_retention_prune_command = lambda _cutoff, _preview_signature: {
             "returncode": 1,
             "stdout": "",
             "stderr": "",
@@ -739,11 +739,11 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
         handler = serve.Handler.__new__(serve.Handler)
         output = pathlib.Path("/tmp/bola.sqlite")
         sent: list[tuple[dict[str, object], int]] = []
-        calls: list[tuple[pathlib.Path, float, str]] = []
+        calls: list[tuple[float, str]] = []
         handler.server = types.SimpleNamespace(db_path=str(output))
         handler.read_json_body = lambda: {"cutoff_date": "2026-05-20", "timezone": "Asia/Seoul", "preview_signature": "fresh"}
-        handler.run_retention_prune_command = lambda db_path, cutoff, preview_signature: (
-            calls.append((db_path, cutoff, preview_signature))
+        handler.run_retention_prune_command = lambda cutoff, preview_signature: (
+            calls.append((cutoff, preview_signature))
             or {"returncode": 0, "stdout": '{"deleted_rows":1}', "stderr": "", "metadata": {"deleted_rows": 1, "delete": {"deleted_rows": 1}}}
         )
         handler.cleanup_payload = lambda db_path=None, retention_cutoff_unix=None: {
@@ -756,7 +756,7 @@ class DashboardCleanupApiTests(DashboardFixtureMixin, unittest.TestCase):
 
         handler.handle_cleanup_retention()
 
-        self.assertEqual(calls, [(output, 1779289200.0, "fresh")])
+        self.assertEqual(calls, [(1779289200.0, "fresh")])
         self.assertEqual(sent[0][1], 200)
         self.assertEqual(sent[0][0]["retention"]["deleted_rows"], 1)
         self.assertIn("cleanup", sent[0][0])

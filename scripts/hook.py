@@ -51,11 +51,9 @@ def int_env(name: str, default: int) -> int:
         return default
 
 
-def bool_env(name: str, default: bool) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+def nonnegative_int_env(name: str, default: int) -> int:
+    value = int_env(name, default)
+    return value if value >= 0 else default
 
 
 def safe_int(value: Any, default: int = 0) -> int:
@@ -68,13 +66,10 @@ def safe_int(value: Any, default: int = 0) -> int:
 RUNTIME_PATHS = service_paths.resolve_runtime_paths()
 CODEX_DIR = RUNTIME_PATHS.codex_dir
 BASE_DIR = RUNTIME_PATHS.output_dir
-STATE_DIR = BASE_DIR / "state"
-ERROR_LOG = pathlib.Path(
-    os.environ.get("BOLA_ERROR_LOG", str(BASE_DIR / "prompt-usage-errors.jsonl"))
-).expanduser()
-STORE_TEXT = bool_env("BOLA_STORE_TEXT", True)
-PROMPT_PREVIEW_CHARS = int_env("BOLA_PROMPT_PREVIEW_CHARS", 800 if STORE_TEXT else 0)
-INSTRUCTION_EXCERPT_CHARS = int_env("BOLA_INSTRUCTION_EXCERPT_CHARS", 600 if STORE_TEXT else 0)
+OUTPUT_LAYOUT = service_paths.OutputLayout(BASE_DIR)
+STATE_DIR = OUTPUT_LAYOUT.state_dir
+ERROR_LOG = OUTPUT_LAYOUT.error_log
+PROMPT_PREVIEW_CHARS = nonnegative_int_env("BOLA_PROMPT_PREVIEW_CHARS", 800)
 HOOK_TAIL_SCAN_BYTES = int_env("BOLA_HOOK_TAIL_SCAN_BYTES", 1024 * 1024)
 HOOK_FORWARD_SCAN_BYTES = int_env("BOLA_HOOK_FORWARD_SCAN_BYTES", 16 * 1024 * 1024)
 HOOK_APPEND_LOCK_TIMEOUT_MS = int_env("BOLA_HOOK_APPEND_LOCK_TIMEOUT_MS", 500)
@@ -82,14 +77,13 @@ USAGE_KEYS = turn_capture.USAGE_KEYS
 
 
 def configure_runtime_paths(paths: service_paths.RuntimePaths | None = None) -> service_paths.RuntimePaths:
-    global RUNTIME_PATHS, CODEX_DIR, BASE_DIR, STATE_DIR, ERROR_LOG
+    global RUNTIME_PATHS, CODEX_DIR, BASE_DIR, OUTPUT_LAYOUT, STATE_DIR, ERROR_LOG
     RUNTIME_PATHS = paths or service_paths.resolve_runtime_paths()
     CODEX_DIR = RUNTIME_PATHS.codex_dir
     BASE_DIR = RUNTIME_PATHS.output_dir
-    STATE_DIR = BASE_DIR / "state"
-    ERROR_LOG = pathlib.Path(
-        os.environ.get("BOLA_ERROR_LOG", str(BASE_DIR / "prompt-usage-errors.jsonl"))
-    ).expanduser()
+    OUTPUT_LAYOUT = service_paths.OutputLayout(BASE_DIR)
+    STATE_DIR = OUTPUT_LAYOUT.state_dir
+    ERROR_LOG = OUTPUT_LAYOUT.error_log
     return RUNTIME_PATHS
 
 
@@ -213,7 +207,6 @@ def prompt_metadata(text: str) -> dict[str, Any]:
     return turn_capture.prompt_metadata(
         text,
         preview_chars=PROMPT_PREVIEW_CHARS,
-        instruction_excerpt_chars=INSTRUCTION_EXCERPT_CHARS,
     )
 
 
@@ -780,7 +773,7 @@ def handle_stop(data: dict[str, Any]) -> None:
                 "end_token_usage": start_usage,
                 "start_token_snapshot": compact_snapshot(start.get("start_token_snapshot")),
                 "end_token_snapshot": compact_snapshot(end_snapshot),
-                "prompt": start.get("prompt") or prompt_metadata(""),
+                "prompt": turn_capture.without_instruction_excerpt(start.get("prompt") or prompt_metadata("")),
                 "assistant": assistant_metadata(data),
                 "model_call_count": 0,
                 "estimated": True,
@@ -847,7 +840,7 @@ def handle_stop(data: dict[str, Any]) -> None:
             "end_token_usage": end_usage,
             "start_token_snapshot": compact_snapshot(start.get("start_token_snapshot")),
             "end_token_snapshot": compact_snapshot(end_snapshot),
-            "prompt": start.get("prompt") or prompt_metadata(""),
+            "prompt": turn_capture.without_instruction_excerpt(start.get("prompt") or prompt_metadata("")),
             "assistant": assistant_metadata(data),
             "model_call_count": model_call_count,
             "estimated": estimated,

@@ -24,6 +24,7 @@ export function focusTargetForView(view = state.view) {
     tools: ['#tool-output tr.selected .row-select-button', '#tool-output tr[data-tool] .row-select-button'],
     subagents: ['#subagent-rollups tr.selected .row-select-button', '#subagent-rollups tr[data-confidence] .row-select-button'],
     cleanup: ['#cleanup-files tr.selected .row-select-button', '#cleanup-files tr[data-cleanup-file] .row-select-button'],
+    settings: ['#settings-list .settings-list-item.selected'],
   }[view] || [];
   for (const selector of selectors) {
     const target = document.querySelector(selector);
@@ -102,7 +103,7 @@ export function tableHeader(header, sortState = null) {
 
 export function table(headers, rows, sortState = null) {
   if (!rows.length) return '<div class="empty">No rows for the current filter.</div>';
-  return `<div class="table-scroll"><div class="table-header-shadow" aria-hidden="true"></div><table><thead><tr>${headers.map(header => tableHeader(header, sortState)).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table></div>`;
+  return `<div class="table-scroll scrollbar-hidden"><div class="table-header-shadow" aria-hidden="true"></div><table><thead><tr>${headers.map(header => tableHeader(header, sortState)).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table></div>`;
 }
 
 export function loadingPanel(label = 'Loading panel data.') {
@@ -122,7 +123,7 @@ function tableSkeleton(rowCount = 4, columnCount = 4) {
   const head = Array.from({length: columnCount}).map((_, index) => `<th${index ? ' class="num"' : ''}><div class="loading-line"></div></th>`).join('');
   const cells = Array.from({length: columnCount}).map((_, index) => `<td${index ? ' class="num"' : ''}><div class="loading-line"></div></td>`).join('');
   const rows = Array.from({length: rowCount}).map(() => `<tr>${cells}</tr>`).join('');
-  return `<div class="table-scroll table-skeleton" aria-hidden="true"><div class="table-header-shadow" aria-hidden="true"></div><table><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>`;
+  return `<div class="table-scroll table-skeleton scrollbar-hidden" aria-hidden="true"><div class="table-header-shadow" aria-hidden="true"></div><table><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
 export function sessionDetailLoadingPanel(label = 'Loading session detail.') {
@@ -251,55 +252,4 @@ export function detailMetric(label, value, kind = '', title = '') {
   const cls = kind ? `detail-cell ${kind}` : 'detail-cell';
   const titleAttr = title ? ` title="${esc(title)}"` : '';
   return `<div class="${cls}"><div class="label">${esc(label)}</div><div class="value"${titleAttr}>${esc(value)}</div></div>`;
-}
-
-export function setPageInert(inert) {
-  if (inert) {
-    document.querySelector('header')?.setAttribute('inert', '');
-    document.querySelector('main')?.setAttribute('inert', '');
-  } else {
-    document.querySelector('header')?.removeAttribute('inert');
-    document.querySelector('main')?.removeAttribute('inert');
-  }
-}
-
-export function setActiveModal(activeModalId = '') {
-  setPageInert(Boolean(activeModalId));
-  document.querySelectorAll('.turn-modal').forEach(modal => {
-    const isActive = modal.id === activeModalId;
-    if (isActive) {
-      modal.removeAttribute('inert');
-      modal.setAttribute('aria-hidden', 'false');
-      return;
-    }
-    if (activeModalId) modal.setAttribute('inert', '');
-    else modal.removeAttribute('inert');
-    modal.setAttribute('aria-hidden', 'true');
-  });
-}
-
-export function modalFocusableElements(rootId = 'turn-modal') {
-  const root = document.getElementById(rootId);
-  if (!root) return [];
-  return [...root.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')]
-    .filter(el => !el.disabled && el.offsetParent !== null);
-}
-
-export function trapModalFocus(event, rootId = 'turn-modal') {
-  const focusable = modalFocusableElements(rootId);
-  if (!focusable.length) {
-    event.preventDefault();
-    const root = document.getElementById(rootId);
-    (root?.querySelector('[role="status"]') || root?.querySelector('[role="dialog"]'))?.focus?.();
-    return;
-  }
-  const first = focusable[0];
-  const last = focusable[focusable.length - 1];
-  if (event.shiftKey && document.activeElement === first) {
-    event.preventDefault();
-    last.focus();
-  } else if (!event.shiftKey && document.activeElement === last) {
-    event.preventDefault();
-    first.focus();
-  }
 }

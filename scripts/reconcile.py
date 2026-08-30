@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import gzip
 import json
-import os
 import pathlib
 import sys
 import time
@@ -31,9 +30,10 @@ import turn_resolution
 RUNTIME_PATHS = service_paths.resolve_runtime_paths()
 CODEX_DIR = RUNTIME_PATHS.codex_dir
 BASE_DIR = RUNTIME_PATHS.output_dir
-STATE_DIR = BASE_DIR / "state"
-BAD_DIR = BASE_DIR / "bad"
-ERROR_LOG = pathlib.Path(os.environ.get("BOLA_ERROR_LOG", str(BASE_DIR / "prompt-usage-errors.jsonl"))).expanduser()
+OUTPUT_LAYOUT = service_paths.OutputLayout(BASE_DIR)
+STATE_DIR = OUTPUT_LAYOUT.state_dir
+BAD_DIR = OUTPUT_LAYOUT.bad_dir
+ERROR_LOG = OUTPUT_LAYOUT.error_log
 QUARANTINE_RESULTS: list[dict[str, Any]] = []
 
 
@@ -249,7 +249,9 @@ def reconcile_one(path: pathlib.Path, completed_turns: set[tuple[str, str]]) -> 
         "start_token_snapshot": turn_capture.compact_snapshot(state.get("start_token_snapshot")),
         "end_token_snapshot": turn_capture.compact_snapshot(end_snapshot),
         "turn_end_event": turn_end,
-        "prompt": state.get("prompt") or turn_capture.prompt_metadata("", preview_chars=0, instruction_excerpt_chars=0),
+        "prompt": turn_capture.without_instruction_excerpt(
+            state.get("prompt") or turn_capture.prompt_metadata("", preview_chars=0)
+        ),
         "assistant": turn_capture.assistant_metadata({}),
         "model_call_count": len(end_snapshot.get("model_calls") or []),
         "hook_input": state.get("hook_input"),
@@ -322,7 +324,7 @@ def reconcile_missing_start_stop(path: pathlib.Path, state: dict[str, Any], comp
         "end_token_usage": turn_capture.normalize_usage(snapshot.get("total_token_usage")),
         "start_token_snapshot": None,
         "end_token_snapshot": turn_capture.compact_snapshot(snapshot),
-        "prompt": turn_capture.prompt_metadata("", preview_chars=0, instruction_excerpt_chars=0),
+        "prompt": turn_capture.prompt_metadata("", preview_chars=0),
         "assistant": state.get("assistant") or turn_capture.assistant_metadata({}),
         "model_call_count": len(snapshot.get("model_calls") or []),
         "hook_input": state.get("hook_input"),

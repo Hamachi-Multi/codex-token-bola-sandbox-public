@@ -1,4 +1,4 @@
-import { fmt, money } from './core.js';
+import { fmt, money, SESSION_LABEL_MODES, state } from './core.js';
 import { esc } from './ui.js';
 
 export function statusLabel(status) {
@@ -29,31 +29,41 @@ export function sessionPathLabel(row) {
   return part ? `${part}/` : '';
 }
 
+export function normalizeSessionLabelMode(value) {
+  return SESSION_LABEL_MODES.has(value) ? value : 'project';
+}
+
+export function sessionProjectLabel(row) {
+  const value = String((row || {}).project || '').trim().replace(/\/+$/g, '');
+  return `${value || 'Unknown'}/`;
+}
+
+export function sessionThreadLabel(row) {
+  return String((row || {}).thread_name || '').trim() || 'Unnamed';
+}
+
+export function sessionPrimaryLabel(row, mode = state.sessionLabelMode) {
+  return normalizeSessionLabelMode(mode) === 'thread'
+    ? sessionThreadLabel(row)
+    : sessionProjectLabel(row);
+}
+
 export function sessionLabel(row) {
-  const name = String((row || {}).thread_name || '').trim();
+  const name = sessionPrimaryLabel(row);
   const compact = compactSessionId((row || {}).session_id || '');
-  if (name) return compact ? `${name} · ${compact}` : name;
-  const path = sessionPathLabel(row);
-  if (compact && path) return `${path} · ${compact}`;
-  return compact || path;
+  return compact ? `${name} · ${compact}` : name;
 }
 
 export function sessionDetailLabel(row) {
-  const name = String((row || {}).thread_name || '').trim();
+  const name = sessionPrimaryLabel(row);
   const id = String((row || {}).session_id || '').trim();
   const compact = compactSessionId(id);
-  if (compact && name) return `${name} · ${compact}`;
-  const path = sessionPathLabel(row);
-  if (compact && path) return `${path} · ${compact}`;
-  return compact || path || name || '';
+  return compact ? `${name} · ${compact}` : name;
 }
 
 export function sessionLabelParts(row) {
-  const name = String((row || {}).thread_name || '').trim();
-  const path = sessionPathLabel(row);
   const compact = compactSessionId((row || {}).session_id || '');
-  const primary = name || path;
-  return { primary, compact };
+  return { primary: sessionPrimaryLabel(row), compact };
 }
 
 export function sessionLabelMarkup(row) {
@@ -65,7 +75,7 @@ export function sessionLabelMarkup(row) {
 }
 
 export function sessionDetailMetric(row) {
-  const name = String((row || {}).thread_name || '').trim() || sessionPathLabel(row) || 'unnamed';
+  const name = sessionPrimaryLabel(row);
   const id = compactSessionId((row || {}).session_id || '') || '-';
   return `<div class="detail-cell session"><div class="label">Session</div><div class="value" title="${esc(sessionDetailLabel(row))}"><span class="session-detail-name">${esc(name)}</span><span class="session-label-separator">·</span><span class="session-detail-id">${esc(id)}</span></div></div>`;
 }

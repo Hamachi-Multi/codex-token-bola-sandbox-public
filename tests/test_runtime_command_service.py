@@ -15,7 +15,7 @@ class RuntimeCommandServiceTests(unittest.TestCase):
     def paths(root: pathlib.Path) -> service_paths.RuntimePaths:
         return service_paths.RuntimePaths(
             project_root=root,
-            config_path=root / "config.json",
+            runtime_config_path=root / "runtime.conf",
             codex_dir=root / ".codex",
             output_dir=root / "output",
         )
@@ -34,7 +34,6 @@ class RuntimeCommandServiceTests(unittest.TestCase):
                 service.BuildOptions(
                     normalized_log="turns.jsonl",
                     state_db="state.sqlite",
-                    output="analytics.sqlite",
                     project_roots=("/work/a", "/work/b"),
                     extra_arguments=("--incremental",),
                 ),
@@ -54,8 +53,6 @@ class RuntimeCommandServiceTests(unittest.TestCase):
                 "turns.jsonl",
                 "--state-db",
                 "state.sqlite",
-                "--output",
-                "analytics.sqlite",
                 "--project-root",
                 "/work/a",
                 "--project-root",
@@ -89,6 +86,7 @@ class RuntimeCommandServiceTests(unittest.TestCase):
                     ),
                     service.ServeDependencies(
                         resolve_paths=lambda _codex, _output: paths,
+                        require_runtime_config=lambda: {"schema_version": 1},
                         replace_command=replace,
                     ),
                 )
@@ -111,6 +109,27 @@ class RuntimeCommandServiceTests(unittest.TestCase):
             ),
         )
         self.assertEqual(replace.call_args.kwargs["env"]["BOLA_TEST_SENTINEL"], "kept")
+
+    def test_serve_requires_runtime_config_before_replacing_process(self) -> None:
+        def missing_config() -> dict[str, object]:
+            raise service_paths.ConfigurationError("run bola install-hook first")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            paths = self.paths(root)
+            replace = mock.Mock()
+
+            with self.assertRaisesRegex(service_paths.ConfigurationError, "run bola install-hook first"):
+                service.run_serve(
+                    service.ServeOptions(host="127.0.0.1", port=8766),
+                    service.ServeDependencies(
+                        resolve_paths=lambda _codex, _output: paths,
+                        require_runtime_config=missing_config,
+                        replace_command=replace,
+                    ),
+                )
+
+        replace.assert_not_called()
 
 
 if __name__ == "__main__":

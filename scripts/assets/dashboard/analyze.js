@@ -7,6 +7,7 @@ let analyzeProgressTimer = null;
 let analyzeStatusClearTimer = null;
 let analyzeRequest = null;
 let analyzeProgressPollInFlight = false;
+let serviceActivity = { running: false };
 function clearAnalyzeTimers() {
   if (analyzeProgressTimer) {
     clearInterval(analyzeProgressTimer);
@@ -134,6 +135,22 @@ function isAnalyzeRunning() {
   return analyzeRequest !== null && !analyzeRequest.observer;
 }
 
+function applyServiceActivity(activity) {
+  serviceActivity = activity || { running: false };
+  if (analyzeRequest) return;
+  const button = document.getElementById('rebuild');
+  if (!button) return;
+  button.disabled = Boolean(serviceActivity.running);
+  if (serviceActivity.running) {
+    const label = serviceActivity.operation === 'cleanup'
+      ? 'Cleanup is running'
+      : (serviceActivity.operation === 'cost_recalculation' ? 'Cost recalculation is running' : 'Analysis is running');
+    setAnalyzeButtonState('blocked', label);
+  } else if (button.dataset.analyzeState === 'blocked') {
+    setAnalyzeButtonState('idle', 'Analyze');
+  }
+}
+
 function waitForAnalyzePoll() {
   return new Promise(resolve => setTimeout(resolve, 1000));
 }
@@ -177,6 +194,7 @@ async function observeActiveAnalysis(request, started) {
   const status = String((finalProgress || {}).status || '');
   if (status === 'failed' || status === 'cancelled') {
     finishAnalyzeStatus(`analysis ${status} elsewhere`, 9000);
+    return false;
   } else {
     finishAnalyzeStatus('analysis finished elsewhere');
   }
@@ -203,7 +221,7 @@ async function cancelAnalyze() {
 async function rebuildAndRefresh() {
   if (isAnalyzeRunning()) {
     cancelAnalyze();
-    return;
+    return false;
   }
   const button = document.getElementById('rebuild');
   const request = { operationId: crypto.randomUUID(), cancelRequested: false };
@@ -213,7 +231,7 @@ async function rebuildAndRefresh() {
     const result = await postJSON('/api/rebuild', {operation_id: request.operationId});
     if ((result || {}).cancelled) {
       finishAnalyzeStatus('analysis cancelled', 2500);
-      return;
+      return false;
     }
     const elapsed = Math.max(0, (performance.now() - started) / 1000);
     setAnalyzeButtonState('running', `refreshing dashboard data · ${money.format(elapsed)}s`, ANALYZE_STATUS_PHASES.length - 1, 92);
@@ -227,30 +245,33 @@ async function rebuildAndRefresh() {
       ? ` · ${compactNumber(quarantined)} quarantined`
       : '';
     finishAnalyzeStatus(`analyzed ${compactNumber(result.new_turn_rows ?? result.turn_rows ?? 0)} new turns${quarantineNote}${compactNote}`, quarantined > 0 ? 9000 : 2000);
+    return true;
   } catch (err) {
     if (isServiceBusyError(err)) {
       if ((err || {}).operation === 'analysis' && (err || {}).progress_available === true) {
         request.operationId = String((err || {}).operation_id || '');
-        await observeActiveAnalysis(request, started);
+        return await observeActiveAnalysis(request, started);
       } else {
         finishAnalyzeStatus(`${String((err || {}).operation || 'service')} is busy`, 5000);
-        showQueryError('Analysis or cleanup is already running');
+        showQueryError('Another service operation is already running');
       }
-      return;
+      return false;
     }
     const failedPhase = currentAnalyzePhaseLabel();
     finishAnalyzeStatus(`analysis failed · ${failedPhase}`, 9000);
     setGlobalError(err.message || err);
     refreshScrollFades();
+    return false;
   } finally {
     if (analyzeRequest === request) analyzeRequest = null;
-    button.disabled = false;
+    button.disabled = Boolean(serviceActivity.running);
   }
 }
 
 
 return {
   rebuildAndRefresh,
+  applyServiceActivity,
   setAnalyzeButtonState,
 };
 }

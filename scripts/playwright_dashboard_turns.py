@@ -13,13 +13,20 @@ from playwright_dashboard_helpers import (
     fetch_json,
     parse_number,
     scroll_bottom_state,
-    session_path_label,
+    set_dashboard_select,
 )
 
 
 def check_turns_and_selected_turn(page, base_url: str) -> None:
     page.locator('button[data-view-target="turns"]').click()
     page.wait_for_selector("#turn-list tr[data-turn]", state="attached", timeout=10_000)
+    panel_head_heights = page.locator('[data-view="turns"] .panel > .panel-head').evaluate_all(
+        "els => els.map(el => Math.round(el.getBoundingClientRect().height * 1000) / 1000)"
+    )
+    assert_true(
+        panel_head_heights == [52, 52],
+        f"turn and selected-turn headers should share the primary panel height: {panel_head_heights}",
+    )
     turn_view_focus_index = page.locator("#turn-list").evaluate(
         "() => Array.from(document.querySelectorAll('#turn-list tr[data-turn] .row-select-button')).indexOf(document.activeElement)"
     )
@@ -176,7 +183,7 @@ def check_turns_and_selected_turn(page, base_url: str) -> None:
         page.locator("#session-picker-button").click()
         page.locator('#session-options [data-session-id=""]').click()
         page.wait_for_function("() => document.querySelectorAll('#turn-list tr[data-turn]').length > 6", timeout=10_000)
-    page.locator("#turn-page-size").select_option("10")
+    set_dashboard_select(page, "#turn-page-size", "10")
     page.wait_for_function("() => document.querySelectorAll('#turn-list tr[data-turn]').length === 10", timeout=10_000)
     rendered_turn_rows = page.locator("#turn-list tr[data-turn]").count()
     assert_true(
@@ -335,7 +342,7 @@ def check_turns_and_selected_turn(page, base_url: str) -> None:
         else:
             assert_true(detail_layout["toolRows"] == 0 and not detail_layout["hasToolToggle"], f"empty selected turn tool summary should not render rows or controls: {detail_layout}")
         assert_true(detail_layout["sections"] == expected_sections, f"selected turn sections are not in the expected order: {detail_layout}")
-    page.locator("#turn-page-size").select_option("25")
+    set_dashboard_select(page, "#turn-page-size", "25")
     page.wait_for_selector("#turn-list tr[data-turn]", timeout=10_000)
     first_prompt_at = rows[0].get("started_at") or rows[0].get("captured_at") or ""
     expected_datetime = f"{compact_date(first_prompt_at)} {compact_time(first_prompt_at)}"
@@ -347,22 +354,35 @@ def check_turns_and_selected_turn(page, base_url: str) -> None:
     detail_session = (page.locator("#detail .selected-turn-identity .method-desc").first.text_content() or "").strip()
     expected_session_id = compact_session_id(rows[0].get("session_id") or "")
     expected_thread_name = (rows[0].get("thread_name") or "").strip()
-    expected_path = session_path_label(rows[0].get("cwd") or "")
+    project_name = str(rows[0].get("project") or "").rstrip("/") or "Unknown"
+    expected_project = f"{project_name}/"
     assert_true(
         not re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", detail_session),
         f"selected turn session still shows a full UUID: {detail_session!r}",
     )
-    if expected_thread_name:
-        assert_true(
-            f"{expected_thread_name} · {expected_session_id}" in detail_session,
-            f"selected turn named session label is not compact: {detail_session!r}",
-        )
-    else:
-        assert_true(
-            f"{expected_path} · {expected_session_id}" in detail_session,
-            f"selected turn fallback session label is not compact id plus path: {detail_session!r}",
-        )
+    assert_true(
+        f"{expected_project} · {expected_session_id}" in detail_session,
+        f"selected turn project session label is not compact: {detail_session!r}",
+    )
     assert_true(" / " in detail_session, f"selected turn identity metadata is missing session/date context: {detail_session!r}")
+
+    set_dashboard_select(page, "#session-label-mode", "thread")
+    expected_thread_label = expected_thread_name or "Unnamed"
+    page.wait_for_function(
+        "([label, sessionId]) => document.querySelector('#detail .selected-turn-identity .method-desc')?.textContent.includes(`${label} · ${sessionId}`)",
+        arg=[expected_thread_label, expected_session_id],
+        timeout=10_000,
+    )
+    assert_true(
+        page.evaluate("() => JSON.parse(localStorage.getItem('bola-dashboard-settings') || '{}').sessionLabelMode") == "thread",
+        "thread label mode should persist in dashboard settings",
+    )
+    set_dashboard_select(page, "#session-label-mode", "project")
+    page.wait_for_function(
+        "([label, sessionId]) => document.querySelector('#detail .selected-turn-identity .method-desc')?.textContent.includes(`${label} · ${sessionId}`)",
+        arg=[expected_project, expected_session_id],
+        timeout=10_000,
+    )
 
     prompt_times = [row.get("started_at") or row.get("captured_at") or "" for row in rows]
     assert_true(prompt_times == sorted(prompt_times, reverse=True), f"turn rows are not latest-first: {prompt_times}")
