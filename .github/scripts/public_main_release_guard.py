@@ -15,7 +15,7 @@ if str(SCRIPT_DIR) not in sys.path:
 import public_snapshot_commit_policy
 
 
-PUBLIC_OPS_PREFIX = "chore(public-ops):"
+PUBLIC_OPS_PREFIX = "chore(public-ops): "
 
 
 class InputError(Exception):
@@ -42,6 +42,8 @@ def validate_product_snapshot(
     message: str,
     actor: str,
     expected_promotion_actor: str,
+    author_name: str,
+    expected_snapshot_author_name: str,
     author_email: str,
     expected_snapshot_author_email: str,
     codeql_conclusion: str,
@@ -50,6 +52,8 @@ def validate_product_snapshot(
     errors = list(policy["errors"])
     if actor != expected_promotion_actor:
         errors.append("product snapshot push actor must match expected promotion actor")
+    if author_name != expected_snapshot_author_name:
+        errors.append("product snapshot author name must match expected snapshot author name")
     if author_email != expected_snapshot_author_email:
         errors.append("product snapshot author email must match expected snapshot author email")
     if codeql_conclusion != "success":
@@ -70,6 +74,8 @@ def validate_public_main_release(
     message: str,
     actor: str,
     expected_promotion_actor: str,
+    author_name: str,
+    expected_snapshot_author_name: str,
     author_email: str,
     expected_snapshot_author_email: str,
     codeql_conclusion: str,
@@ -83,6 +89,8 @@ def validate_public_main_release(
         message=message,
         actor=actor,
         expected_promotion_actor=expected_promotion_actor,
+        author_name=author_name,
+        expected_snapshot_author_name=expected_snapshot_author_name,
         author_email=author_email,
         expected_snapshot_author_email=expected_snapshot_author_email,
         codeql_conclusion=codeql_conclusion,
@@ -116,6 +124,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ref", required=True)
     parser.add_argument("--actor", required=True)
     parser.add_argument("--expected-promotion-actor", required=True)
+    parser.add_argument("--author-name", required=True)
+    parser.add_argument("--expected-snapshot-author-name", required=True)
     parser.add_argument("--author-email", required=True)
     parser.add_argument("--expected-snapshot-author-email", required=True)
     parser.add_argument("--codeql-conclusion", required=True)
@@ -132,6 +142,8 @@ def main(argv: list[str] | None = None) -> int:
             message=read_message(args),
             actor=args.actor,
             expected_promotion_actor=args.expected_promotion_actor,
+            author_name=args.author_name,
+            expected_snapshot_author_name=args.expected_snapshot_author_name,
             author_email=args.author_email,
             expected_snapshot_author_email=args.expected_snapshot_author_email,
             codeql_conclusion=args.codeql_conclusion,

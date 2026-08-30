@@ -5,43 +5,71 @@ on:
     branches:
       - main
       - release-candidate/*
+      - public-ops/*
 
 permissions:
   contents: read
   id-token: none
 
 jobs:
+  python_compatibility:
+    name: python-${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dev dependencies
+        run: python3 -m pip install ".[dev]"
+      - name: Lint
+        if: matrix.python-version == '3.10'
+        run: make lint
+      - name: Compile
+        run: make compile
+      - name: Test
+        run: make test
+
   compile_test:
     name: compile-test
     runs-on: ubuntu-latest
+    if: ${{ always() }}
+    needs: python_compatibility
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-      - name: Compile
-        run: python3 -m py_compile hooks/token-usage.py scripts/*.py
-      - name: Test
-        run: python3 -m unittest discover -s tests -v
+      - name: Require Python compatibility matrix
+        env:
+          PYTHON_COMPATIBILITY_RESULT: ${{ needs.python_compatibility.result }}
+        run: test "$PYTHON_COMPATIBILITY_RESULT" = success
 
   asset_static_sanity:
     name: asset-static-sanity
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Verify dashboard assets
         run: |
-          test -f assets/dashboard.html
-          test -f assets/dashboard.css
-          test -f assets/dashboard.js
-          test -d assets/dashboard
-          test -d assets/fonts
+          test -f scripts/assets/dashboard.html
+          test -f scripts/assets/dashboard.css
+          test -f scripts/assets/dashboard.js
+          test -f scripts/assets/bola-icon.png
+          test -d scripts/assets/dashboard
+          test -f scripts/assets/dashboard/app.js
+          test -d scripts/assets/fonts
+          test -f scripts/assets/fonts/PretendardVariable.woff2
+          test -f scripts/assets/fonts/JetBrainsMonoVariable.woff2
 
   public_sensitive_guard:
     name: public-sensitive-guard
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Verify never-public paths are absent
         run: |
           test ! -e analytics
@@ -56,6 +84,35 @@ jobs:
           test ! -e reviews
           test ! -e AGENTS.md
 
+  release_dependency_audit:
+    name: release-dependency-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24.13.0"
+          cache: npm
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      - name: Install release dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts
+      - name: Enforce release dependency audit policy
+        shell: bash
+        run: |
+          set +e
+          npm audit --json > "$RUNNER_TEMP/npm-audit.json"
+          audit_status=$?
+          set -e
+          if [[ "$audit_status" -gt 1 ]]; then
+            exit "$audit_status"
+          fi
+          python3 .github/scripts/release_dependency_audit.py \
+            --audit-json "$RUNNER_TEMP/npm-audit.json" \
+            --allowlist .github/release-dependency-audit-allowlist.json \
+            --release-config .releaserc.json
+
   candidate_snapshot_guard:
     name: candidate-snapshot-guard
     runs-on: ubuntu-latest
@@ -64,10 +121,55 @@ jobs:
       - compile_test
       - asset_static_sanity
       - public_sensitive_guard
+      - release_dependency_audit
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
       - name: Verify candidate snapshot guard boundary
-        run: echo "::notice title=placeholder::candidate snapshot guard policy runs here"
+        run: |
+          python3 .github/scripts/public_candidate_snapshot_guard.py \
+            --repo-root . \
+            --base-ref HEAD^ \
+            --head-ref HEAD
+
+  public_ops_candidate_guard:
+    name: public-ops-candidate-guard
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/heads/public-ops/')
+    needs:
+      - compile_test
+      - asset_static_sanity
+      - public_sensitive_guard
+      - release_dependency_audit
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Verify public ops candidate boundary
+        shell: bash
+        run: |
+          subject="$(git log -1 --pretty=%s)"
+          [[ "$subject" == chore\(public-ops\):\ * ]]
+          test "$(git show -s --format=%P HEAD | wc -w)" -eq 1
+          git diff-tree --no-commit-id --name-only -r HEAD^ HEAD > "$RUNNER_TEMP/changed-paths.txt"
+          test -s "$RUNNER_TEMP/changed-paths.txt"
+          while IFS= read -r path; do
+            case "$path" in
+              .github/dependabot.yml|.github/release-dependency-audit-allowlist.json|.github/scripts/public_candidate_snapshot_guard.py|.github/scripts/public_main_release_guard.py|.github/scripts/public_ops_path_policy.py|.github/scripts/public_snapshot_commit_policy.py|.github/scripts/release_dependency_audit.py|.github/workflows/codeql.yml|.github/workflows/public-ops-policy.yml|.github/workflows/release.yml|.releaserc.json|docs/public-ops-path-policy.md|docs/public-ruleset-checklist.md|package-lock.json|package.json|scripts/public_main_release_guard.py|scripts/public_snapshot_commit_policy.py)
+                ;;
+              *)
+                echo "unexpected public ops path: $path" >&2
+                exit 1
+                ;;
+            esac
+          done < "$RUNNER_TEMP/changed-paths.txt"
+          test ! -e .github/scripts/public_ops_path_policy.py
+          test ! -e .github/workflows/public-ops-policy.yml
+          test ! -e scripts/public_main_release_guard.py
+          test ! -e scripts/public_snapshot_commit_policy.py
 
   product_snapshot_guard:
     name: product-snapshot-guard
@@ -81,11 +183,12 @@ jobs:
       - compile_test
       - asset_static_sanity
       - public_sensitive_guard
+      - release_dependency_audit
     outputs:
       release_kind: ${{ steps.guard.outputs.release_kind }}
       semantic_release: ${{ steps.guard.outputs.semantic_release }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Read public main commit metadata
@@ -93,8 +196,10 @@ jobs:
         shell: bash
         run: |
           git log -1 --pretty=%B > "$RUNNER_TEMP/commit-message.txt"
+          author_name="$(git log -1 --pretty=%an)"
           author_email="$(git log -1 --pretty=%ae)"
           echo "message_file=$RUNNER_TEMP/commit-message.txt" >> "$GITHUB_OUTPUT"
+          echo "author_name=$author_name" >> "$GITHUB_OUTPUT"
           echo "author_email=$author_email" >> "$GITHUB_OUTPUT"
       - name: Resolve CodeQL conclusion for product snapshots
         id: codeql
@@ -104,7 +209,7 @@ jobs:
         run: |
           conclusion="not_required"
           subject="$(git log -1 --pretty=%s)"
-          if [[ "$subject" == chore\(public-ops\):* ]]; then
+          if [[ "$subject" == chore\(public-ops\):\ * ]]; then
             echo "conclusion=$conclusion" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -124,11 +229,13 @@ jobs:
       - name: Guard public main release path
         id: guard
         run: |
-          python3 scripts/public_main_release_guard.py \
+          python3 .github/scripts/public_main_release_guard.py \
             --ref "${{ github.ref }}" \
             --message-file "${{ steps.commit.outputs.message_file }}" \
             --actor "${{ github.actor }}" \
             --expected-promotion-actor "${{ vars.PROMOTION_APP_ACTOR }}" \
+            --author-name "${{ steps.commit.outputs.author_name }}" \
+            --expected-snapshot-author-name "${{ vars.SNAPSHOT_AUTHOR_NAME }}" \
             --author-email "${{ steps.commit.outputs.author_email }}" \
             --expected-snapshot-author-email "${{ vars.SNAPSHOT_AUTHOR_EMAIL }}" \
             --codeql-conclusion "${{ steps.codeql.outputs.conclusion }}" \
@@ -142,6 +249,7 @@ jobs:
       - compile_test
       - asset_static_sanity
       - public_sensitive_guard
+      - release_dependency_audit
       - product_snapshot_guard
     if: github.ref == 'refs/heads/main' && needs.product_snapshot_guard.outputs.semantic_release == 'true'
     permissions:
@@ -149,13 +257,13 @@ jobs:
       id-token: none
     environment: public-release-publish
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
-          node-version: lts/*
+          node-version: "24.13.0"
           cache: npm
       - name: Install release dependencies
         run: npm ci
