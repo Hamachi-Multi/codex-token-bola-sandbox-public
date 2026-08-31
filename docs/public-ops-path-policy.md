@@ -10,12 +10,12 @@ The private Apply workflow accepts only the recorded candidate SHA after all can
 
 The trusted private manifest permits only:
 
-- `.github/dependabot.yml`
 - `.github/public-ops-managed-paths.json`
 - `.github/release-dependency-audit-allowlist.json`
 - `.github/scripts/public_candidate_snapshot_guard.py`
 - `.github/scripts/public_codeql_result.py`
 - `.github/scripts/public_main_release_guard.py`
+- `.github/scripts/public_orphan_release_recovery.mjs`
 - `.github/scripts/public_release_retry_guard.py`
 - `.github/scripts/public_snapshot_commit_policy.py`
 - `.github/scripts/release_dependency_audit.py`
@@ -34,7 +34,7 @@ The candidate guard rejects every other changed path. Before any public write to
 
 The two public policy files that contain the forbidden regular expressions themselves are exempt only while their private manifest SHA-256 values match exactly. Any edit invalidates the exemption until its reviewed digest is updated
 
-The retired `.github/scripts/public_ops_path_policy.py`, `.github/workflows/public-ops-policy.yml`, `scripts/public_main_release_guard.py`, and `scripts/public_snapshot_commit_policy.py` paths are accepted only as migration deletions and must be absent from the candidate tree
+The retired `.github/dependabot.yml`, `.github/scripts/public_ops_path_policy.py`, `.github/workflows/public-ops-policy.yml`, `scripts/public_main_release_guard.py`, and `scripts/public_snapshot_commit_policy.py` paths are accepted only as migration deletions and must be absent from the candidate tree
 
 ## Subject Policy
 

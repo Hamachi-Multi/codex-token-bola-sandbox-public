@@ -16,9 +16,16 @@ from typing import Any
 
 HEX_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+RELEASE_TAG_RE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+$")
+RELEASE_DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+RECOVERY_KINDS = {"semantic_release_retry", "orphan_release_repair"}
 
 
 class InputError(Exception):
+    pass
+
+
+class GitHubNotFound(Exception):
     pass
 
 
@@ -44,6 +51,8 @@ class GitHubClient:
                 return json.load(response)
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace").strip()
+            if exc.code == 404:
+                raise GitHubNotFound(f"GitHub API resource not found: {path}") from exc
             raise InputError(f"GitHub API request failed: {path}: HTTP {exc.code}: {detail}") from exc
         except (OSError, json.JSONDecodeError) as exc:
             raise InputError(f"GitHub API request failed: {path}: {exc}") from exc
@@ -79,6 +88,31 @@ def ref_sha(payload: Any) -> str:
     if not isinstance(payload, dict) or not isinstance(payload.get("object"), dict):
         raise InputError("public main ref response is invalid")
     return validate_sha(str(payload["object"].get("sha") or ""), "public main SHA")
+
+
+def tag_target_sha(client: Any, *, repo_name: str, tag: str) -> str:
+    encoded = urllib.parse.quote(tag, safe="")
+    payload = client.request_json(f"/repos/{repo_name}/git/ref/tags/{encoded}")
+    target = ref_sha(payload)
+    object_payload = payload.get("object") if isinstance(payload, dict) else None
+    if not isinstance(object_payload, dict) or object_payload.get("type") != "tag":
+        return target
+    annotated = client.request_json(f"/repos/{repo_name}/git/tags/{target}")
+    nested = annotated.get("object") if isinstance(annotated, dict) else None
+    if not isinstance(nested, dict) or nested.get("type") != "commit":
+        raise InputError(f"annotated tag {tag} must point directly to a commit")
+    return validate_sha(str(nested.get("sha") or ""), f"tag {tag} target SHA")
+
+
+def release_exists(client: Any, *, repo_name: str, tag: str) -> bool:
+    encoded = urllib.parse.quote(tag, safe="")
+    try:
+        payload = client.request_json(f"/repos/{repo_name}/releases/tags/{encoded}")
+    except GitHubNotFound:
+        return False
+    if not isinstance(payload, dict):
+        raise InputError("GitHub Release response must be a JSON object")
+    return True
 
 
 def exact_successful_push(client: Any, *, repo: str, workflow: str, expected_sha: str) -> int:
@@ -118,6 +152,9 @@ def validate_retry(
     expected_actor: str,
     product_sha: str,
     release_sha: str,
+    recovery_kind: str = "semantic_release_retry",
+    expected_tag: str = "",
+    release_date: str = "",
 ) -> dict[str, Any]:
     if not REPO_RE.fullmatch(repo_name):
         raise InputError(f"repo must be owner/repo: {repo_name}")
@@ -127,6 +164,15 @@ def validate_retry(
     ops_commits: list[str] = []
     if actor != expected_actor:
         errors.append("release retry actor must match promotion App actor")
+    if recovery_kind not in RECOVERY_KINDS:
+        errors.append(f"unsupported release recovery kind: {recovery_kind}")
+    elif recovery_kind == "orphan_release_repair":
+        if not RELEASE_TAG_RE.fullmatch(expected_tag):
+            errors.append("orphan release repair requires a vX.Y.Z expected tag")
+        if not RELEASE_DATE_RE.fullmatch(release_date):
+            errors.append("orphan release repair requires a YYYY-MM-DD release date")
+    elif expected_tag or release_date:
+        errors.append("semantic release retry must not include orphan release metadata")
     head = run_git(repo_root, "rev-parse", "HEAD").stdout.strip()
     if head != release_sha:
         errors.append("checked out HEAD does not match expected release SHA")
@@ -168,7 +214,12 @@ def validate_retry(
             }
         public_ci_run_id = verified_runs[release_sha]["public_ci"]
         codeql_run_id = verified_runs[release_sha]["codeql"]
-    except InputError as exc:
+        if recovery_kind == "orphan_release_repair" and RELEASE_TAG_RE.fullmatch(expected_tag):
+            if tag_target_sha(client, repo_name=repo_name, tag=expected_tag) != product_sha:
+                errors.append("orphan release tag does not point to product SHA")
+            if release_exists(client, repo_name=repo_name, tag=expected_tag):
+                errors.append("GitHub Release already exists for orphan release tag")
+    except (InputError, GitHubNotFound) as exc:
         errors.append(str(exc))
         public_ci_run_id = None
         codeql_run_id = None
@@ -177,6 +228,9 @@ def validate_retry(
         "errors": errors,
         "product_sha": product_sha,
         "release_sha": release_sha,
+        "recovery_kind": recovery_kind,
+        "expected_tag": expected_tag,
+        "release_date": release_date,
         "public_ci_run_id": public_ci_run_id,
         "codeql_run_id": codeql_run_id,
         "verified_public_ops_commits": ops_commits,
@@ -192,6 +246,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-actor", required=True)
     parser.add_argument("--product-sha", required=True)
     parser.add_argument("--release-sha", required=True)
+    parser.add_argument("--recovery-kind", required=True, choices=sorted(RECOVERY_KINDS))
+    parser.add_argument("--expected-tag", default="")
+    parser.add_argument("--release-date", default="")
     return parser
 
 
@@ -207,6 +264,9 @@ def main(argv: list[str] | None = None) -> int:
             expected_actor=args.expected_actor,
             product_sha=args.product_sha,
             release_sha=args.release_sha,
+            recovery_kind=args.recovery_kind,
+            expected_tag=args.expected_tag,
+            release_date=args.release_date,
         )
     except InputError as exc:
         result = {"ok": False, "errors": [str(exc)]}

@@ -19,6 +19,17 @@ on:
       request_id:
         description: Private retry workflow run ID
         required: true
+      recovery_kind:
+        description: Validated release recovery kind
+        required: true
+      expected_tag:
+        description: Orphan semantic-release tag, empty for a normal retry
+        required: false
+        default: ""
+      release_date:
+        description: Stable YYYY-MM-DD date for regenerated release notes
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -32,6 +43,9 @@ concurrency:
 env:
   INPUT_PRODUCT_SHA: ${{ inputs.product_sha }}
   INPUT_RELEASE_SHA: ${{ inputs.release_sha }}
+  INPUT_RECOVERY_KIND: ${{ inputs.recovery_kind }}
+  INPUT_EXPECTED_TAG: ${{ inputs.expected_tag }}
+  INPUT_RELEASE_DATE: ${{ inputs.release_date }}
 
 jobs:
   authorize_retry:
@@ -58,12 +72,27 @@ jobs:
             --actor "$RETRY_ACTOR" \
             --expected-actor "$EXPECTED_RETRY_ACTOR" \
             --product-sha "$INPUT_PRODUCT_SHA" \
-            --release-sha "$INPUT_RELEASE_SHA"
+            --release-sha "$INPUT_RELEASE_SHA" \
+            --recovery-kind "$INPUT_RECOVERY_KIND" \
+            --expected-tag "$INPUT_EXPECTED_TAG" \
+            --release-date "$INPUT_RELEASE_DATE"
+      - name: Summarize orphan Release repair
+        if: inputs.recovery_kind == 'orphan_release_repair'
+        run: |
+          {
+            echo "## Orphan GitHub Release repair"
+            echo
+            echo "- Tag: \`$INPUT_EXPECTED_TAG\`"
+            echo "- Product SHA: \`$INPUT_PRODUCT_SHA\`"
+            echo "- Current main SHA: \`$INPUT_RELEASE_SHA\`"
+            echo "- Release date: \`$INPUT_RELEASE_DATE\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   semantic_release_retry:
     name: semantic-release-retry
     runs-on: ubuntu-latest
     needs: authorize_retry
+    if: inputs.recovery_kind == 'semantic_release_retry'
     environment: public-release-publish
     steps:
       - uses: actions/checkout@v7
@@ -93,3 +122,44 @@ jobs:
         run: |
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
           npx semantic-release
+
+  orphan_release_repair:
+    name: orphan-release-repair
+    runs-on: ubuntu-latest
+    needs: authorize_retry
+    if: inputs.recovery_kind == 'orphan_release_repair'
+    environment: public-orphan-tag-recovery
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24.13.0"
+          cache: npm
+      - name: Verify immutable release SHA
+        run: test "$(git rev-parse HEAD)" = "$INPUT_RELEASE_SHA"
+      - name: Install release dependencies
+        run: npm ci
+      - name: Mint orphan recovery GitHub App token
+        id: orphan-recovery-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.ORPHAN_TAG_RECOVERY_CLIENT_ID }}
+          private-key: ${{ secrets.ORPHAN_TAG_RECOVERY_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+      - name: Revalidate and create missing GitHub Release
+        env:
+          GH_TOKEN: ${{ steps.orphan-recovery-token.outputs.token }}
+        run: |
+          node .github/scripts/public_orphan_release_recovery.mjs \
+            --repo-root . \
+            --repo "${{ github.repository }}" \
+            --product-sha "$INPUT_PRODUCT_SHA" \
+            --release-sha "$INPUT_RELEASE_SHA" \
+            --tag "$INPUT_EXPECTED_TAG" \
+            --release-date "$INPUT_RELEASE_DATE" \
+            --output "$RUNNER_TEMP/orphan-release-repair.json"

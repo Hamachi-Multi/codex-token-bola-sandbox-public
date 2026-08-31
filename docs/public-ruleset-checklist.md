@@ -24,7 +24,7 @@ Set every ruleset to `active` and confirm each bypass entry points to the intend
 - Treat `Always bypass` as bypassing every rule in that ruleset, including status checks and non-fast-forward restrictions
 - Let the private promotion and Ops Apply workflows verify the exact candidate SHA, base SHA, and required check conclusions before updating `main`
 - Run candidate checks after the Snapshot or Ops Stage App pushes the candidate branch; the candidate branch rulesets do not require those checks
-- Use the Release Tag App for release tag mutations. Semantic Release creates tags, and the protected orphan recovery workflow performs approved deletion; no workflow moves an existing release tag
+- Allow the Release Tag App to create release tags only. Block tag updates and deletions; the protected orphan recovery workflow preserves the tag and creates only the missing GitHub Release
 
 ## Baseline Tag
 

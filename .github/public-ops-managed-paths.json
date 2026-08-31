@@ -6,6 +6,7 @@
   ".github/scripts/public_codeql_result.py",
   ".github/scripts/public_main_release_guard.py",
   ".github/scripts/public_ops_path_policy.py",
+  ".github/scripts/public_orphan_release_recovery.mjs",
   ".github/scripts/public_release_retry_guard.py",
   ".github/scripts/public_snapshot_commit_policy.py",
   ".github/scripts/release_dependency_audit.py",
